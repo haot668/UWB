@@ -1,0 +1,182 @@
+<html>
+<body>
+<pre>
+<h1>礦ision Build Log</h1>
+<h2>Tool Versions:</h2>
+IDE-Version: μVision V5.43.1.0
+Copyright (C) 2025 ARM Ltd and ARM Germany GmbH. All rights reserved.
+License Information: 123 1790053220@qq.com, 123, LIC=----
+ 
+Tool Versions:
+Toolchain:       MDK-Lite  Version: 5.43.0.0
+Toolchain Path:  D:\Tools\keil5\ARM\ARMCC\Bin
+C Compiler:      Armcc.exe V5.05 update 1 (build 106)
+Assembler:       Armasm.exe V5.05 update 1 (build 106)
+Linker/Locator:  ArmLink.exe V5.05 update 1 (build 106)
+Library Manager: ArmAr.exe V5.05 update 1 (build 106)
+Hex Converter:   FromElf.exe V5.05 update 1 (build 106)
+CPU DLL:         
+Dialog DLL:      
+Target DLL:      STLink\ST-LINKIII-KEIL_SWO.dll V3.3.1.0
+Dialog DLL:      
+ 
+<h2>Project:</h2>
+D:\Work\UWB开发\4.开发文档\UWB_V0.0.1\API\DWS3000_STM32L412.uvprojx
+Project File Date:  06/01/2026
+
+<h2>Output:</h2>
+*** Using Compiler 'V5.05 update 1 (build 106)', folder: 'D:\Tools\keil5\ARM\ARMCC\Bin'
+Rebuild target 'DWS3000_STM32L412'
+compiling config_options.c...
+compiling mac_802_15_4.c...
+compiling mac_802_15_8.c...
+compiling example_info.c...
+compiling deca_device.c...
+Src\decadriver\deca_device.c(306): warning:  #111-D: statement is unreachable
+          break;
+Src\decadriver\deca_device.c(672): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or8bitoffsetreg(SYS_CFG_ID, 0, SYS_CFG_SPI_CRC_BIT_MASK);
+Src\decadriver\deca_device.c(691): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or16bitoffsetreg(OTP_CFG_ID, 0, LDO_BIAS_KICK);
+Src\decadriver\deca_device.c(781): warning:  #188-D: enumerated type mixed with another type
+      pdw3000local->spicrc = 0;
+Src\decadriver\deca_device.c(872): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or8bitoffsetreg(SEQ_CTRL_ID, 0x01, SEQ_CTRL_AINIT2IDLE_BIT_MASK>>8);
+Src\decadriver\deca_device.c(877): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or8bitoffsetreg(CLK_CTRL_ID, 0, FORCE_SYSCLK_FOSC);
+Src\decadriver\deca_device.c(888): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or8bitoffsetreg(CLK_CTRL_ID, 0, FORCE_SYSCLK_FOSCDIV4);
+Src\decadriver\deca_device.c(906): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or32bitoffsetreg(CLK_CTRL_ID, 0, CLK_CTRL_GPIO_CLK_EN_BIT_MASK);
+Src\decadriver\deca_device.c(1159): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(STS_CTRL_ID, 0, STS_CTRL_LOAD_IV_BIT_MASK);
+Src\decadriver\deca_device.c(1586): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or16bitoffsetreg(LDO_CTRL_ID, 0, (
+Src\decadriver\deca_device.c(1623): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(RX_CAL_CFG_ID, 0x0, RX_CAL_CFG_CAL_EN_BIT_MASK);
+Src\decadriver\deca_device.c(1642): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(RX_CAL_CFG_ID, 0x2, 0x1); //enable reading
+Src\decadriver\deca_device.c(1886): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or16bitoffsetreg(CLK_CTRL_ID, 0x0, CLK_CTRL_ACC_MCLK_EN_BIT_MASK | CLK_CTRL_ACC_CLK_EN_BIT_MASK);
+Src\decadriver\deca_device.c(2072): warning:  #1207-D: unknown attribute "fallthrough"
+          __attribute__ ((fallthrough));
+Src\decadriver\deca_device.c(2562): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or8bitoffsetreg(SYS_CFG_ID, 0, (uint8_t)(SYS_CFG_FFEN_BIT_MASK));
+Src\decadriver\deca_device.c(2761): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or32bitoffsetreg(LDO_TUNE_HI_ID, 0, LDO_TUNE_HI_LDO_HVAUX_TUNE_BIT_MASK);
+Src\decadriver\deca_device.c(2945): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(LDO_CTRL_ID, 0, LDO_CTRL_LDO_VDDPLL_EN_BIT_MASK);
+Src\decadriver\deca_device.c(3047): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or16bitoffsetreg(SEQ_CTRL_ID, 0, SEQ_CTRL_ATX2SLP_BIT_MASK);
+Src\decadriver\deca_device.c(3101): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or8bitoffsetreg(CIA_CONF_ID, 2, CIA_DIAGNOSTIC_OFF);
+Src\decadriver\deca_device.c(3130): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or32bitoffsetreg(SYS_CFG_ID, 0, SYS_CFG_AUTO_ACK_BIT_MASK | SYS_CFG_FAST_AAT_EN_BIT_MASK); //set the AUTO_ACK bit
+Src\decadriver\deca_device.c(3177): warning:  #68-D: integer conversion resulted in a change of sign
+      uint32_t  or_val=0,and_val=-1;
+Src\decadriver\deca_device.c(3560): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or32bitoffsetreg(CLK_CTRL_ID, 0, (CLK_CTRL_GPIO_DCLK_EN_BIT_MASK | CLK_CTRL_LP_CLK_EN_BIT_MASK));
+Src\decadriver\deca_device.c(3917): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or16bitoffsetreg(SYS_CFG_ID, 0, SYS_CFG_RXWTOE_BIT_MASK); //set the RX FWTO bit
+Src\decadriver\deca_device.c(3973): warning:  #68-D: integer conversion resulted in a change of sign
+              dwt_or32bitoffsetreg(SYS_ENABLE_LO_ID, 0, bitmask_lo); //Set the bits
+Src\decadriver\deca_device.c(3974): warning:  #68-D: integer conversion resulted in a change of sign
+              dwt_or32bitoffsetreg(SYS_ENABLE_HI_ID, 0, bitmask_hi); //Set the bits
+Src\decadriver\deca_device.c(4070): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(CLK_CTRL_ID, 0, FORCE_SYSCLK_FOSC);
+Src\decadriver\deca_device.c(4157): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or32bitoffsetreg(LDO_CTRL_ID, 0, (LDO_CTRL_LDO_VDDHVTX_VREF_BIT_MASK |
+Src\decadriver\deca_device.c(4159): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or32bitoffsetreg(LDO_CTRL_ID, 0, (LDO_CTRL_LDO_VDDTX2_VREF_BIT_MASK |
+Src\decadriver\deca_device.c(4167): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or32bitoffsetreg(RF_ENABLE_ID, 0, (RF_ENABLE_TX_SW_EN_BIT_MASK
+Src\decadriver\deca_device.c(4173): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or32bitoffsetreg(RF_ENABLE_ID, 0, (RF_ENABLE_TX_SW_EN_BIT_MASK
+Src\decadriver\deca_device.c(4226): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(TEST_CTRL0_ID, 0x0, TEST_CTRL0_TX_PSTM_BIT_MASK);
+Src\decadriver\deca_device.c(4251): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or32bitoffsetreg(RF_CTRL_MASK_ID, 0, (RF_ENABLE_TX_SW_EN_BIT_MASK
+Src\decadriver\deca_device.c(4257): warning:  #68-D: integer conversion resulted in a change of sign
+          dwt_or32bitoffsetreg(RF_CTRL_MASK_ID, 0, (RF_ENABLE_TX_SW_EN_BIT_MASK
+Src\decadriver\deca_device.c(4339): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(LDO_CTRL_ID, 0, LDO_CTRL_LDO_VDDMS2_EN_BIT_MASK);
+Src\decadriver\deca_device.c(4473): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(PGC_CTRL_ID, 0x0, (uint8_t)(PGC_CTRL_PGC_START_BIT_MASK | PGC_CTRL_PGC_AUTO_CAL_BIT_MASK));
+Src\decadriver\deca_device.c(4511): warning:  #68-D: integer conversion resulted in a change of sign
+      dwt_or8bitoffsetreg(PGC_CTRL_ID, 0x0, PGC_CTRL_PGC_START_BIT_MASK);
+Src\decadriver\deca_device.c: 36 warnings, 0 errors
+compiling stm32l4xx_it.c...
+compiling port.c...
+compiling main.c...
+compiling deca_sleep.c...
+compiling stm32l4xx_hal_msp.c...
+compiling deca_mutex.c...
+compiling deca_spi.c...
+compiling stm32l4xx_hal_cortex.c...
+compiling stm32l4xx_hal_dma.c...
+compiling system_stm32l4xx.c...
+compiling stm32l4xx_hal.c...
+compiling stm32l4xx_hal_exti.c...
+compiling shared_functions.c...
+compiling gateway_cmd.c...
+compiling fusion_anchor.c...
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(153): warning:  #47-D: incompatible redefinition of macro "CLAIM_LEN" (declared at line 58 of ".\Src\examples\shared_data\auto_anchor.h")
+  #define CLAIM_LEN 16u
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(159): warning:  #47-D: incompatible redefinition of macro "JOIN_REQ_LEN" (declared at line 59 of ".\Src\examples\shared_data\auto_anchor.h")
+  #define JOIN_REQ_LEN 16u
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(527): warning:  #870-D: invalid multibyte character sequence
+          test_run_info((unsigned char *)"ELECT WIN 鈫?MASTER");
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(532): warning:  #870-D: invalid multibyte character sequence
+      test_run_info((unsigned char *)"ELECT LOSE 鈫?JOIN");
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(632): warning:  #870-D: invalid multibyte character sequence
+          test_run_info((unsigned char *)"JOIN ALL FAIL 鈫?RELISTEN");
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(1157): warning:  #870-D: invalid multibyte character sequence
+                      test_run_info((unsigned char *)"FATAL: MULTI LOST 鈫?RST");
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(989): warning:  #550-D: variable "got_final" was set but never used
+          int got_blink = 0, got_sync = 0, got_final = 0;
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(1200): warning:  #870-D: invalid multibyte character sequence
+                  test_run_info((unsigned char *)"IDLE TIMEOUT 鈫?SYS RST");
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(1373): warning:  #870-D: invalid multibyte character sequence
+          test_run_info((unsigned char *)"DISCOVERY FAIL 鈥?RETRY");
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(145): warning:  #177-D: variable "match_gw_find_ack" was declared but never referenced
+  static uint8_t match_gw_find_ack[]  = {0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0, 0, 0xF3};
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(146): warning:  #177-D: variable "match_gw_coord_ack" was declared but never referenced
+  static uint8_t match_gw_coord_ack[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0, 0, 0xF5};
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(183): warning:  #550-D: variable "clock_offset" was set but never used
+  static int      clock_offset = 0;
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c(260): warning:  #177-D: function "wait_for_rx" was declared but never referenced
+  static int wait_for_rx(uint32_t *status, uint32_t *flen)
+Src\examples\ex_09b_fusion_anchor\fusion_anchor.c: 13 warnings, 0 errors
+assembling startup_stm32l412xx.s...
+compiling stm32l4xx_hal_flash.c...
+compiling stm32l4xx_hal_flash_ex.c...
+compiling stm32l4xx_hal_gpio.c...
+compiling stm32l4xx_hal_pwr.c...
+compiling stm32l4xx_hal_pwr_ex.c...
+compiling stm32l4xx_hal_rcc_ex.c...
+compiling stm32l4xx_hal_spi.c...
+compiling stm32l4xx_hal_rcc.c...
+compiling stm32l4xx_hal_tim_ex.c...
+compiling stm32l4xx_hal_uart.c...
+compiling stm32l4xx_hal_tim.c...
+linking...
+.\Output\DWS3000_STM32L412.axf: Warning: L6988W: Ignoring unknown patch sdcomp-29491-629360.
+Program Size: Code=31282 RO-data=722 RW-data=416 ZI-data=2728  
+Finished: 0 information, 1 warning and 0 error messages.
+FromELF: creating hex file...
+".\Output\DWS3000_STM32L412.axf" - 0 Error(s), 50 Warning(s).
+
+<h2>Software Packages used:</h2>
+
+Package Vendor: Keil
+                https://www.keil.com/pack/Keil.STM32L4xx_DFP.3.1.0.pack
+                Keil::STM32L4xx_DFP@3.1.0
+                STMicroelectronics STM32L4 Series Device Support
+
+<h2>Collection of Component include folders:</h2>
+
+<h2>Collection of Component Files used:</h2>
+Build Time Elapsed:  00:00:05
+</pre>
+</body>
+</html>

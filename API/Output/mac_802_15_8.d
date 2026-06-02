@@ -1,0 +1,10 @@
+.\output\mac_802_15_8.o: Src\MAC_802_15_8\mac_802_15_8.c
+.\output\mac_802_15_8.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\string.h
+.\output\mac_802_15_8.o: Src\MAC_802_15_8\mac_802_15_8.h
+.\output\mac_802_15_8.o: .\Src\decadriver\deca_regs.h
+.\output\mac_802_15_8.o: .\Src\decadriver\deca_vals.h
+.\output\mac_802_15_8.o: .\Src\decadriver\deca_device_api.h
+.\output\mac_802_15_8.o: .\Src\decadriver\deca_types.h
+.\output\mac_802_15_8.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\output\mac_802_15_8.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\stddef.h
+.\output\mac_802_15_8.o: .\Src\examples\shared_data\shared_defines.h
