@@ -46,19 +46,12 @@ extern "C" {
 #define AUTO_ANCHOR_MAX            16u
 
 /*============================================================================
- * Frequency offset (ferr) scaling for inter-anchor time sync
- * ferr = (T_m[n]-T_m[n-1]) / (t_s[n]-t_s[n-1]) - 1, scaled by 2^30 → int32_t
- *============================================================================*/
-#define FERR_SCALE_BITS 30
-#define FERR_SCALE      (1UL << 30)
-
-/*============================================================================
  * Frame lengths
  *============================================================================*/
 #define CLAIM_LEN   14u   /* FC[2],SEQ,PAN[2],DEST[2],SRC[2],FUNC, UID[4],  FCS[2] */
 #define JOIN_REQ_LEN 14u  /* FC[2],SEQ,PAN[2],DEST[2],SRC[2],FUNC, UID[4],  FCS[2] */
 #define JOIN_ACK_LEN 13u  /* FC[2],SEQ,PAN[2],DEST[2],SRC[2],FUNC, RANK,NODE,FCS[2] */
-#define BEACON_LEN   18u  /* FC[2],SEQ,PAN[2],DEST[2],SRC[2],FUNC, GROUP,COUNT, UID[4],FCS[2] */
+#define BEACON_LEN   20u  /* FC[2],SEQ,PAN[2],DEST[2],SRC[2],FUNC, GROUP,COUNT, UID[4], VER[2], FCS[2] */
 
 /*============================================================================
  * Payload field indices (within TX/RX buffer, after 10-byte IEEE header)
@@ -73,6 +66,8 @@ extern "C" {
 /* Beacon group/count at bytes 14-15 */
 #define AUTO_BCN_GROUP_IDX  14u
 #define AUTO_BCN_COUNT_IDX  15u
+/* Beacon firmware version at bytes 16-17 */
+#define AUTO_BCN_FWVER_IDX  16u
 
 /*============================================================================
  * Auto-discovery state machine

@@ -24,11 +24,11 @@ extern "C" {
 /* Frame header size: FC[2]+SEQ[1]+PAN[2]+DST[2]+SRC[2]+FUNC[1] */
 #define GW_HDR_LEN        10u
 
-/* Max AT command line length */
-#define GW_CMD_MAX_LEN    64
+/* Max AT command line length — must fit AT+OTA_DATA with 248B hex payload (~526B worst) */
+#define GW_CMD_MAX_LEN    600
 
-/* RX ring buffer size */
-#define GW_RX_BUF_SIZE    256
+/* RX ring buffer size — must hold at least one full max-length command line */
+#define GW_RX_BUF_SIZE    1024
 
 #ifdef __cplusplus
 }

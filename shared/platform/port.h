@@ -102,9 +102,9 @@ typedef enum
 #define DBG_RX_GPIO_Port            GPIOA
 
 /* ---- RF Switch SW8112QU4: ENT=PA7(TX_EN), ENR=PA6(RX_EN) ---- */
-#define RF_SW_TX_EN_Pin             GPIO_PIN_7
+#define RF_SW_TX_EN_Pin             GPIO_PIN_7   /* PA7 = ENT */
 #define RF_SW_TX_EN_GPIO_Port       GPIOA
-#define RF_SW_RX_EN_Pin             GPIO_PIN_6
+#define RF_SW_RX_EN_Pin             GPIO_PIN_6   /* PA6 = ENR */
 #define RF_SW_RX_EN_GPIO_Port       GPIOA
 
 /* ---- Measurement time debug pin ---- */

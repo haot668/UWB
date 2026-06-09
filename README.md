@@ -80,7 +80,7 @@ UWB_V0.0.1/
 │   │   ├── example_info.c             #   宏→函数指针映射
 │   │   └── examples_defines.h         #   类型定义
 │   ├── fusion_anchor/                 # 基站固件 (主/从)
-│   │   └── fusion_anchor.c            #   ~1510 行，核心逻辑 + 下行 TX
+│   │   └── fusion_anchor.c            #   ~1560 行，核心逻辑 + 下行 TX + 两帧时钟同步
 │   ├── fusion_tag/                    # 标签固件
 │   │   └── fusion_tag.c               #   ~270 行，下行接收 + 本地解算
 │   └── downlink/                      # 下行 TDOA 解算
@@ -130,7 +130,7 @@ UWB_V0.0.1/
 |------|------|------|
 | MCU | STM32L412KBU6 | Cortex-M4, 80MHz, 128KB Flash, 40KB SRAM |
 | UWB | DW3210 (Decawave/Qorvo) | Channel 5 (6.5GHz), 6.8Mbps, STS 模式 1 |
-| 时钟 | MSI 4MHz → PLL 80MHz | 内部振荡器，无需外部晶振 |
+| 时钟 | HSE 8MHz → PLL 80MHz | 外部有源晶振 ±25ppm |
 | UART | USART2 | 115200 8N1, 三设备均通过 USART2 (PA2/PA3) |
 | SPI | SPI1 | PB3=SCK, PB4=MISO, PB5=MOSI, PA15=NSS |
 | GPIO | PA12=DW_IRQ, PB6=DW_RESET, PB7=DW_WAKEUP | LED: PA5, PA11 |
@@ -212,8 +212,8 @@ PA11          ──→   LED2
 | 功能 | 状态 | 说明 |
 |------|:----:|------|
 | TDOA Blink 广播 | 已实现 | 标签周期性发送 Blink 帧 (FC=0xE2)，含序列号和 40-bit 时间戳 |
-| 时钟同步 (Clock Sync) | 已实现 | 主基站收到 Blink 后 300μs 延迟发送 Sync 帧，嵌入 40-bit 发送时间戳 |
-| 从基站 ferr 计算 | 已实现 | 从基站通过 Sync 帧计算与主基站的频率偏移 (ferr) |
+| 时钟同步 (Clock Sync) | 已实现 | 两帧协议：信标 (0xF0) + 同步帧 (0xF8, ~200us 间隔)，同步帧携带**本次**信标 TX 时间戳 |
+| 从基站 ferr 计算 | 已实现 | 从基站比较连续两个同步帧：`ferr = (d_master - d_slave) × 2³⁰ / d_slave`，差值公式防溢出 |
 | TOF 双向测距 | 已实现 | Poll→Response→Final 三步测距，单位 UUS → 米 |
 | 从基站 TDMA 上报 | 已实现 | 从基站使用 TDMA 时隙 (5ms slots) 上报 Slave Report 给主基站 |
 | 主基站 UART 输出 | 已实现 | 格式: `F,SEQ,R=TS,D=DIST,C=CLK_OFF[,Sn:R=TS:C=CO]` |
@@ -276,11 +276,13 @@ PA11          ──→   LED2
 
 | 功能 | 状态 |
 |------|:----:|
-| `downlink_protocol.h` — 协议定义 | 已实现 |
+| `downlink_protocol.h` — 协议定义 (含 0xF8 时钟同步帧) | 已实现 |
 | `downlink_anchor.c` — 基站下行信标/Blink TX | 已集成到 `fusion_anchor.c` |
-| `downlink_tag.c` — 标签下行接收 | 已重写为 `fusion_tag.c` |
+| `fusion_tag.c` — 标签下行接收 + 本地解算 | 已实现 |
 | `tdoa_solver.c` — Gauss-Newton 解算 | 已实现 (FPU 硬件加速) |
 | 编译守卫 `FUSION_DOWNLINK_MODE` | 三工程均已启用 |
+| 两帧时钟同步 (0xF0 + 0xF8) | 已实现 — 主站每周期发信标+同步帧，从站用同步帧计算 FERR |
+| AT+RATE 动态频率调节 | 已实现 — 20~5000ms，上位机下拉框选择 |
 
 ---
 
@@ -321,13 +323,41 @@ PA11          ──→   LED2
 
 | 帧类型 | FC[0] | 方向 | 说明 |
 |--------|-------|------|------|
-| DOWNLINK_BEACON | 0xF0 | Master → Tag | 主基站广播锚点位置表 (N×7 bytes) + 周期序号 |
+| DOWNLINK_BEACON | 0xF0 | Master → Tag | 主基站广播锚点位置表 (N×4 bytes) + 周期序号 |
 | DOWNLINK_BLINK | 0xF1 | Slave → Tag | 从基站 TDMA 下行 Blink，源地址编码 rank |
+| DL_CLOCK_SYNC | 0xF8 | Master → All | 时钟同步帧，携带**本次**信标 TX 时间戳 (信标后 ~200us) |
 
 ---
 
-## 7. 主基站主循环 (7 阶段)
+## 7. 主循环架构
 
+### 7.1 下行模式 (FUSION_DOWNLINK_MODE)
+
+**主基站循环 (~500ms)：**
+```
+Phase 1: RX 标签 Blink (0xE2) / 选举帧 / JOIN_REQ  ← 500ms 轮询
+         └── 标签 Blink → gateway_device_seen() 在线检测
+Phase 7: TX 下行信标 (0xF0)  ← 每周期，携带锚点位置表
+         TX 时钟同步帧 (0xF8) ← 每周期，携带**本次**信标 TX 时间戳 (信标后 ~200us)
+         TX 自发现信标 (0xE7) ← 每 10 周期
+         gateway_poll_uart()  ← AT 指令轮询
+```
+
+**从基站循环 (~500ms)：**
+```
+Phase 1: RX 下行信标 (0xF0)  ← 心跳检测
+         RX 时钟同步帧 (0xF8) ← FERR 计算 + TDMA Blink TX (0xF1)
+         RX 自发现信标 (0xE7) ← 主站在线确认
+         未收到 → 打印 "." 心跳丢失
+         
+FERR 计算: d_master = sync_tx[N] - sync_tx[N-1]  (主站时钟间隔)
+           d_slave  = sync_rx[N] - sync_rx[N-1]  (从站时钟间隔)
+           ferr = (d_master - d_slave) × 2³⁰ / d_slave
+```
+
+### 7.2 融合模式 (!FUSION_DOWNLINK_MODE)
+
+**主基站循环：**
 ```
 Phase 1: RX TDOA Blink    ← 500ms 超时，监听标签 Blink
 Phase 2: TX Clock Sync     ← 延迟 300μs 后发送 Sync 帧
@@ -335,12 +365,10 @@ Phase 3: RX TOF Poll       ← 200ms 超时，监听标签 Poll
 Phase 4: TX TOF Response   ← 延迟发送 Resp (含时间戳)
 Phase 5: RX TOF Final      ← 200ms 超时，监听标签 Final
 Phase 6: RX Slave Reports  ← TDMA 收集从基站上报
-Phase 7: UART 输出 + 下行信标 TX (0xF0) + Beacon + Gateway Poll
+Phase 7: UART 输出 + Beacon + Gateway Poll
 ```
 
-**从基站循环：** RX Blink → RX Sync → RX Final → TX Slave Report (TDMA) → 下行 Blink TX (0xF1, TDMA 时隙)
-
-**标签循环 (下行模式)：** RX Beacon (0xF0, 200ms 超时) → RX N-1 Blinks (0xF1, 每时隙 30ms) → tdoa_solve() → UART 输出 `P,SEQ,X=<cm>,Y=<cm>,Z=<cm>,Q=<rms>`
+**标签循环 (下行模式)：** RX Beacon (0xF0) → 发 TDOA Blink (0xE2, 10ms 后) → RX N-1 Blinks (0xF1) → tdoa_solve() → TX 位置报告 (0xF2) → UART 输出坐标
 
 ### UART 输出格式
 
@@ -348,6 +376,7 @@ Phase 7: UART 输出 + 下行信标 TX (0xF0) + Beacon + Gateway Poll
 |------|------|------|------|
 | 主基站 (融合) | `F,SEQ,R=TS,D=DIST,C=CLK_OFF[,Sn:R=TS:C=CO]` | `F,0A,R=01234567,D=12.34` | TDOA+TOF 原始数据上报 |
 | 标签 (下行) | `P,SEQ,X=<cm>,Y=<cm>,Z=<cm>,Q=<rms>` | `P,1F,X=123.4,Y=567.8,Z=150.0,Q=2.1` | 下行 TDOA 定位解算结果 |
+| 从基站 (下行) | `S,<rank>,<ferr_hex>` | `S,01,0000001B` | 从站时钟频率偏移 (8 位 hex，有符号) |
 | 基站日志 | `START MASTER` / `START SLAVE` | — | 组网上电状态 |
 | 网关 AT | `+PONG` / `+ONLINE,...` / `+OFFLINE,...` | `+ONLINE,0001,A,1` | AT 指令响应 |
 
@@ -365,6 +394,11 @@ Phase 7: UART 输出 + 下行信标 TX (0xF0) + Beacon + Gateway Poll
 | Keil link error L6047U | 已修复 | 移除未用的 USB CDC 代码 + HAL 精简 |
 | SysTick 中断不触发 | 已修复 | STM32L4 HAL 的 `HAL_SYSTICK_Callback` 是弱空函数，需用户实现 |
 | 下行 TDOA 定位解算 | 已实现 | 基站增加下行 TX (0xF0/0xF1)，标签重写为纯接收+本地 Gauss-Newton 解算 |
+| FERR int64 溢出 (500ms 间隔 × 2³⁰ > 2⁶³) | 已修复 | 改用差值公式: `(d_master - d_slave) × FERR_SCALE / d_slave` |
+| FERR 符号反复跳变 (d_master/d_slave 测相邻区间) | 已修复 | 两帧协议：同步帧 (0xF8) 携带本次信标 TX 时间戳，d_master 和 d_slave 测同一区间 |
+| 从站收到信标 0xF0 后 DW3000 停止 RX → 同步帧 0xF8 丢失 | 已修复 | for 循环内每收到帧后立即 `dwt_rxenable()`，确保信标后 200us 的同步帧能被接收 |
+| 标签 0xE2 Blink 导致从站聋掉 | 已修复 | 非信标帧处理后 `dwt_rxenable()` 重新使能 RX |
+| 从站保存状态 (saved_d_slave) 因丢帧 stale 导致溢出 | 已修复 | 两帧协议无需保存跨周期状态，仅需 prev_sync_tx/rx_ts |
 
 ---
 

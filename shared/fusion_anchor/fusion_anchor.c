@@ -1,22 +1,16 @@
 /*! ----------------------------------------------------------------------------
  *  @file    fusion_anchor.c
- *  @brief   TDOA+TOF Fusion Anchor — supports Main (rank 0) and Slave (rank 1+)
+ *  @brief   Downlink TDOA Anchor — supports Master (rank 0) and Slave (rank 1+)
  *
- *           Main Anchor (RANK == 0):
- *             1. RX TDOA Blink  → record timestamp + clock offset
- *             2. TX Clock Sync   → broadcast sync frame (delayed TX)
- *             3. RX TOF Poll     → record timestamp
- *             4. TX TOF Response → send with timestamps (delayed TX)
- *             5. RX TOF Final    → extract TOF distance
- *             6. RX Slave Reports→ TDMA collection from slave anchors
- *             7. UART output: F,SEQ,R=TS,D=DIST,C=CLK_OFF[,Sn:R=TS:C=CO]
+ *           Master Anchor (RANK == 0):
+ *             1. RX TDOA Blink  → record timestamp
+ *             2. TX Beacon      → periodic heartbeat + network formation
+ *             3. Gateway UART   → poll AT commands
  *
  *           Slave Anchor (RANK >= 1):
- *             1. RX TDOA Blink   → record timestamp
- *             2. RX Clock Sync    → record timestamp + clock offset vs main
- *             3. RX TOF Final     → extract TOF distance
- *             4. TX Slave Report  → send timestamps to main (TDMA slot)
- *             5. UART output: S,RANK,BLINK_TS,SYNC_TS,CLK_OFF,TOF_DIST
+ *             1. RX Beacon      → heartbeat + trigger TDMA blink
+ *             2. TX Blink       → TDOA reference in TDMA slot
+ *             3. Gateway UART   → poll AT commands (if ENABLE_GATEWAY)
  *
  * @attention
  * Copyright 2015-2020 (c) Decawave Ltd, Dublin, Ireland.
@@ -61,13 +55,18 @@ extern void test_run_info(unsigned char *data);
 #endif
 #endif
 
+#if ENABLE_GATEWAY
+#define APP_NAME "FUSION GATEWAY v2.2"
+#else
 #define APP_NAME "FUSION ANCHOR v2.2"
+#endif
 
 /*============================================================================
- * Common configuration — Channel 5, 6.8 Mbps
+ * Common configuration — 6.8 Mbps, PRF 64M, preamble code 9
+ * Channel selected via UWB_CHANNEL macro in example_selection.h
  *============================================================================*/
 static dwt_config_t config = {
-    5,               /* Channel number. */
+    UWB_CHANNEL,      /* Channel number (5 or 9). */
     DWT_PLEN_128,    /* Preamble length. */
     DWT_PAC8,        /* Preamble acquisition chunk size. */
     9,               /* TX preamble code. */
@@ -86,58 +85,11 @@ static dwt_config_t config = {
 #define RX_ANT_DLY 16385
 
 /*============================================================================
- * Timing constants (UWB microseconds)
- *============================================================================*/
-#define BLINK_RX_TO_SYNC_TX_DLY_UUS  5000u  /* 5ms: Tag needs ~3ms to recover from TX+settle into RX */
-#define POLL_RX_TO_RESP_TX_DLY_UUS   5000u
-#define TDMA_BASE_DELAY_UUS          2000u
-#define TDMA_SLOT_DURATION_UUS       5000u
-
-/*============================================================================
- * Frame function codes
- *============================================================================*/
-#define FUNC_TDOA_BLINK     0xE2u
-#define FUNC_CLOCK_SYNC     0xAAu
-#define FUNC_TOF_POLL       0xE3u
-#define FUNC_TOF_RESP       0xE4u
-#define FUNC_TOF_FINAL      0xE5u
-#define FUNC_SLAVE_REPORT   0xE6u
-
-/*============================================================================
  * Frame headers for matching (seq/addr bytes zeroed)
  *============================================================================*/
 static uint8_t match_blink[]  = {0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0, 0, 0xE2};
-static uint8_t match_poll[]   = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, 0xE3};
-static uint8_t match_final[]  = {0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0, 0, 0xE5};
-static uint8_t match_sync[]   = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, 0xAA};
 #define HDR_LEN 10u
 #define SN_IDX  2u
-
-/*============================================================================
- * TX frame buffers
- *============================================================================*/
-static uint8_t tx_sync[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0x01, 0x00, 0xAA, 0, 0, 0, 0, 0, 0, 0};
-#define SYNC_LEN 17u
-/* SYNC frame: [0-9]=IEEE hdr+FUNC, [10]=group, [11]=node, [12-16]=master_blink_rx_ts(40bit) */
-
-static uint8_t tx_resp[] = {
-    0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, 0xE4,
-    0, 0, 0, 0, 0,  0, 0, 0, 0, 0
-};
-#define RESP_LEN 20u
-#define RESP_POLL_RX_TS_IDX  10u
-#define RESP_RESP_TX_TS_IDX  14u
-
-static uint8_t tx_report[] = {
-    0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0, 0, 0xE6,
-    0, 0, 0, 0, 0,  0, 0, 0, 0, 0,  0, 0, 0, 0,  0, 0,  0, 0
-};
-#define REPORT_LEN 28u
-/* SLAVE_REPORT: [10-14]=blink_rx_ts(40b), [15-19]=sync_rx_ts(40b), [20-23]=ferr(s32), [24-25]=tof_dist, [26-27]=rsvd */
-#define REPORT_BLINK_TS_IDX  10u
-#define REPORT_SYNC_TS_IDX   15u
-#define REPORT_FERR_IDX      20u
-#define REPORT_TOF_DIST_IDX  24u
 
 /*============================================================================
  * Auto-discovery match patterns (FC[2],SEQ,PAN[2],DEST[2],SRC[2],FUNC)
@@ -153,9 +105,9 @@ static uint8_t match_gw_coord_ack[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0,
 #endif
 
 #ifdef FUSION_DOWNLINK_MODE
-/* Downlink: beacon table + default positions + match pattern */
+/* Downlink: beacon table + default positions */
 static dl_anchor_entry_t g_dl_beacon_table[DL_MAX_ANCHORS];
-static uint8_t g_dl_num_anchors = 1;
+static uint8_t  g_dl_num_anchors = 1;
 static const int16_t g_dl_default_positions[][3] = {
     {DL_A0_X_CM, DL_A0_Y_CM, DL_A0_Z_CM},
     {DL_A1_X_CM, DL_A1_Y_CM, DL_A1_Z_CM},
@@ -163,7 +115,25 @@ static const int16_t g_dl_default_positions[][3] = {
     {DL_A3_X_CM, DL_A3_Y_CM, DL_A3_Z_CM},
     {DL_A4_X_CM, DL_A4_Y_CM, DL_A4_Z_CM},
 };
-static uint8_t match_dl_beacon[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0, 0, 0xF0};
+static uint8_t match_dl_beacon[]  = {0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0, 0, 0xF0};
+static uint8_t match_tag_blink[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0, 0, 0xE2};
+
+/* Beacon interval for AT+RATE (runtime configurable) */
+static uint16_t g_dl_beacon_interval_ms = 100;  /* default 10 Hz */
+
+void dl_set_beacon_interval(uint16_t ms) { g_dl_beacon_interval_ms = ms; }
+uint16_t dl_get_beacon_interval(void) { return g_dl_beacon_interval_ms; }
+
+/* Update anchor coordinate in beacon table (called from gateway AT+COORD) */
+void dl_set_anchor_coord(uint8_t rank, int16_t x_cm, int16_t y_cm, int16_t z_cm)
+{
+    if (rank < DL_MAX_ANCHORS) {
+        g_dl_beacon_table[rank].id   = rank;
+        g_dl_beacon_table[rank].x_cm = x_cm;
+        g_dl_beacon_table[rank].y_cm = y_cm;
+        g_dl_beacon_table[rank].z_cm = z_cm;
+    }
+}
 #endif
 
 /* Auto-discovery TX frames */
@@ -171,12 +141,14 @@ static uint8_t tx_claim[] = {
     0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0x01, 0x00, 0xE8,
     0, 0, 0, 0,  0, 0
 };
+#undef  CLAIM_LEN
 #define CLAIM_LEN 16u
 
 static uint8_t tx_join_req[] = {
     0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0, 0, 0xE9,
     0, 0, 0, 0,  0, 0
 };
+#undef  JOIN_REQ_LEN
 #define JOIN_REQ_LEN 16u
 
 static uint8_t tx_beacon[] = {
@@ -186,6 +158,7 @@ static uint8_t tx_beacon[] = {
     0, 0, 0, 0,   /* MASTER_UID[4] */
     0, 0     /* FCS[2] */
 };
+#undef  BEACON_LEN
 #define BEACON_LEN 18u
 
 /*============================================================================
@@ -198,63 +171,22 @@ static uint8_t rx_buffer[RX_BUF_LEN];
  * Timestamps and tracking variables
  *============================================================================*/
 static uint64_t blink_rx_ts;
-static uint64_t poll_rx_ts;
-static uint64_t sync_rx_ts;
-static uint64_t resp_tx_ts;
-static int      clock_offset = 0;
 static uint8_t  last_blink_seq = 0;
-static uint8_t  last_poll_seq = 0;
-static uint16_t tof_distance_cm = 0;
-static uint64_t prev_master_blink_rx_ts = 0;
-static uint64_t prev_slave_blink_rx_ts = 0;
-static int      prev_ferr_valid = 0;
-static int32_t  slave_ferr = 0;
 
-#define ANCHOR_ID_VAL  0x0001u
-#define ANCHOR_GROUP   0u
-#define ANCHOR_NODE    0u
+#define ANCHOR_ID_VAL  0x0000u  /* Master = 0, Slave1 = 1, Slave2 = 2 */
 
 extern dwt_txconfig_t txconfig_options;
+extern dwt_txconfig_t txconfig_options_ch9;
+#if UWB_CHANNEL == 9
+#define TXCONFIG (&txconfig_options_ch9)
+#else
+#define TXCONFIG (&txconfig_options)
+#endif
 
 /*============================================================================
  * Helper: UART hex output
  *============================================================================*/
 static const char hex[] = "0123456789ABCDEF";
-
-static void uart_fusion_line(uint8_t seq, uint64_t ts, uint16_t dist)
-{
-    char out[32];
-    int i;
-    out[0] = 'F'; out[1] = ',';
-    out[2] = hex[(seq >> 4) & 0xF]; out[3] = hex[seq & 0xF];
-    out[4] = ','; out[5] = 'R'; out[6] = '=';
-    for (i = 0; i < 10; i++) out[7+i] = hex[(ts >> (36 - i*4)) & 0xF];
-    out[17] = ','; out[18] = 'D'; out[19] = '=';
-    out[20] = hex[(dist >> 12) & 0xF]; out[21] = hex[(dist >> 8) & 0xF];
-    out[22] = hex[(dist >> 4) & 0xF]; out[23] = hex[dist & 0xF];
-    out[24] = '\0';
-    test_run_info((unsigned char *)out);
-}
-
-static void uart_slave_line(uint8_t rank, uint64_t brx, uint64_t srx, int32_t ferr, uint16_t dist)
-{
-    char out[55];
-    int i;
-    uint32_t ferr_u32 = (uint32_t)ferr;
-    out[0] = 'S'; out[1] = ',';
-    out[2] = hex[(rank >> 4) & 0xF]; out[3] = hex[rank & 0xF];
-    out[4] = ','; out[5] = 'B'; out[6] = '=';
-    for (i = 0; i < 10; i++) out[7+i] = hex[(brx >> (36 - i*4)) & 0xF];
-    out[17] = ','; out[18] = 'Y'; out[19] = '=';
-    for (i = 0; i < 10; i++) out[20+i] = hex[(srx >> (36 - i*4)) & 0xF];
-    out[30] = ','; out[31] = 'F'; out[32] = '=';
-    for (i = 0; i < 8; i++) out[33+i] = hex[(ferr_u32 >> (28 - i*4)) & 0xF];
-    out[41] = ','; out[42] = 'D'; out[43] = '=';
-    out[44] = hex[(dist >> 12) & 0xF]; out[45] = hex[(dist >> 8) & 0xF];
-    out[46] = hex[(dist >> 4) & 0xF]; out[47] = hex[dist & 0xF];
-    out[48] = '\0';
-    test_run_info((unsigned char *)out);
-}
 
 /*============================================================================
  * Helper: match a received frame header
@@ -273,81 +205,6 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
     if (zero_dst) { rx[5] = saved_d0; rx[6] = saved_d1; }
     if (zero_src) { rx[7] = saved_s0; rx[8] = saved_s1; }
     return match;
-}
-
-/*============================================================================
- * Helper: wait for RX
- *============================================================================*/
-static int wait_for_rx(uint32_t *status, uint32_t *flen)
-{
-    /* Sleep-based polling to avoid suppressing DW3000 SFD detection.
-     * Master only calls this when a Tag is present (got_blink path). */
-    while (1)
-    {
-        Sleep(1);
-        *status = dwt_read32bitreg(SYS_STATUS_ID);
-        if (*status & SYS_STATUS_ALL_RX_ERR)
-        {
-            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            continue;
-        }
-        if (*status & SYS_STATUS_RXFCG_BIT_MASK)
-        {
-            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-            *flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
-            return 1;
-        }
-    }
-}
-
-/*============================================================================
- * Helper: delayed TX start
- *============================================================================*/
-static int do_delayed_tx(uint8_t *data, uint16_t len, uint8_t ranging)
-{
-    int ret;
-    dwt_writetxdata(len, data, 0);
-    dwt_writetxfctrl(len, 0, ranging ? 1 : 0);
-    port_rf_switch_tx();
-    ret = dwt_starttx(DWT_START_TX_DELAYED);
-    if (ret == DWT_SUCCESS)
-    {
-        while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
-        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
-    }
-    port_rf_switch_rx();
-    return ret;
-}
-
-/*============================================================================
- * Helper: wait for RX with Sleep()-based timeout (does NOT use HAL_GetTick)
- * Returns 1 on frame received, 0 on timeout / error
- *============================================================================*/
-static int wait_for_rx_timeout(uint32_t *status, uint32_t *flen, uint32_t timeout_ms)
-{
-    /* Sleep-based polling — one check per ms, same approach as auto_discovery
-     * LISTEN phase.  Tight SPI polling (every ~6us) can suppress DW3000 SFD
-     * detection; a 1 ms gap between register reads lets the receiver breathe. */
-    uint32_t elapsed;
-    for (elapsed = 0; elapsed < timeout_ms; elapsed++)
-    {
-        Sleep(1);
-        *status = dwt_read32bitreg(SYS_STATUS_ID);
-        if (*status & SYS_STATUS_ALL_RX_ERR)
-        {
-            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            continue;
-        }
-        if (*status & SYS_STATUS_RXFCG_BIT_MASK)
-        {
-            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-            *flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
-            return 1;
-        }
-    }
-    return 0;  /* timeout */
 }
 
 #if DISCOVERY_ENABLED
@@ -374,17 +231,6 @@ static int auto_discovery(auto_disc_t *disc)
     disc->master_addr[0] = 0x01;
     disc->master_addr[1] = 0x00;
 
-    {
-        char dbg[48];
-        int x;
-        const char *hx = "0123456789ABCDEF";
-        dbg[0] = 'U'; dbg[1] = 'I'; dbg[2] = 'D'; dbg[3] = '=';
-        for (x = 0; x < 8; x++)
-            dbg[4+x] = hx[(disc->my_uid32 >> (28 - x*4)) & 0xF];
-        dbg[12] = '\0';
-        test_run_info((unsigned char *)dbg);
-    }
-
     /* Initialize RF switch in RX mode for discovery listening */
     port_rf_switch_init();
     port_rf_switch_rx();
@@ -394,7 +240,7 @@ static int auto_discovery(auto_disc_t *disc)
         int attempt;
         test_run_info((unsigned char *)"AUTO LISTEN");
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        test_run_info((unsigned char *)"RX ON");
+        /* RX enabled */
 
         for (attempt = 0; attempt < 20; attempt++)
         {
@@ -431,16 +277,6 @@ static int auto_discovery(auto_disc_t *disc)
             disc->master_addr[0] = rx_buffer[7];  /* SRC low byte */
             disc->master_addr[1] = rx_buffer[8];  /* SRC high byte */
             disc->best_uid = unpack_uid(&rx_buffer[AUTO_UID_IDX]);
-
-            {
-                char dbg[48];
-                const char *hx = "0123456789ABCDEF";
-                dbg[0] = 'B'; dbg[1] = 'E'; dbg[2] = 'A'; dbg[3] = 'C'; dbg[4] = 'O'; dbg[5] = 'N'; dbg[6] = ' ';
-                dbg[7] = 'G'; dbg[8] = '='; dbg[9] = hx[disc->group_id & 0xF];
-                dbg[10] = ' '; dbg[11] = 'C'; dbg[12] = '='; dbg[13] = hx[disc->node_count & 0xF];
-                dbg[14] = '\0';
-                test_run_info((unsigned char *)dbg);
-            }
 
             disc->state = AUTO_STATE_JOIN;  /* skip election, join existing master */
             goto phase_join;
@@ -483,7 +319,7 @@ static int auto_discovery(auto_disc_t *disc)
                 {
                     int claim_attempt;
                     dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                    test_run_info((unsigned char *)"CLAIM TX");
+                    /* claim sent */
 
                     for (claim_attempt = 0; claim_attempt < 5; claim_attempt++)
                     {
@@ -511,7 +347,7 @@ static int auto_discovery(auto_disc_t *disc)
                         {
                             uint32_t other_uid = unpack_uid(&rx_buffer[AUTO_UID_IDX]);
                             disc->candidates_seen++;
-                            test_run_info((unsigned char *)"CLAIM RX");
+                            /* claim received */
                             if (other_uid < disc->best_uid)
                                 disc->best_uid = other_uid;
                         }
@@ -521,7 +357,7 @@ static int auto_discovery(auto_disc_t *disc)
                             disc->group_id = rx_buffer[AUTO_BCN_GROUP_IDX];
                             disc->node_count = rx_buffer[AUTO_BCN_COUNT_IDX];
                             disc->best_uid = unpack_uid(&rx_buffer[AUTO_UID_IDX]);
-                            test_run_info((unsigned char *)"BCN-YIELD");
+                            /* beacon-yield */
                             disc->state = AUTO_STATE_JOIN;
                             dwt_rxenable(DWT_START_RX_IMMEDIATE);
                             goto phase_join;
@@ -587,7 +423,7 @@ phase_join:
              * overwrite by a later beacon (1 ms poll vs 100 ms before).
              * 2000 iterations × 1 ms = 2 sec timeout. */
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            test_run_info((unsigned char *)"JOIN REQ TX");
+            /* join request sent */
 
             for (join_attempt = 0; join_attempt < 2000; join_attempt++)
             {
@@ -631,16 +467,6 @@ phase_join:
                     disc->my_rank = rx_buffer[AUTO_ACK_RANK_IDX];
                     disc->group_id = rx_buffer[AUTO_ACK_NODE_IDX];
 
-                    {
-                        char dbg[32];
-                        const char *hx = "0123456789ABCDEF";
-                        dbg[0] = 'R'; dbg[1] = 'A'; dbg[2] = 'N'; dbg[3] = 'K'; dbg[4] = '=';
-                        dbg[5] = hx[(disc->my_rank >> 4) & 0xF];
-                        dbg[6] = hx[disc->my_rank & 0xF];
-                        dbg[7] = '\0';
-                        test_run_info((unsigned char *)dbg);
-                    }
-
                     disc->state = AUTO_STATE_RUN;
                     return 0;
                 }
@@ -660,7 +486,13 @@ phase_join:
 
 static int auto_discovery(auto_disc_t *disc)
 {
+#ifndef FUSION_ANCHOR_RANK
+#define FUSION_ANCHOR_RANK 1
+#endif
     disc->my_rank = (uint8_t)FUSION_ANCHOR_RANK;
+    disc->node_count = DL_NUM_ANCHORS;
+    disc->master_addr[0] = 0x01;
+    disc->master_addr[1] = 0x00;
     disc->state = AUTO_STATE_RUN;
     return 0;
 }
@@ -703,7 +535,22 @@ static int anchor_init(void)
     }
     test_run_info((unsigned char *)"CONFIG OK");
 
-    dwt_configuretxrf(&txconfig_options);
+    /* Enable CIA diagnostics — required for dwt_readclockoffset() and
+     * dwt_readcarrierintegrator() to return valid clock offset data.
+     * Per DW3000 API Guide §5.6.9, must be called after dwt_configure(). */
+    dwt_configciadiag(DW_CIA_DIAG_LOG_ALL);
+
+    /* Enable DW3000 GPIO clocks (required for IRQ etc.) */
+    dwt_enablegpioclocks();
+
+    /* Enable DW3000 auto RX re-enable (RXAUTR, bit 10 in SYS_CFG). */
+    {
+        uint32_t sys_cfg = dwt_read32bitreg(SYS_CFG_ID);
+        sys_cfg |= SYS_CFG_RXAUTR_BIT_MASK;
+        dwt_write32bitreg(SYS_CFG_ID, sys_cfg);
+    }
+
+    dwt_configuretxrf(TXCONFIG);
     dwt_setrxantennadelay(RX_ANT_DLY);
     dwt_settxantennadelay(TX_ANT_DLY);
     dwt_setfinegraintxseq(0);
@@ -716,14 +563,10 @@ static int anchor_init(void)
  *============================================================================*/
 static void main_anchor_loop(void)
 {
-    uint8_t node_count = 1;   /* master counts as 1 */
+    uint8_t node_count = 1;
     uint16_t beacon_cycle = 0;
-
-    /* Init static frame fields */
-    tx_sync[10] = ANCHOR_GROUP;
-    tx_sync[11] = ANCHOR_NODE;
-    tx_resp[7] = ANCHOR_ID_VAL & 0xFF;
-    tx_resp[8] = (ANCHOR_ID_VAL >> 8) & 0xFF;
+    static uint8_t  is_first_beacon = 1;
+    static uint64_t prev_tx_ts_dtu = 0;  /* last actual TX timestamp for DLY_TS */
 
     test_run_info((unsigned char *)"ANCHOR READY");
     port_rf_switch_init();
@@ -731,38 +574,208 @@ static void main_anchor_loop(void)
     while (1)
     {
         uint32_t status_reg, frame_len;
-        int got_blink = 0;
 
-        /* Phase 1: RX TDOA Blink (500ms timeout → periodic beacon/join even without Tag).
-         * Also handles CLAIM/JOIN_REQ from late-joining anchors to prevent dual-master. */
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        if (wait_for_rx_timeout(&status_reg, &frame_len, 500)
-            && frame_len <= sizeof(rx_buffer))
+        /*=== Phase 1: RX for ~490ms (leave 10ms margin for Delayed TX setup) ===*/
         {
-            dwt_readrxdata(rx_buffer, frame_len, 0);
+            int _q;
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            for (_q = 0; _q < 5; _q++) {
+                HAL_Delay(94);  /* 5×94ms = 470ms, leaving 30ms margin for DLY_TS */
+                status_reg = dwt_read32bitreg(SYS_STATUS_ID);
+                if (status_reg & SYS_STATUS_ALL_RX_ERR) {
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    continue;
+                }
+                if (!(status_reg & SYS_STATUS_RXFCG_BIT_MASK)) continue;
+                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                if (frame_len > sizeof(rx_buffer)) {
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    continue;
+                }
+                dwt_readrxdata(rx_buffer, frame_len, 0);
 
-            if (match_header(rx_buffer, match_blink, HDR_LEN, 1, 0, 1))
-            {
-                got_blink = 1;
-                last_blink_seq = rx_buffer[SN_IDX];
-                blink_rx_ts = get_rx_timestamp_u64();
-                clock_offset = (int)dwt_readclockoffset();
-#if ENABLE_GATEWAY
+                if (match_header(rx_buffer, match_blink, HDR_LEN, 1, 0, 1))
                 {
+                    last_blink_seq = rx_buffer[SN_IDX];
+                    blink_rx_ts = get_rx_timestamp_u64();
+                    {
+                        char _s[24]; int _i;
+                        _s[0]='B'; _s[1]=','; _s[2]='0'; _s[3]=',';
+                        _s[4]=hex[(last_blink_seq>>4)&0xF]; _s[5]=hex[last_blink_seq&0xF];
+                        _s[6]=',';
+                        for (_i=0;_i<10;_i++) _s[7+_i]=hex[(blink_rx_ts>>(36-_i*4))&0xF];
+                        _s[17]='\0';
+                        test_run_info((unsigned char *)_s);
+                    }
+#if ENABLE_GATEWAY
+                    {
+                        char uid[8];
+                        uint16_t tag_addr = (uint16_t)(rx_buffer[7] | (rx_buffer[8] << 8));
+                        uid[0] = hex[(tag_addr >> 12) & 0xF];
+                        uid[1] = hex[(tag_addr >>  8) & 0xF];
+                        uid[2] = hex[(tag_addr >>  4) & 0xF];
+                        uid[3] = hex[ tag_addr        & 0xF];
+                        uid[4] = '\0';
+                        gateway_device_seen(uid, "TAG", 0);
+                    }
+#endif
+                }
+                else if (rx_buffer[9] == FUNC_ELECTION_CLAIM)
+                {
+                    dwt_forcetrxoff();
+                    port_rf_switch_tx();
+                    tx_beacon[2] = 0;
+                    tx_beacon[AUTO_BCN_GROUP_IDX] = 0;
+                    tx_beacon[AUTO_BCN_COUNT_IDX] = node_count;
+                    pack_uid(&tx_beacon[AUTO_UID_IDX], *(uint32_t *)0x1FFF7590UL);
+                    dwt_writetxdata(BEACON_LEN, tx_beacon, 0);
+                    dwt_writetxfctrl(BEACON_LEN, 0, 0);
+                    if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
+                        while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                    }
+                    port_rf_switch_rx();
+                }
+                else if (rx_buffer[9] == FUNC_JOIN_REQUEST && frame_len >= JOIN_REQ_LEN - 2)
+                {
+                    uint32_t req_uid = unpack_uid(&rx_buffer[AUTO_UID_IDX]);
+                    uint8_t req_src_lo = rx_buffer[7];
+                    uint8_t req_src_hi = rx_buffer[8];
+                    uint8_t new_rank = node_count;
+                    if (new_rank < 16) {
+                        node_count++;
+                        dwt_forcetrxoff();
+                        port_rf_switch_tx();
+                        {
+                            uint8_t ack[] = {
+                                0x41, 0x88, 0, 0xCA, 0xDE,
+                                req_src_lo, req_src_hi,
+                                0x01, 0x00, 0xEA,
+                                0, 0, 0, 0, new_rank, 0, 0
+                            };
+                            pack_uid(&ack[10], req_uid);
+                            dwt_writetxdata(sizeof(ack), ack, 0);
+                            dwt_writetxfctrl(sizeof(ack), 0, 0);
+                            if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
+                                while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                            }
+                        }
+                        port_rf_switch_rx();
+                    }
+                }
+#if ENABLE_GATEWAY
+                else if (rx_buffer[9] == FUNC_DOWNLINK_BLINK
+                         && frame_len >= DL_BLINK_LEN)
+                {
+                    uint16_t rank16 = (uint16_t)(rx_buffer[7])
+                                    | ((uint16_t)(rx_buffer[8]) << 8);
                     char uid[8];
-                    uint16_t tag_addr = (uint16_t)(rx_buffer[7] | (rx_buffer[8] << 8));
-                    uid[0] = hex[(tag_addr >> 12) & 0xF];
-                    uid[1] = hex[(tag_addr >>  8) & 0xF];
-                    uid[2] = hex[(tag_addr >>  4) & 0xF];
-                    uid[3] = hex[ tag_addr        & 0xF];
+                    uid[0] = hex[(rank16 >> 12) & 0xF]; uid[1] = hex[(rank16 >>  8) & 0xF];
+                    uid[2] = hex[(rank16 >>  4) & 0xF]; uid[3] = hex[ rank16        & 0xF];
                     uid[4] = '\0';
-                    gateway_device_seen(uid, "TAG", 0);
+                    gateway_device_seen(uid, "ANCHOR", (int)rank16);
+                }
+                else if ((rx_buffer[9] == FUNC_DL_POS_REPORT || rx_buffer[9] == 0xF3
+                       || rx_buffer[9] == 0xF5 || rx_buffer[9] == 0xF7)
+                         && frame_len >= GW_HDR_LEN) {
+                    gateway_handle_uwb_rx(rx_buffer, frame_len);
                 }
 #endif
             }
-            else if (rx_buffer[9] == FUNC_ELECTION_CLAIM)
+        }
+
+        /*=== Phase 2: TX Downlink Beacon — DWT_START_TX_DLY_TS (relative to last TX) ===*/
+        {
+#ifdef FUSION_DOWNLINK_MODE
+            uint16_t bcn_len = (uint16_t)DL_BEACON_LEN((int)g_dl_num_anchors);
+            uint8_t  dl_bcn[DL_BEACON_LEN(DL_MAX_ANCHORS)];
+            uint64_t tx_ts_dtu;
+            int i;
+
+            /* Predict TX timestamp: last actual TX + 500ms period.
+             * First beacon uses Immediate TX (no previous reference). */
+            if (is_first_beacon) {
+                tx_ts_dtu = 0;  /* placeholder */
+            } else {
+                tx_ts_dtu = prev_tx_ts_dtu + (500000ull * UUS_TO_DWT_TIME);
+            }
+
+            dl_bcn[0] = 0x41; dl_bcn[1] = 0x88;
+            dl_bcn[2] = (uint8_t)beacon_cycle;
+            dl_bcn[3] = 0xCA; dl_bcn[4] = 0xDE;
+            dl_bcn[5] = 0xFF; dl_bcn[6] = 0xFF;
+            dl_bcn[7] = ANCHOR_ID_VAL & 0xFF;
+            dl_bcn[8] = (ANCHOR_ID_VAL >> 8) & 0xFF;
+            dl_bcn[9] = FUNC_DOWNLINK_BEACON;
+            dl_bcn[DL_BCN_NUM_IDX]   = g_dl_num_anchors;
+            dl_bcn[DL_BCN_CYCLE_IDX] = (uint8_t)beacon_cycle;
+            pack_40bit_ts(&dl_bcn[DL_BCN_TX_TS_IDX], tx_ts_dtu);
+            for (i = 0; i < (int)g_dl_num_anchors && i < DL_MAX_ANCHORS; i++) {
+                pack_anchor_entry(
+                    &dl_bcn[DL_BCN_TABLE_IDX + i * DL_ANCHOR_ENTRY_SIZE],
+                    &g_dl_beacon_table[i]);
+            }
+            /* Pad last 2 bytes — absorbed by DW3210 RX corruption */
+            dl_bcn[bcn_len - 2] = 0xCC;
+            dl_bcn[bcn_len - 1] = 0xDD;
+
+            dwt_forcetrxoff();
+            port_rf_switch_tx();
+            dwt_writetxdata(bcn_len, dl_bcn, 0);
+            dwt_writetxfctrl(bcn_len, 0, 0);
+
+            if (is_first_beacon) {
+                /* First TX: no TX_TIME_LO reference yet → Immediate */
+                dwt_starttx(DWT_START_TX_IMMEDIATE);
+            } else {
+                /* DLY_TS: TX at TX_TIME_LO + (500ms_DTU >> 8).
+                 * Constant offset, independent of when this is issued. */
+                uint32_t period_hi = (uint32_t)((500000ull * UUS_TO_DWT_TIME) >> 8);
+                dwt_setdelayedtrxtime(period_hi);
+                if (dwt_starttx(DWT_START_TX_DLY_TS) != DWT_SUCCESS) {
+                    /* Target passed → fallback Immediate */
+                    test_run_info((unsigned char *)"DLY FL\r\n");
+                    dwt_starttx(DWT_START_TX_IMMEDIATE);
+                }
+            }
+
+            while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+
+            /* Read actual TX time + dump beacon payload for debug */
             {
-                /* Another anchor is electing — assert master presence with immediate beacon */
+                uint64_t actual_tx = get_tx_timestamp_u64();
+                uint64_t predicted = is_first_beacon ? actual_tx
+                    : (prev_tx_ts_dtu + (500000ull * UUS_TO_DWT_TIME));
+                int64_t  err_dtu = (int64_t)(actual_tx - predicted);
+                /* Print: M,<pred_hi>,<err_ns> */
+                {
+                    char _m[40]; int _p = 0;
+                    _m[_p++]='M'; _m[_p++]=',';
+                    _m[_p++]=hex[(predicted>>36)&0xF]; _m[_p++]=hex[(predicted>>32)&0xF];
+                    _m[_p++]=',';
+                    if (err_dtu < 0) { _m[_p++]='-'; err_dtu = -err_dtu; }
+                    else _m[_p++]='+';
+                    { int64_t ns = err_dtu / 64;
+                      if (ns > 9999) ns = 9999;
+                      _m[_p++]=hex[((int)ns>>12)&0xF]; _m[_p++]=hex[((int)ns>>8)&0xF];
+                      _m[_p++]=hex[((int)ns>>4)&0xF]; _m[_p++]=hex[(int)ns&0xF]; }
+                    _m[_p++]='\r'; _m[_p++]='\n'; _m[_p]='\0';
+                    test_run_info((unsigned char *)_m);
+                }
+                prev_tx_ts_dtu = actual_tx;
+                is_first_beacon = 0;
+            }
+
+            port_rf_switch_rx();
+#endif
+
+            beacon_cycle++;
+            if (beacon_cycle >= 10) {
+                beacon_cycle = 0;
                 dwt_forcetrxoff();
                 port_rf_switch_tx();
                 tx_beacon[2] = 0;
@@ -771,264 +784,15 @@ static void main_anchor_loop(void)
                 pack_uid(&tx_beacon[AUTO_UID_IDX], *(uint32_t *)0x1FFF7590UL);
                 dwt_writetxdata(BEACON_LEN, tx_beacon, 0);
                 dwt_writetxfctrl(BEACON_LEN, 0, 0);
-                if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
-                {
+                if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
                     while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
                     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
-                }
-                port_rf_switch_rx();
-                test_run_info((unsigned char *)"CLAIM-BCN");
-            }
-            else if (rx_buffer[9] == FUNC_JOIN_REQUEST && frame_len >= JOIN_REQ_LEN - 2)
-            {
-                /* Late join request — send ACK immediately */
-                uint32_t req_uid = unpack_uid(&rx_buffer[AUTO_UID_IDX]);
-                uint8_t req_src_lo = rx_buffer[7];
-                uint8_t req_src_hi = rx_buffer[8];
-                uint8_t new_rank = node_count;
-                if (new_rank < 16)
-                {
-                    node_count++;
-                    dwt_forcetrxoff();
-                    port_rf_switch_tx();
-                    {
-                        uint8_t ack[] = {
-                            0x41, 0x88, 0, 0xCA, 0xDE,
-                            req_src_lo, req_src_hi,
-                            0x01, 0x00,
-                            0xEA,
-                            0, 0, 0, 0,
-                            new_rank,
-                            0, 0
-                        };
-                        pack_uid(&ack[10], req_uid);
-                        dwt_writetxdata(sizeof(ack), ack, 0);
-                        dwt_writetxfctrl(sizeof(ack), 0, 0);
-                        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
-                        {
-                            while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
-                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
-                        }
-                    }
-                    port_rf_switch_rx();
-                    test_run_info((unsigned char *)"JOIN ACK TX");
-                }
-            }
-#if ENABLE_GATEWAY
-            else if ((rx_buffer[9] == 0xF3 || rx_buffer[9] == 0xF5 || rx_buffer[9] == 0xF7)
-                     && frame_len >= GW_HDR_LEN)
-            {
-                /* Gateway UWB response frame (FIND_ACK / COORD_ACK / OTA_ACK) */
-                gateway_handle_uwb_rx(rx_buffer, frame_len);
-            }
-#endif
-        }
-
-        if (got_blink)
-        {
-            /* Phase 2: TX Clock Sync (delayed) */
-            {
-                uint32_t sync_tx_time;
-                sync_tx_time = (uint32_t)((blink_rx_ts + (BLINK_RX_TO_SYNC_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
-                dwt_setdelayedtrxtime(sync_tx_time);
-                sync_rx_ts = (((uint64_t)(sync_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
-                tx_sync[SN_IDX] = last_blink_seq;
-                pack_40bit_ts(&tx_sync[12], blink_rx_ts);
-                if (do_delayed_tx(tx_sync, SYNC_LEN, 0) == DWT_SUCCESS)
-                    test_run_info((unsigned char *)"SYNC TX");
-                else
-                {
-                    test_run_info((unsigned char *)"SYNC TX FAIL");
-                    continue;  /* skip Phases 3-6 — Tag won't send Poll without SYNC */
-                }
-            }
-
-            /* Phase 3: RX TOF Poll (200ms timeout — Tag sends Poll ~2ms after SYNC) */
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            if (wait_for_rx_timeout(&status_reg, &frame_len, 200)
-                && frame_len <= sizeof(rx_buffer))
-            {
-                uint8_t tag_id_lo, tag_id_hi;
-                dwt_readrxdata(rx_buffer, frame_len, 0);
-                tag_id_lo = rx_buffer[7];
-                tag_id_hi = rx_buffer[8];
-                if (match_header(rx_buffer, match_poll, HDR_LEN, 1, 1, 1))
-                {
-                    last_poll_seq = rx_buffer[SN_IDX];
-                    test_run_info((unsigned char *)"POLL RX");
-                    poll_rx_ts = get_rx_timestamp_u64();
-                    /* Register tag with gateway */
-                    {
-                        char uid[8];
-                        uint16_t tag_addr = (uint16_t)(tag_id_lo | (tag_id_hi << 8));
-                        uid[0] = hex[(tag_addr >> 12) & 0xF];
-                        uid[1] = hex[(tag_addr >>  8) & 0xF];
-                        uid[2] = hex[(tag_addr >>  4) & 0xF];
-                        uid[3] = hex[ tag_addr        & 0xF];
-                        uid[4] = '\0';
-#if ENABLE_GATEWAY
-                        gateway_device_seen(uid, "TAG", 0);
-#endif
-                    }
-
-                    /* Phase 4: TX TOF Response (delayed) */
-                    {
-                        uint32_t resp_tx_time;
-                        resp_tx_time = (uint32_t)((poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
-                        dwt_setdelayedtrxtime(resp_tx_time);
-                        resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
-                        resp_msg_set_ts(&tx_resp[RESP_POLL_RX_TS_IDX], poll_rx_ts);
-                        resp_msg_set_ts(&tx_resp[RESP_RESP_TX_TS_IDX], resp_tx_ts);
-                        tx_resp[SN_IDX] = last_poll_seq;
-                        tx_resp[5] = tag_id_lo;
-                        tx_resp[6] = tag_id_hi;
-                        if (do_delayed_tx(tx_resp, RESP_LEN, 1) == DWT_SUCCESS)
-                        {
-                            test_run_info((unsigned char *)"RESP TX");
-                        }
-                        else
-                        {
-                            /* Delayed TX failed (TX time likely in past) —
-                             * fall back to immediate TX.  TX buffer was already
-                             * written by do_delayed_tx, just restart immediately. */
-                            dwt_forcetrxoff();
-                            port_rf_switch_tx();
-                            if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
-                            {
-                                while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
-                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
-                                test_run_info((unsigned char *)"RESP TX*");
-                            }
-                            else
-                            {
-                                test_run_info((unsigned char *)"RESP TX FAIL");
-                            }
-                            port_rf_switch_rx();
-                        }
-                    }
-
-                    /* Phase 5: RX TOF Final (200ms timeout) */
-                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                    if (wait_for_rx_timeout(&status_reg, &frame_len, 200)
-                        && frame_len <= sizeof(rx_buffer))
-                    {
-                        dwt_readrxdata(rx_buffer, frame_len, 0);
-                        if (match_header(rx_buffer, match_final, HDR_LEN, 1, 0, 1))
-                        {
-                            tof_distance_cm = (uint16_t)rx_buffer[10] | ((uint16_t)rx_buffer[11] << 8);
-                            uart_fusion_line(last_poll_seq, blink_rx_ts, tof_distance_cm);
-
-                            /* Phase 6: RX Slave Reports (TDMA).
-                             * Only iterate known slaves (node_count-1), not all 15 slots.
-                             * Short per-slot timeout — if a slave's report doesn't arrive
-                             * within 3ms the master skips it and won't miss the next Blink. */
-                            {
-                                uint64_t final_rx_ts = get_rx_timestamp_u64();
-                                int slave, slave_count;
-                                slave_count = (int)node_count - 1;  /* exclude master */
-                                for (slave = 1; slave <= slave_count; slave++)
-                                {
-                                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                                    if (!wait_for_rx_timeout(&status_reg, &frame_len, SLAVE_REPORT_SLOT_TIMEOUT_MS))
-                                        continue;
-                                    if (!(status_reg & SYS_STATUS_RXFCG_BIT_MASK))
-                                        continue;
-                                    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
-                                    if (frame_len > sizeof(rx_buffer))
-                                        continue;
-                                    dwt_readrxdata(rx_buffer, frame_len, 0);
-                                    if (match_header(rx_buffer, tx_report, HDR_LEN, 1, 0, 1))
-                                    {
-                                        uint64_t s_brx, s_srx;
-                                        int32_t s_ferr;
-                                        uint16_t s_dist;
-                                        uint8_t s_rank = rx_buffer[7];
-                                        s_brx  = unpack_40bit_ts(&rx_buffer[10]);
-                                        s_srx  = unpack_40bit_ts(&rx_buffer[15]);
-                                        s_ferr = *(int32_t*)&rx_buffer[20];
-                                        s_dist = (uint16_t)rx_buffer[24] | ((uint16_t)rx_buffer[25] << 8);
-                                        uart_slave_line(s_rank, s_brx, s_srx, s_ferr, s_dist);
-                                        /* Register slave anchor with gateway */
-                                        {
-                                            char uid[8];
-                                            uid[0] = hex[(s_rank >> 12) & 0xF];
-                                            uid[1] = hex[(s_rank >>  8) & 0xF];
-                                            uid[2] = hex[(s_rank >>  4) & 0xF];
-                                            uid[3] = hex[ s_rank        & 0xF];
-                                            uid[4] = '\0';
-#if ENABLE_GATEWAY
-                                            gateway_device_seen(uid, "ANCHOR", s_rank);
-#endif
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /*=== Phase 7: Periodic beacon (every 10 cycles). Join handled by Phase 1. ===*/
-        {
-#ifdef FUSION_DOWNLINK_MODE
-            /* Downlink beacon: TX every cycle with full anchor position table.
-             * Tag uses this to get anchor positions + timing reference for TDOA. */
-            {
-                uint16_t bcn_len = (uint16_t)DL_BEACON_LEN((int)g_dl_num_anchors);
-                uint8_t  dl_bcn[DL_BEACON_LEN(DL_MAX_ANCHORS)];
-                int i;
-                dl_bcn[0] = 0x41; dl_bcn[1] = 0x88;
-                dl_bcn[2] = (uint8_t)beacon_cycle;
-                dl_bcn[3] = 0xCA; dl_bcn[4] = 0xDE;
-                dl_bcn[5] = 0xFF; dl_bcn[6] = 0xFF;
-                dl_bcn[7] = ANCHOR_ID_VAL & 0xFF;
-                dl_bcn[8] = (ANCHOR_ID_VAL >> 8) & 0xFF;
-                dl_bcn[9] = FUNC_DOWNLINK_BEACON;
-                dl_bcn[DL_BCN_NUM_IDX]   = g_dl_num_anchors;
-                dl_bcn[DL_BCN_CYCLE_IDX] = (uint8_t)beacon_cycle;
-                for (i = 0; i < (int)g_dl_num_anchors && i < DL_MAX_ANCHORS; i++)
-                {
-                    pack_anchor_entry(
-                        &dl_bcn[DL_BCN_TABLE_IDX + i * DL_ANCHOR_ENTRY_SIZE],
-                        &g_dl_beacon_table[i]);
-                }
-                dwt_forcetrxoff();
-                port_rf_switch_tx();
-                dwt_writetxdata(bcn_len, dl_bcn, 0);
-                dwt_writetxfctrl(bcn_len, 0, 0);
-                if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
-                {
-                    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
-                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                    /* Sync DLY_TS reference: auto-discovery TX overwrites TX_TIME_LO */
+                    prev_tx_ts_dtu = get_tx_timestamp_u64();
                 }
                 port_rf_switch_rx();
             }
-#endif
 
-            beacon_cycle++;
-            if (beacon_cycle >= 10)
-            {
-                beacon_cycle = 0;
-                dwt_forcetrxoff();
-                port_rf_switch_tx();
-                tx_beacon[2] = 0;
-                tx_beacon[AUTO_BCN_GROUP_IDX] = 0;
-                tx_beacon[AUTO_BCN_COUNT_IDX] = node_count;
-                pack_uid(&tx_beacon[AUTO_UID_IDX],
-                         *(uint32_t *)0x1FFF7590UL);
-                dwt_writetxdata(BEACON_LEN, tx_beacon, 0);
-                dwt_writetxfctrl(BEACON_LEN, 0, 0);
-                if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
-                {
-                    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
-                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
-                }
-                port_rf_switch_rx();
-                test_run_info((unsigned char *)"BEACON TX");
-            }
-
-            /* Poll gateway AT commands (non-blocking, only if line available) */
 #if ENABLE_GATEWAY
             gateway_poll_uart();
 #endif
@@ -1037,234 +801,203 @@ static void main_anchor_loop(void)
 }
 
 /*============================================================================
- * SLAVE ANCHOR — rank 1+: RX Blink → RX Sync → RX Final → TX Report (TDMA)
- * All phases use timeout. Master loss detected via consecutive missed cycles
- * with beacon check. If master lost, re-discover (may become new master).
+ * SLAVE ANCHOR — rank 1+:  receives beacon + sends TDMA blink
+ *
+ *   Each cycle:
+ *     1. RX downlink beacon (0xF0) from master → heartbeat
+ *     2. TX downlink blink (0xF1) in TDMA slot (based on beacon RX time)
  *============================================================================*/
 static void master_network_formation(void);  /* forward decl — defined below */
 
 static void slave_anchor_loop(uint8_t my_rank)
 {
     int master_miss_count = 0;
-    static int consecutive_lost = 0;  /* persists across goto slave_entry */
-    #define MASTER_LOST_THRESHOLD  3   /* ~5 seconds without master */
+    static int consecutive_lost = 0;
+    #define MASTER_LOST_THRESHOLD  999
 
 slave_entry:
-    /* Init report frame static fields */
-    tx_report[7] = my_rank & 0xFF;
-    tx_report[8] = (my_rank >> 8) & 0xFF;
-    tx_report[5] = ANCHOR_ID_VAL & 0xFF;
-    tx_report[6] = (ANCHOR_ID_VAL >> 8) & 0xFF;
-
     test_run_info((unsigned char *)"SLAVE READY");
     port_rf_switch_init();
 
     while (1)
     {
         uint32_t status_reg, frame_len;
-        int got_blink = 0, got_sync = 0, got_final = 0;
+        int got_beacon = 0;
 
-        /* Phase 1: RX TDOA Blink (500ms timeout) */
-        dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        if (wait_for_rx_timeout(&status_reg, &frame_len, 500)
-            && frame_len <= sizeof(rx_buffer))
+        /*=== Phase 1: RX for ~490ms (1ms fast polling for DW3000 double buffer) ===*/
         {
-            dwt_readrxdata(rx_buffer, frame_len, 0);
-            if (match_header(rx_buffer, match_blink, HDR_LEN, 1, 0, 1))
+            int _p;
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            for (_p = 0; _p < 500; _p++)  /* 500×1ms = 500ms RX window */
             {
-                got_blink = 1;
-                last_blink_seq = rx_buffer[SN_IDX];
-                blink_rx_ts = get_rx_timestamp_u64();
-            }
-            else if (match_header(rx_buffer, match_beacon, HDR_LEN, 1, 0, 1))
-            {
-                /* Master beacon caught by Phase 1 — count as heartbeat */
-                got_blink = 0;  /* no Tag, but master is alive */
-                master_miss_count = 0;
-                consecutive_lost = 0;
-            }
-#ifdef FUSION_DOWNLINK_MODE
-            else if (match_header(rx_buffer, match_dl_beacon, HDR_LEN, 1, 0, 1)
-                     && got_blink == 0)
-            {
-                /* Downlink beacon from master — schedule blink in TDMA slot.
-                 * Only TX when no tag blink was detected (fusion protocol takes priority). */
-                uint64_t beacon_rx_ts = get_rx_timestamp_u64();
-                uint32_t blink_tx_time;
-                uint8_t dl_blink[] = {
-                    0x41, 0x88, 0, 0xCA, 0xDE, 0xFF, 0xFF, 0, 0, 0xF1, 0, 0
-                };
-                dl_blink[7] = my_rank & 0xFF;
-                dl_blink[8] = (my_rank >> 8) & 0xFF;
-                blink_tx_time = (uint32_t)(
-                    (beacon_rx_ts + (uint32_t)my_rank * DL_SLOT_DURATION_UUS * UUS_TO_DWT_TIME) >> 8);
-                dwt_setdelayedtrxtime(blink_tx_time);
-                dwt_writetxdata(DL_BLINK_LEN, dl_blink, 0);
-                dwt_writetxfctrl(DL_BLINK_LEN, 0, 0);
-                port_rf_switch_tx();
-                if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS)
-                {
-                    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
-                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                Sleep(1);
+                status_reg = dwt_read32bitreg(SYS_STATUS_ID);
+                if (status_reg & SYS_STATUS_ALL_RX_ERR) {
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    continue;
                 }
-                port_rf_switch_rx();
-                /* Count as master heartbeat */
-                master_miss_count = 0;
-                consecutive_lost = 0;
-            }
+                if (!(status_reg & SYS_STATUS_RXFCG_BIT_MASK)) continue;
+                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                if (frame_len > sizeof(rx_buffer)) {
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    continue;
+                }
+                dwt_readrxdata(rx_buffer, frame_len, 0);
+
+                /* Auto-discovery beacon (0xE7) → master heartbeat */
+                if (match_header(rx_buffer, match_beacon, HDR_LEN, 1, 0, 1))
+                {
+                    master_miss_count = 0;
+                    consecutive_lost = 0;
+                }
+#ifdef FUSION_DOWNLINK_MODE
+                /* Downlink beacon (0xF0) → heartbeat + TDMA blink via DLY_RS */
+                else if (match_header(rx_buffer, match_dl_beacon, HDR_LEN, 1, 0, 1))
+                {
+                    uint64_t bcn_rx_ts = get_rx_timestamp_u64();
+                    uint32_t slot_offset_hi;
+                    uint8_t dl_blink[DL_BLINK_LEN];
+                    int dly_ok;
+
+                    master_miss_count = 0;
+                    consecutive_lost = 0;
+                    got_beacon = 1;
+
+                    /* Build blink frame */
+                    dl_blink[0] = 0x41; dl_blink[1] = 0x88;
+                    dl_blink[2] = 0;
+                    dl_blink[3] = 0xCA; dl_blink[4] = 0xDE;
+                    dl_blink[5] = 0xFF; dl_blink[6] = 0xFF;
+                    dl_blink[7] = my_rank & 0xFF;
+                    dl_blink[8] = (my_rank >> 8) & 0xFF;
+                    dl_blink[9] = FUNC_DOWNLINK_BLINK;
+                    /* TX timestamp at bytes 10-14 (verified correct on DW3210) */
+                    {
+                        uint64_t blink_tx_ts = bcn_rx_ts
+                            + (uint64_t)my_rank * DL_SLOT_DURATION_UUS * UUS_TO_DWT_TIME;
+                        pack_40bit_ts(&dl_blink[DL_BLINK_TX_TS_IDX], blink_tx_ts);
+                    }
+                    /* Rank is encoded in SRC (bytes 7-8, verified reliable).
+                     * Pad last 2 bytes to absorb DW3210 RX corruption. */
+                    dl_blink[DL_BLINK_LEN - 2] = 0;
+                    dl_blink[DL_BLINK_LEN - 1] = 0;
+
+                    slot_offset_hi = (uint32_t)(
+                        ((uint64_t)my_rank * DL_SLOT_DURATION_UUS * UUS_TO_DWT_TIME) >> 8);
+
+                    /* Now stop RX, switch, and TX */
+                    dwt_forcetrxoff();
+                    port_rf_switch_tx();
+                    dwt_writetxdata(DL_BLINK_LEN, dl_blink, 0);
+                    dwt_writetxfctrl(DL_BLINK_LEN, 0, 0);
+                    dwt_setdelayedtrxtime(slot_offset_hi);
+                    dly_ok = (dwt_starttx(DWT_START_TX_DLY_RS) == DWT_SUCCESS);
+
+                    if (dly_ok) {
+                        while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                        /* Clock sync: compare actual TX vs predicted
+                         * + dump key blink bytes [7,8,9,10,14,15,16] */
+                        {
+                            uint64_t actual_tx  = get_tx_timestamp_u64();
+                            uint64_t predicted = bcn_rx_ts
+                                + (uint64_t)my_rank * DL_SLOT_DURATION_UUS * UUS_TO_DWT_TIME;
+                            int64_t  err_dtu = (int64_t)(actual_tx - predicted);
+                            char _t[64]; int _p = 0;
+                            _t[_p++]='T'; _t[_p++]=',';
+                            _t[_p++]=hex[my_rank&0xF]; _t[_p++]=',';
+                            /* Blink bytes: SRC[7,8] FC[9] TS[10] TS[14] RANK[15,16] */
+                            _t[_p++]='['; _t[_p++]=hex[(dl_blink[7]>>4)&0xF]; _t[_p++]=hex[dl_blink[7]&0xF];
+                            _t[_p++]=' '; _t[_p++]=hex[(dl_blink[8]>>4)&0xF]; _t[_p++]=hex[dl_blink[8]&0xF];
+                            _t[_p++]=' '; _t[_p++]=hex[(dl_blink[9]>>4)&0xF]; _t[_p++]=hex[dl_blink[9]&0xF];
+                            _t[_p++]=' '; _t[_p++]=hex[(dl_blink[10]>>4)&0xF]; _t[_p++]=hex[dl_blink[10]&0xF];
+                            _t[_p++]=' '; _t[_p++]=hex[(dl_blink[14]>>4)&0xF]; _t[_p++]=hex[dl_blink[14]&0xF];
+                            _t[_p++]=' '; _t[_p++]=hex[(dl_blink[15]>>4)&0xF]; _t[_p++]=hex[dl_blink[15]&0xF];
+                            _t[_p++]=' '; _t[_p++]=hex[(dl_blink[16]>>4)&0xF]; _t[_p++]=hex[dl_blink[16]&0xF];
+                            _t[_p++]=']'; _t[_p++]=',';
+                            { int64_t ns = err_dtu>=0 ? err_dtu/64 : -err_dtu/64;
+                              if(ns>9999)ns=9999;
+                              _t[_p++]=hex[(ns>>12)&0xF]; _t[_p++]=hex[(ns>>8)&0xF];
+                              _t[_p++]=hex[(ns>>4)&0xF]; _t[_p++]=hex[ns&0xF]; }
+                            _t[_p++]='\r'; _t[_p++]='\n'; _t[_p]='\0';
+                            test_run_info((unsigned char *)_t);
+                        }
+                    } else {
+                        /* DLY_RS failed (target passed) → fallback Immediate */
+                        test_run_info((unsigned char *)"F\r\n");
+                        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
+                            while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                            test_run_info((unsigned char *)"t\r\n");
+                        }
+                    }
+                    port_rf_switch_rx();
+                }
+                /* Tag blink (0xE2) — uplink TDOA reference */
+                else if (match_header(rx_buffer, match_tag_blink, HDR_LEN, 1, 0, 1))
+                {
+                    uint64_t tag_toa = get_rx_timestamp_u64();
+                    uint8_t   seq     = rx_buffer[SN_IDX];
+                    {
+                        char _s[24]; int _i;
+                        _s[0]='B'; _s[1]=',';
+                        _s[2]=hex[(my_rank>>4)&0xF]; _s[3]=hex[my_rank&0xF];
+                        _s[4]=','; _s[5]=hex[(seq>>4)&0xF]; _s[6]=hex[seq&0xF];
+                        _s[7]=',';
+                        for (_i=0;_i<10;_i++) _s[8+_i]=hex[(tag_toa>>(36-_i*4))&0xF];
+                        _s[18]='\0';
+                        test_run_info((unsigned char *)_s);
+                    }
+                }
 #endif
 #if ENABLE_GATEWAY
-            /* Gateway commands from master */
-            else if (rx_buffer[9] == FUNC_FIND_REQ
-                     && frame_len >= GW_HDR_LEN + 1
-                     && (uint16_t)(rx_buffer[5] | (rx_buffer[6] << 8)) == my_rank)
-            {
-                uint8_t on_off = rx_buffer[GW_HDR_LEN];
-                HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin,
-                                  on_off ? GPIO_PIN_SET : GPIO_PIN_RESET);
-                gateway_send_uwb_ack_ex(GW_MASTER_ADDR, (uint16_t)my_rank,
-                                        FUNC_FIND_ACK, &on_off, 1);
-            }
-            else if (rx_buffer[9] == FUNC_COORD_WRITE
-                     && frame_len >= GW_HDR_LEN + 6
-                     && (uint16_t)(rx_buffer[5] | (rx_buffer[6] << 8)) == my_rank)
-            {
-                int16_t cx, cy, cz;
-                uint8_t ack_payload[6];
-                cx = (int16_t)(rx_buffer[GW_HDR_LEN]     | (rx_buffer[GW_HDR_LEN+1] << 8));
-                cy = (int16_t)(rx_buffer[GW_HDR_LEN+2]   | (rx_buffer[GW_HDR_LEN+3] << 8));
-                cz = (int16_t)(rx_buffer[GW_HDR_LEN+4]   | (rx_buffer[GW_HDR_LEN+5] << 8));
-                gateway_flash_save_coord(cx, cy, cz);
-                ack_payload[0] = cx & 0xFF;  ack_payload[1] = (cx >> 8) & 0xFF;
-                ack_payload[2] = cy & 0xFF;  ack_payload[3] = (cy >> 8) & 0xFF;
-                ack_payload[4] = cz & 0xFF;  ack_payload[5] = (cz >> 8) & 0xFF;
-                gateway_send_uwb_ack_ex(GW_MASTER_ADDR, (uint16_t)my_rank,
-                                        FUNC_COORD_ACK, ack_payload, 6);
-            }
+                else if (rx_buffer[9] == FUNC_FIND_REQ
+                         && frame_len >= GW_HDR_LEN + 1
+                         && (uint16_t)(rx_buffer[5] | (rx_buffer[6] << 8)) == my_rank)
+                {
+                    uint8_t on_off = rx_buffer[GW_HDR_LEN];
+                    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin,
+                                      on_off ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                    gateway_send_uwb_ack_ex(GW_MASTER_ADDR, (uint16_t)my_rank,
+                                            FUNC_FIND_ACK, &on_off, 1);
+                }
+                else if (rx_buffer[9] == FUNC_COORD_WRITE
+                         && frame_len >= GW_HDR_LEN + 6
+                         && (uint16_t)(rx_buffer[5] | (rx_buffer[6] << 8)) == my_rank)
+                {
+                    int16_t cx, cy, cz;
+                    uint8_t ack_payload[6];
+                    cx = (int16_t)(rx_buffer[GW_HDR_LEN]     | (rx_buffer[GW_HDR_LEN+1] << 8));
+                    cy = (int16_t)(rx_buffer[GW_HDR_LEN+2]   | (rx_buffer[GW_HDR_LEN+3] << 8));
+                    cz = (int16_t)(rx_buffer[GW_HDR_LEN+4]   | (rx_buffer[GW_HDR_LEN+5] << 8));
+                    gateway_flash_save_coord(cx, cy, cz);
+                    ack_payload[0] = cx & 0xFF;  ack_payload[1] = (cx >> 8) & 0xFF;
+                    ack_payload[2] = cy & 0xFF;  ack_payload[3] = (cy >> 8) & 0xFF;
+                    ack_payload[4] = cz & 0xFF;  ack_payload[5] = (cz >> 8) & 0xFF;
+                    gateway_send_uwb_ack_ex(GW_MASTER_ADDR, (uint16_t)my_rank,
+                                            FUNC_COORD_ACK, ack_payload, 6);
+                }
 #endif
-        }
-
-        if (got_blink)
-        {
-            /* Phase 2: RX Clock Sync from Main Anchor (100ms timeout — should arrive ~300us after Blink) */
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            if (wait_for_rx_timeout(&status_reg, &frame_len, 100)
-                && frame_len <= sizeof(rx_buffer))
-            {
-                dwt_readrxdata(rx_buffer, frame_len, 0);
-                if (match_header(rx_buffer, match_sync, HDR_LEN, 1, 0, 1))
-                {
-                    got_sync = 1;
-                    sync_rx_ts = get_rx_timestamp_u64();
-                    {
-                        uint64_t master_blink_rx_ts = unpack_40bit_ts(&rx_buffer[12]);
-                        int32_t ferr = 0;
-                        if (prev_ferr_valid)
-                        {
-                            uint64_t num = master_blink_rx_ts - prev_master_blink_rx_ts;
-                            uint64_t den = blink_rx_ts - prev_slave_blink_rx_ts;
-                            if (den > 0)
-                            {
-                                ferr = (int32_t)(((int64_t)num * FERR_SCALE) / (int64_t)den - (int64_t)FERR_SCALE);
-                            }
-                        }
-                        else
-                        {
-                            prev_ferr_valid = 1;
-                        }
-                        prev_master_blink_rx_ts = master_blink_rx_ts;
-                        prev_slave_blink_rx_ts = blink_rx_ts;
-                        slave_ferr = ferr;
-                    }
-                }
-            }
-        }
-
-        if (got_sync)
-        {
-            /* Phase 3: RX TOF Final from Tag (500ms timeout) */
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            if (wait_for_rx_timeout(&status_reg, &frame_len, 500)
-                && frame_len <= sizeof(rx_buffer))
-            {
-                dwt_readrxdata(rx_buffer, frame_len, 0);
-                if (match_header(rx_buffer, match_final, HDR_LEN, 1, 0, 1))
-                {
-                    got_final = 1;
-                    tof_distance_cm = (uint16_t)rx_buffer[10] | ((uint16_t)rx_buffer[11] << 8);
-
-                    /* Phase 4: TX Slave Report (TDMA delayed TX) */
-                    {
-                        uint32_t report_tx_time;
-                        uint32_t tdma_delay;
-                        tdma_delay = TDMA_BASE_DELAY_UUS + (my_rank - 1) * TDMA_SLOT_DURATION_UUS;
-                        report_tx_time = (uint32_t)((get_rx_timestamp_u64() + tdma_delay * UUS_TO_DWT_TIME) >> 8);
-                        dwt_setdelayedtrxtime(report_tx_time);
-
-                        pack_40bit_ts(&tx_report[REPORT_BLINK_TS_IDX], blink_rx_ts);
-                        pack_40bit_ts(&tx_report[REPORT_SYNC_TS_IDX], sync_rx_ts);
-                        *(int32_t*)&tx_report[REPORT_FERR_IDX] = slave_ferr;
-                        tx_report[REPORT_TOF_DIST_IDX] = (uint8_t)(tof_distance_cm & 0xFF);
-                        tx_report[REPORT_TOF_DIST_IDX + 1] = (uint8_t)((tof_distance_cm >> 8) & 0xFF);
-                        tx_report[SN_IDX] = last_blink_seq;
-
-                        if (do_delayed_tx(tx_report, REPORT_LEN, 0) == DWT_SUCCESS)
-                            test_run_info((unsigned char *)"RPT TX");
-                        else
-                            test_run_info((unsigned char *)"RPT TX FAIL");
-                    }
-
-                    /* Phase 5: UART Output */
-                    uart_slave_line(my_rank, blink_rx_ts, sync_rx_ts, slave_ferr, tof_distance_cm);
-                }
+                /* Re-enable RX after handling frame */
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
             }
         }
 
         /*=== Master heartbeat detection ===*/
-        if (got_sync)
+        if (!got_beacon)
         {
-            /* Full cycle completed — master is alive */
-            master_miss_count = 0;
-            consecutive_lost = 0;
-        }
-        else
-        {
-            /* No clock sync this cycle — check for beacon as secondary heartbeat.
-             * Master sends beacon every ~1100ms; 1200ms timeout ensures the
-             * slave's check window always overlaps at least one master cycle. */
-            int heard_beacon = 0;
-            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            if (wait_for_rx_timeout(&status_reg, &frame_len, 1200)
-                && frame_len <= sizeof(rx_buffer))
-            {
-                dwt_readrxdata(rx_buffer, frame_len, 0);
-                if (match_header(rx_buffer, match_beacon, HDR_LEN, 1, 0, 1))
-                {
-                    heard_beacon = 1;
-                }
-            }
-
-            if (heard_beacon)
-            {
-                master_miss_count = 0;
-                consecutive_lost = 0;
-            }
-            else
-            {
-                master_miss_count++;
-                /* Heartbeat dot — one per missed cycle so we can see slave is alive */
-                test_run_info((unsigned char *)".");
-            }
-
+            master_miss_count++;
             if (master_miss_count >= MASTER_LOST_THRESHOLD)
             {
                 consecutive_lost++;
                 test_run_info((unsigned char *)"MASTER LOST");
                 if (consecutive_lost >= 3)
                 {
-                    test_run_info((unsigned char *)"FATAL: MULTI LOST → RST");
+                    test_run_info((unsigned char *)"FATAL: MULTI LOST");
                     NVIC_SystemReset();
-                    while (1) { }  /* unreachable */
+                    while (1) { }
                 }
                 goto re_discover;
             }
@@ -1283,14 +1016,14 @@ re_discover:
         {
             int idle_timeout;
 
-            test_run_info((unsigned char *)"REINIT");
+            /* re-init */
 
             /* Force DW3000 out of RX before touching RST pin */
             dwt_forcetrxoff();
 
             port_set_dw_ic_spi_fastrate();
 
-            test_run_info((unsigned char *)"RST DW");
+            /* reset DW3000 */
             reset_DWIC();
             Sleep(100);  /* warm-reset needs longer recovery than cold-boot */
 
@@ -1325,7 +1058,7 @@ re_discover:
             }
             test_run_info((unsigned char *)"CONFIG OK");
 
-            dwt_configuretxrf(&txconfig_options);
+            dwt_configuretxrf(TXCONFIG);
             dwt_setrxantennadelay(RX_ANT_DLY);
             dwt_settxantennadelay(TX_ANT_DLY);
             dwt_setfinegraintxseq(0);
@@ -1334,7 +1067,7 @@ re_discover:
             if (auto_discovery(&disc) == 0)
                 break;
 
-            test_run_info((unsigned char *)"REDISC RETRY");
+            /* re-discovery retry */
         }
 
         if (total_attempts >= 6)
@@ -1346,7 +1079,6 @@ re_discover:
         if (disc.my_rank == 0)
         {
             test_run_info((unsigned char *)"PROMOTED MASTER");
-            prev_ferr_valid = 0;
             master_network_formation();
             main_anchor_loop();  /* never returns */
         }
@@ -1355,7 +1087,6 @@ re_discover:
             test_run_info((unsigned char *)"SLAVE AGAIN");
             my_rank = disc.my_rank;
             master_miss_count = 0;
-            prev_ferr_valid = 0;
             goto slave_entry;
         }
     }
@@ -1401,7 +1132,7 @@ static void master_network_formation(void)
         {
             int attempt;
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
-            test_run_info((unsigned char *)"BCN TX");
+            /* net-formation beacon sent */
             for (attempt = 0; attempt < 20; attempt++)
             {
                 Sleep(50);
@@ -1426,7 +1157,7 @@ static void master_network_formation(void)
                     uint8_t req_src_lo = rx_buffer[7];
                     uint8_t req_src_hi = rx_buffer[8];
 
-                    test_run_info((unsigned char *)"JOIN RX");
+                    /* join request received */
 
                     /* TX JOIN_ACK */
                     dwt_forcetrxoff();
@@ -1452,7 +1183,7 @@ static void master_network_formation(void)
                     }
                     /* Switch to RX BEFORE UART */
                     port_rf_switch_rx();
-                    test_run_info((unsigned char *)"ACK TX");
+                    /* ack sent */
                 }
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
             }
@@ -1461,6 +1192,112 @@ static void master_network_formation(void)
 
     test_run_info((unsigned char *)"NET FORM DONE");
 }
+
+/*============================================================================
+ * GATEWAY SNIFFER — pure listener, no TX (except AT-command responses)
+ *============================================================================*/
+#if defined(ENABLE_GATEWAY) && defined(GATEWAY_ROLE)
+/* Format uint16_t as 4-char hex string (e.g. 1 → "0001") */
+static char *fmt_uid4(char *buf, uint16_t val)
+{
+    buf[0] = hex[(val >> 12) & 0xF];
+    buf[1] = hex[(val >>  8) & 0xF];
+    buf[2] = hex[(val >>  4) & 0xF];
+    buf[3] = hex[ val        & 0xF];
+    buf[4] = '\0';
+    return buf;
+}
+
+static void gateway_sniffer_loop(void)
+{
+    uint32_t status_reg, frame_len;
+    uint8_t  rx_buf[DL_BEACON_LEN(DL_MAX_ANCHORS) + 4];
+
+    test_run_info((unsigned char *)"GATEWAY SNIFFER");
+    /* Register gateway itself (unique UID, not a rank) */
+    gateway_device_seen("GW01", "GATEWAY", 0);
+    port_rf_switch_init();
+    port_rf_switch_rx();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    while (1)
+    {
+        int p, frame_cnt = 0;
+        for (p = 0; p < 500; p++)  /* 500ms window × 1ms poll */
+        {
+            Sleep(1);
+            status_reg = dwt_read32bitreg(SYS_STATUS_ID);
+            if (status_reg & SYS_STATUS_ALL_RX_ERR) {
+                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                continue;
+            }
+            if (!(status_reg & SYS_STATUS_RXFCG_BIT_MASK)) continue;
+
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+            frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+            if (frame_len > sizeof(rx_buf) || frame_len < HDR_LEN) {
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                continue;
+            }
+            dwt_readrxdata(rx_buf, frame_len, 0);
+            frame_cnt++;
+
+            /* Match known frame types — consistent UID = 4-digit hex of rank/addr */
+            if (rx_buf[9] == FUNC_DOWNLINK_BEACON && frame_len >= DL_BEACON_LEN(2))
+            {
+                uint8_t n = rx_buf[DL_BCN_NUM_IDX];
+                uint16_t master_addr = (uint16_t)(rx_buf[7])
+                                     | ((uint16_t)(rx_buf[8]) << 8);
+                char uid[8]; uint8_t k;
+                uid[4] = '\0';
+                /* Log master */
+                gateway_device_seen(fmt_uid4(uid, master_addr), "ANCHOR", 0);
+                /* Log slaves from beacon table using their rank as UID */
+                for (k = 1; k < n && k < DL_MAX_ANCHORS; k++) {
+                    gateway_device_seen(fmt_uid4(uid, (uint16_t)k), "ANCHOR", k);
+                }
+            }
+            else if (rx_buf[9] == FUNC_DOWNLINK_BLINK
+                   && frame_len >= DL_BLINK_LEN)
+            {
+                uint16_t rank16 = (uint16_t)(rx_buf[7])
+                                | ((uint16_t)(rx_buf[8]) << 8);
+                char uid[8];
+                uid[4] = '\0';
+                gateway_device_seen(fmt_uid4(uid, rank16), "ANCHOR", (int)rank16);
+            }
+            else if (rx_buf[9] == 0xE7)
+            {
+                uint16_t master_addr = (uint16_t)(rx_buf[7])
+                                     | ((uint16_t)(rx_buf[8]) << 8);
+                char uid[8];
+                uid[4] = '\0';
+                gateway_device_seen(fmt_uid4(uid, master_addr), "ANCHOR", 0);
+            }
+            else if ((rx_buf[9] == FUNC_DL_POS_REPORT || rx_buf[9] == 0xF3
+                   || rx_buf[9] == 0xF5 || rx_buf[9] == 0xF7)
+                   && frame_len >= GW_HDR_LEN) {
+                gateway_handle_uwb_rx(rx_buf, frame_len);
+            }
+
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        }
+
+        /* Debug: print frame count per window */
+        if (frame_cnt > 0) {
+            char _f[8];
+            _f[0]='R'; _f[1]='X'; _f[2]=':';
+            _f[3]=hex[(frame_cnt>>4)&0xF]; _f[4]=hex[frame_cnt&0xF];
+            _f[5]='\r'; _f[6]='\n'; _f[7]='\0';
+            test_run_info((unsigned char *)_f);
+        }
+
+        /* Poll AT commands after each RX window */
+        gateway_poll_uart();
+    }
+}
+#endif /* GATEWAY_ROLE */
 
 /*============================================================================
  * fusion_anchor — init → auto-discovery → run
@@ -1474,6 +1311,12 @@ int fusion_anchor(void)
         test_run_info((unsigned char *)"INIT FAIL");
         while (1) { }
     }
+
+#if defined(ENABLE_GATEWAY) && defined(GATEWAY_ROLE)
+    /* Pure gateway sniffer — no auto-discovery, no anchor loop */
+    gateway_sniffer_loop();
+    return 0;
+#endif
 
     test_run_info((unsigned char *)"DISCOVERY");
     while (auto_discovery(&disc) != 0)

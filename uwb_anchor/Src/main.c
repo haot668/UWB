@@ -2,7 +2,7 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : UWB Anchor firmware for DW3210 on STM32L412KBU6
-  *                   Clock: MSI 4MHz -> PLL -> 80MHz SYSCLK
+  *                   Clock: HSE 8MHz -> PLL -> 80MHz SYSCLK
   *                   Debug: USART2 (PA2/PA3) 115200-8N1
   ******************************************************************************
   */
@@ -15,7 +15,6 @@
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef  hspi1;
 UART_HandleTypeDef huart2;
-TIM_HandleTypeDef  htim1;
 
 #define UNIT_TEST 0
 
@@ -24,10 +23,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
-static void MX_TIM1_Init(void);
 static void MX_NVIC_Init(void);
-
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 
 extern example_ptr example_pointer;
 extern int unit_test_main(void);
@@ -57,15 +53,16 @@ void test_run_info(unsigned char *data)
 
 int main(void)
 {
-    build_examples();
     HAL_Init();
-
     SystemClock_Config();
+
+    sw_rng_init();  /* LFSR seed for DW3000 random — needs HAL_GetTick() */
+
+    build_examples();
 
     MX_GPIO_Init();
     MX_USART2_UART_Init();
     MX_SPI1_Init();
-    MX_TIM1_Init();
     MX_NVIC_Init();
 
     port_DisableEXT_IRQ();
@@ -89,28 +86,46 @@ int main(void)
 
 /**
   * @brief System Clock Configuration for STM32L412KB
-  *        MSI (4MHz) -> PLL (x40 /2) -> 80MHz SYSCLK
+  *        Primary: HSE (8MHz TCXO) -> PLL (x20 /2) -> 80MHz SYSCLK
+  *        Fallback: MSI (4MHz) -> PLL (x40 /2) -> 80MHz SYSCLK
   */
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    HAL_StatusTypeDef ret;
 
     HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
-    RCC_OscInitStruct.MSIState = RCC_MSI_ON;
-    RCC_OscInitStruct.MSICalibrationValue = 0;
-    RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+    /*--- Try HSE first (8MHz external TCXO) ---*/
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+    RCC_OscInitStruct.MSIState = RCC_MSI_OFF;
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
     RCC_OscInitStruct.PLL.PLLM = 1;
-    RCC_OscInitStruct.PLL.PLLN = 40;
+    RCC_OscInitStruct.PLL.PLLN = 20;
     RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
     RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    ret = HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+    if (ret != HAL_OK)
     {
-        _Error_Handler(__FILE__, __LINE__);
+        /*--- HSE failed, fall back to MSI (4MHz internal) ---*/
+        RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+        RCC_OscInitStruct.HSEState = RCC_HSE_OFF;
+        RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+        RCC_OscInitStruct.MSICalibrationValue = 0;
+        RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+        RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+        RCC_OscInitStruct.PLL.PLLM = 1;
+        RCC_OscInitStruct.PLL.PLLN = 40;
+        RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+        RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+        if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+        {
+            _Error_Handler(__FILE__, __LINE__);
+        }
     }
 
     RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
@@ -135,8 +150,10 @@ static void MX_NVIC_Init(void)
     HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 
-    HAL_NVIC_SetPriority(TIM1_CC_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
+    /* DW3000 IRQ (PA12 → EXTI12 → EXTI15_10_IRQn).
+     * Only set priority; the DW3000 driver enables/disables this IRQ
+     * via port_EnableEXT_IRQ() / port_DisableEXT_IRQ(). */
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
 }
 
 static void MX_SPI1_Init(void)
@@ -148,7 +165,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
     hspi1.Init.NSS = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
     hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -157,77 +174,6 @@ static void MX_SPI1_Init(void)
     {
         _Error_Handler(__FILE__, __LINE__);
     }
-}
-
-static void MX_TIM1_Init(void)
-{
-    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-    TIM_SlaveConfigTypeDef sSlaveConfig = {0};
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
-    TIM_OC_InitTypeDef sConfigOC = {0};
-    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-    htim1.Instance = TIM1;
-    htim1.Init.Prescaler = 0;
-    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim1.Init.Period = 65535;
-    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV2;
-    htim1.Init.RepetitionCounter = 0;
-    if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-    if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    sSlaveConfig.SlaveMode = TIM_SLAVEMODE_TRIGGER;
-    sSlaveConfig.InputTrigger = TIM_TS_ITR0;
-    if (HAL_TIM_SlaveConfigSynchronization(&htim1, &sSlaveConfig) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    sConfigOC.OCMode = TIM_OCMODE_TIMING;
-    sConfigOC.Pulse = 0;
-    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-    sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-    sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-    sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-    sBreakDeadTimeConfig.DeadTime = 0;
-    sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-    sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-    sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-    {
-        _Error_Handler(__FILE__, __LINE__);
-    }
-
-    HAL_TIM_MspPostInit(&htim1);
 }
 
 static void MX_USART2_UART_Init(void)
@@ -260,8 +206,8 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
 
     GPIO_InitStruct.Pin = DW_IRQn_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(DW_IRQn_GPIO_Port, &GPIO_InitStruct);
 
     GPIO_InitStruct.Pin = DW_RESET_Pin;

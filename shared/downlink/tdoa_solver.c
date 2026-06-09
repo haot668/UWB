@@ -16,6 +16,9 @@
 #include <shared_defines.h>
 #include "downlink_protocol.h"
 
+extern void test_run_info(unsigned char *data);
+static const char hex[] = "0123456789ABCDEF";
+
 /* DWT time unit in seconds: 1/(499.2e6 * 128) */
 #define DWT_TIME_S   (1.0f / (499.2e6f * 128.0f))
 
@@ -97,14 +100,17 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
     int use_2d = 0;
 
     n = num_anchors;
-    if (n < 3)
+    if (n < 2)
         return -2;
 
-    /* Use 2D mode (fix z) when only 3 anchors */
+    /* Use 2D mode (fix z) when fewer than 4 anchors */
     if (n < 4)
         use_2d = 1;
 
-    /* 1. Convert TDOA to cm */
+    /* 1. Convert TDOA to cm.
+     *    Caller pre-compensates toa_dtu using embedded TX timestamps:
+     *      effective_toa[k] = toa_dtu[k] - tx_ts_dtu[k]
+     *    Then toa_dtu[k] - toa_dtu[0] = (d_k - d_0)/c directly. */
     {
         uint64_t ref = toa_dtu[0];
         for (k = 1; k < (int)n; k++)
@@ -221,8 +227,16 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
                 det = 0;  /* solve_3x3 computes it */
             }
 
-            if (use_2d && fabsf(det) < SING_THRESH)
-                return -1;
+            /* DEBUG: print det as raw float hex (IEEE 754) */
+            if (iter == 0)
+            {
+                char _s[30]; int _p = 0;
+                _s[_p++]='S'; _s[_p++]=',';
+                { union { float f; uint32_t u; } _fu; _fu.f = det;
+                  int _j; for(_j=28;_j>=0;_j-=4) _s[_p++]=hex[(_fu.u>>_j)&0xF]; }
+                _s[_p++]='\r';_s[_p++]='\n';_s[_p]='\0';
+                test_run_info((unsigned char *)_s);
+            }
 
             /* 3f. Solve for delta */
             if (use_2d)

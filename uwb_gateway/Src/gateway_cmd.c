@@ -24,6 +24,14 @@
 
 #include "gateway_cmd.h"
 #include <gateway_protocol.h>
+#include <downlink_protocol.h>
+#include <firmware_version.h>
+
+#ifdef FUSION_DOWNLINK_MODE
+extern void dl_set_beacon_interval(uint16_t ms);
+extern void dl_set_anchor_coord(uint8_t rank, int16_t x_cm, int16_t y_cm,
+                                int16_t z_cm);
+#endif
 
 extern void test_run_info(unsigned char *data);
 
@@ -160,8 +168,9 @@ static int hex_byte(char hi, char lo, uint8_t *out)
  * Device tracking — maintained from slave reports and blink sequences
  *============================================================================*/
 #define GW_MAX_DEVICES        16
-#define GW_TIMEOUT_MS         7000
+#define GW_TIMEOUT_MS          6000  /* 6 s ≈ 12 missed cycles → offline */
 #define GW_HEARTBEAT_MS       5000
+
 
 typedef struct
 {
@@ -169,28 +178,39 @@ typedef struct
     char     type;    /* 'A'=Anchor, 'T'=Tag, 'G'=Gateway */
     uint8_t  rank;
     uint8_t  online;
+    uint16_t fw_ver;  /* Packed firmware version (0x0001=V0.0.1) */
     uint32_t last_seen_ms;
     uint32_t last_heartbeat_ms;
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
 static int      gw_dev_count = 0;
+static char     master_uid[9] = "0001";
+
+void gateway_set_master_uid(const char *uid)
+{
+    int i;
+    for (i = 0; i < 8 && uid[i]; i++) master_uid[i] = uid[i];
+    master_uid[i] = '\0';
+}
 
 void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
 {
-    int i, was_offline = 0;
+    uint32_t now = HAL_GetTick();
+    int i;
     for (i = 0; i < gw_dev_count; i++)
     {
         if (strcmp(gw_devs[i].uid, uid) == 0)
         {
-            was_offline = !gw_devs[i].online;
+            int was_offline = !gw_devs[i].online;
             gw_devs[i].online = 1;
-            gw_devs[i].last_seen_ms = HAL_GetTick();
-            if (was_offline) {
-                gw_devs[i].last_heartbeat_ms = HAL_GetTick();
-                goto send_online;
-            }
-            return;
+            gw_devs[i].last_seen_ms = now;
+            /* Only send +ONLINE if was offline or heartbeat due (every 5s),
+             * not on every frame (avoids host UI flicker). */
+            if (!was_offline && (now - gw_devs[i].last_heartbeat_ms) < GW_HEARTBEAT_MS)
+                return;
+            gw_devs[i].last_heartbeat_ms = now;
+            goto send_online;
         }
     }
     if (gw_dev_count < GW_MAX_DEVICES)
@@ -201,27 +221,76 @@ void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
         d->type      = (type && type[0] == 'T') ? 'T' : (type && type[0] == 'G') ? 'G' : 'A';
         d->rank      = rank;
         d->online    = 1;
-        d->last_seen_ms = HAL_GetTick();
-        d->last_heartbeat_ms = HAL_GetTick();
+        d->last_seen_ms = now;
+        d->last_heartbeat_ms = now;
     }
 
 send_online:
     {
         char out[48];
         int pos;
+        /* Use STORED type for existing devices, not the passed-in parameter */
+        char dev_type = 'A';
+        int  dev_rank = rank;
+        if (i < gw_dev_count) {  /* existing device */
+            dev_type = gw_devs[i].type;
+            dev_rank = gw_devs[i].rank;
+        }
         out[0] = '+'; out[1] = 'O'; out[2] = 'N'; out[3] = 'L'; out[4] = 'I'; out[5] = 'N'; out[6] = 'E'; out[7] = ',';
         pos = 8;
         pos += fmt_str(&out[pos], uid);
         out[pos++] = ',';
-        if (type && type[0] == 'T')
+        if (dev_type == 'T')
         { out[pos++] = 'T'; out[pos++] = 'A'; out[pos++] = 'G'; }
-        else if (type && type[0] == 'G')
+        else if (dev_type == 'G')
         { out[pos++] = 'G'; out[pos++] = 'A'; out[pos++] = 'T'; out[pos++] = 'E'; out[pos++] = 'W'; out[pos++] = 'A'; out[pos++] = 'Y'; }
         else
         { out[pos++] = 'A'; out[pos++] = 'N'; out[pos++] = 'C'; out[pos++] = 'H'; out[pos++] = 'O'; out[pos++] = 'R'; }
         out[pos++] = ',';
-        if (rank < 10) { out[pos++] = '0' + rank; }
-        else { pos += fmt_dec(&out[pos], rank); }
+        if (dev_rank < 10) { out[pos++] = '0' + dev_rank; }
+        else { pos += fmt_dec(&out[pos], dev_rank); }
+        out[pos] = '\0';
+        test_run_info((unsigned char *)out);
+    }
+}
+
+void gateway_device_version(const char *uid, uint16_t fw_ver)
+{
+    int i;
+    char ver[9];
+    for (i = 0; i < gw_dev_count; i++)
+    {
+        if (strcmp(gw_devs[i].uid, uid) == 0)
+        {
+            gw_devs[i].fw_ver = fw_ver;
+            /* Notify PC: +FWV,<type>,<uid>,<version> */
+            {
+                char out[48];
+                int pos;
+                fw_version_str(ver, fw_ver);
+                out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
+                out[5] = gw_devs[i].type; out[6] = ',';
+                pos = 7;
+                pos += fmt_str(&out[pos], uid);
+                out[pos++] = ',';
+                pos += fmt_str(&out[pos], ver);
+                out[pos] = '\0';
+                test_run_info((unsigned char *)out);
+            }
+            return;
+        }
+    }
+    /* Unknown device — still report version */
+    fw_version_str(ver, fw_ver);
+    {
+        char out[48];
+        int pos;
+        out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
+        out[5] = '?'; out[6] = ',';
+        pos = 7;
+        pos += fmt_str(&out[pos], uid);
+        out[pos++] = ',';
+        pos += fmt_str(&out[pos], ver);
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
     }
@@ -376,6 +445,35 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
     }
+    else if (func == FUNC_DL_POS_REPORT)
+    {
+        int16_t x = (int16_t)(frame[GW_HDR_LEN]     | (frame[GW_HDR_LEN+1] << 8));
+        int16_t y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
+        int16_t z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
+        uint16_t q = (uint16_t)(frame[GW_HDR_LEN+6] | (frame[GW_HDR_LEN+7] << 8));
+        /* Mark tag online */
+        {
+            char uid[8];
+            uid[0] = gw_hex[(src_addr >> 12) & 0xF]; uid[1] = gw_hex[(src_addr >>  8) & 0xF];
+            uid[2] = gw_hex[(src_addr >>  4) & 0xF]; uid[3] = gw_hex[ src_addr        & 0xF];
+            uid[4] = '\0';
+            gateway_device_seen(uid, "TAG", 0);
+        }
+        /* +POS,<UID>,<X>,<Y>,<Z>,<Q> */
+        out[0] = '+'; out[1] = 'P'; out[2] = 'O'; out[3] = 'S'; out[4] = ',';
+        pos = 5;
+        pos += fmt_hex4(&out[pos], src_addr);
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], x);
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], y);
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], z);
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], (int)q);
+        out[pos] = '\0';
+        test_run_info((unsigned char *)out);
+    }
 }
 
 /*============================================================================
@@ -480,7 +578,7 @@ static void send_coord_ack(uint16_t uid, int x, int y, int z)
     test_run_info((unsigned char *)ack);
 }
 
-/* AT+COORD=<UID>,<X>,<Y>,<Z> */
+/* AT+COORD=<UID>,<X>,<Y>,<Z> — retry up to 3 times, wait for anchor ACK */
 static void gateway_coord_write(const char *cmd)
 {
     const char *p = cmd;
@@ -507,12 +605,76 @@ static void gateway_coord_write(const char *cmd)
     {
         uint16_t dst = parse_uid(uid_str);
         uint8_t payload[6];
+        int retry, success = 0;
+
+        /* Direct update of beacon table (gateway on same device as Master) */
+#ifdef FUSION_DOWNLINK_MODE
+        dl_set_anchor_coord((uint8_t)dst, (int16_t)x, (int16_t)y, (int16_t)z);
+#endif
         payload[0] = x & 0xFF;  payload[1] = (x >> 8) & 0xFF;
         payload[2] = y & 0xFF;  payload[3] = (y >> 8) & 0xFF;
         payload[4] = z & 0xFF;  payload[5] = (z >> 8) & 0xFF;
 
-        gateway_send_uwb_ack(dst, FUNC_COORD_WRITE, payload, 6);
-        send_coord_ack(dst, x, y, z);
+        for (retry = 0; retry < 3; retry++)
+        {
+            gateway_send_uwb_ack(dst, FUNC_COORD_WRITE, payload, 6);
+
+            /* Wait up to 100ms for COORD_ACK from target anchor */
+            {
+                uint32_t start = HAL_GetTick();
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                while (HAL_GetTick() - start < 100)
+                {
+                    Sleep(1);
+                    {
+                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                        if (st & SYS_STATUS_ALL_RX_ERR)
+                        {
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                            continue;
+                        }
+                        if (st & SYS_STATUS_RXFCG_BIT_MASK)
+                        {
+                            uint32_t flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                            if (flen >= GW_HDR_LEN + 6 && flen <= 32)
+                            {
+                                uint8_t rx_buf[32];
+                                dwt_readrxdata(rx_buf, flen, 0);
+                                if (rx_buf[9] == FUNC_COORD_ACK)
+                                {
+                                    uint16_t src = (uint16_t)(rx_buf[7] | (rx_buf[8] << 8));
+                                    if (src == dst)
+                                    {
+                                        success = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                    }
+                }
+            }
+            if (success) break;
+        }
+
+        if (success)
+        {
+            send_coord_ack(dst, x, y, z);
+        }
+        else
+        {
+            char err[24];
+            int pos = 0;
+            err[pos++] = '+'; err[pos++] = 'C'; err[pos++] = 'O'; err[pos++] = 'O'; err[pos++] = 'R'; err[pos++] = 'D';
+            err[pos++] = '_'; err[pos++] = 'E'; err[pos++] = 'R'; err[pos++] = 'R'; err[pos++] = ',';
+            pos += fmt_hex4(&err[pos], dst);
+            err[pos++] = '\r'; err[pos++] = '\n';
+            err[pos] = '\0';
+            test_run_info((unsigned char *)err);
+        }
     }
 }
 
@@ -570,34 +732,23 @@ static void gateway_send_list(void)
     char out[48];
     int pos, i;
 
-    /* Master anchor */
-    out[0] = '+'; out[1] = 'O'; out[2] = 'N'; out[3] = 'L'; out[4] = 'I'; out[5] = 'N'; out[6] = 'E'; out[7] = ',';
-    out[8] = '0'; out[9] = '0'; out[10] = '0'; out[11] = '0'; out[12] = ',';
-    out[13] = 'G'; out[14] = 'A'; out[15] = 'T'; out[16] = 'E'; out[17] = 'W'; out[18] = 'A'; out[19] = 'Y';
-    out[20] = '0';
-    out[21] = '\0';
-    test_run_info((unsigned char *)out);
-
-    /* Known slaves/tags */
+    /* All known devices (not just online — so reconnecting host sees them) */
     for (i = 0; i < gw_dev_count; i++)
     {
-        if (gw_devs[i].online)
-        {
-            out[0] = '+'; out[1] = 'O'; out[2] = 'N'; out[3] = 'L'; out[4] = 'I'; out[5] = 'N'; out[6] = 'E'; out[7] = ',';
-            pos = 8;
-            pos += fmt_str(&out[pos], gw_devs[i].uid);
-            out[pos++] = ',';
-            if (gw_devs[i].type == 'T')
-            { out[pos++] = 'T'; out[pos++] = 'A'; out[pos++] = 'G'; }
-            else if (gw_devs[i].type == 'G')
-            { out[pos++] = 'G'; out[pos++] = 'A'; out[pos++] = 'T'; out[pos++] = 'E'; out[pos++] = 'W'; out[pos++] = 'A'; out[pos++] = 'Y'; }
-            else
-            { out[pos++] = 'A'; out[pos++] = 'N'; out[pos++] = 'C'; out[pos++] = 'H'; out[pos++] = 'O'; out[pos++] = 'R'; }
-            out[pos++] = ',';
-            out[pos++] = '0' + (gw_devs[i].rank % 10);
-            out[pos] = '\0';
-            test_run_info((unsigned char *)out);
-        }
+        out[0] = '+'; out[1] = 'O'; out[2] = 'N'; out[3] = 'L'; out[4] = 'I'; out[5] = 'N'; out[6] = 'E'; out[7] = ',';
+        pos = 8;
+        pos += fmt_str(&out[pos], gw_devs[i].uid);
+        out[pos++] = ',';
+        if (gw_devs[i].type == 'T')
+        { out[pos++] = 'T'; out[pos++] = 'A'; out[pos++] = 'G'; }
+        else if (gw_devs[i].type == 'G')
+        { out[pos++] = 'G'; out[pos++] = 'A'; out[pos++] = 'T'; out[pos++] = 'E'; out[pos++] = 'W'; out[pos++] = 'A'; out[pos++] = 'Y'; }
+        else
+        { out[pos++] = 'A'; out[pos++] = 'N'; out[pos++] = 'C'; out[pos++] = 'H'; out[pos++] = 'O'; out[pos++] = 'R'; }
+        out[pos++] = ',';
+        out[pos++] = '0' + (gw_devs[i].rank % 10);
+        out[pos] = '\0';
+        test_run_info((unsigned char *)out);
     }
 }
 
@@ -610,6 +761,7 @@ void gateway_poll_uart(void)
 
     gateway_check_timeout();
 
+    gateway_device_seen("0000", "GATEWAY", 0);  /* self keepalive */
     if (!uart_rx_line_available(cmd, sizeof(cmd)))
         return;
 
@@ -632,6 +784,28 @@ void gateway_poll_uart(void)
     else if (strncmp(cmd, "AT+COORD=", 9) == 0)
     {
         gateway_coord_write(cmd + 8);
+    }
+    else if (strncmp(cmd, "AT+RATE=", 8) == 0)
+    {
+        int ms = parse_int(cmd + 8);
+        if (ms >= 20 && ms <= 5000)
+        {
+            dl_set_beacon_interval((uint16_t)ms);
+            {
+                char out[24];
+                int pos = 0;
+                out[pos++] = '+'; out[pos++] = 'R'; out[pos++] = 'A'; out[pos++] = 'T'; out[pos++] = 'E';
+                out[pos++] = '_'; out[pos++] = 'O'; out[pos++] = 'K'; out[pos++] = ',';
+                pos += fmt_dec(&out[pos], ms);
+                out[pos++] = '\r'; out[pos++] = '\n';
+                out[pos] = '\0';
+                test_run_info((unsigned char *)out);
+            }
+        }
+        else
+        {
+            test_run_info((unsigned char *)"+RATE_ERR");
+        }
     }
     else if (strncmp(cmd, "AT+RESET=", 9) == 0)
     {
@@ -756,6 +930,22 @@ void gateway_poll_uart(void)
             out[pos] = '\0';
             test_run_info((unsigned char *)out);
         }
+    }
+    else if (strncmp(cmd, "AT+FWV", 6) == 0)
+    {
+        /* AT+FWV → +FWV,<type>,<uid>,<version> for all known devices */
+        char out[48], ver[9];
+        int pos;
+        /* Gateway itself */
+        fw_version_str(ver, FW_VERSION_U16);
+        out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
+        out[5] = 'G'; out[6] = 'W'; out[7] = ',';
+        out[8] = '0'; out[9] = '0'; out[10] = '0'; out[11] = '0'; out[12] = ',';
+        pos = 13;
+        pos += fmt_str(&out[pos], ver);
+        out[pos] = '\0';
+        test_run_info((unsigned char *)out);
+        /* (Device versions are auto-detected via beacon/slave reports) */
     }
     /* Unknown command — silently ignore */
 }

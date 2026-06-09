@@ -9,7 +9,6 @@
 #include "stm32l4xx_it.h"
 #include "port.h"
 
-extern TIM_HandleTypeDef htim1;
 extern UART_HandleTypeDef huart2;
 
 void SVC_Handler(void) {}
@@ -23,11 +22,6 @@ void SysTick_Handler(void)
 void HAL_SYSTICK_Callback(void)
 {
     HAL_IncTick();
-}
-
-void TIM1_CC_IRQHandler(void)
-{
-    HAL_TIM_IRQHandler(&htim1);
 }
 
 void USART2_IRQHandler(void)

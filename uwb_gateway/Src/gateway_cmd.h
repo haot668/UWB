@@ -27,6 +27,12 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len);
 /* Register a device (called when an anchor/tag is discovered) */
 void gateway_device_seen(const char *uid, const char *type, uint8_t rank);
 
+/* Set firmware version for a device */
+void gateway_device_version(const char *uid, uint16_t fw_ver);
+
+/* Set master UID (called from fusion_anchor after discovery) */
+void gateway_set_master_uid(const char *uid);
+
 /* Expose known node count to anchor */
 void gateway_set_node_count(uint8_t count);
 
