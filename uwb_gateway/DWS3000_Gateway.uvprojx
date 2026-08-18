@@ -49,7 +49,7 @@
             <InvalidFlash>1</InvalidFlash>
           </TargetStatus>
           <OutputDirectory>.\Output\</OutputDirectory>
-          <OutputName>gateway_V0_1</OutputName>
+          <OutputName>gateway</OutputName>
           <CreateExecutable>1</CreateExecutable>
           <CreateLib>0</CreateLib>
           <CreateHexFile>1</CreateHexFile>
@@ -80,9 +80,9 @@
             <nStopB2X>0</nStopB2X>
           </BeforeMake>
           <AfterMake>
-            <RunUserProg1>0</RunUserProg1>
+            <RunUserProg1>1</RunUserProg1>
             <RunUserProg2>0</RunUserProg2>
-            <UserProg1Name></UserProg1Name>
+            <UserProg1Name>powershell -ExecutionPolicy Bypass -File "..\scripts\rename_fw.ps1" "#H" "#L" "Gateway" "..\shared\shared_data\firmware_version.h"</UserProg1Name>
             <UserProg2Name></UserProg2Name>
             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER, STM32L412xx, TEST_FUSION_ANCHOR, ENABLE_GATEWAY, GATEWAY_ROLE</Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src;..\shared\gw_ota</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>

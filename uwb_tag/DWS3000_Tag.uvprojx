@@ -37,7 +37,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
+          <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;..\shared\gw_ota;.\Src</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath></RegisterFilePath>
           <DBRegisterFilePath></DBRegisterFilePath>
@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER, STM32L412xx, TEST_FUSION_TAG</Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;..\shared\gw_ota;.\Src</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -358,7 +358,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;..\shared\gw_ota;.\Src</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -428,6 +428,11 @@
               <FileName>shared_functions.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\shared\shared_data\shared_functions.c</FilePath>
+            </File>
+            <File>
+              <FileName>gw_ota.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\shared\gw_ota\gw_ota.c</FilePath>
             </File>
           </Files>
         </Group>
