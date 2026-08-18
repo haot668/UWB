@@ -98,7 +98,7 @@ static dwt_config_t config = {
  * tag RX clock faster than slave TX).  Over the rank·3ms slot this produces a
  * rank-dependent bias ≈0.9 m/ppm per rank step that a one-shot DLY_RS
  * calibration can only absorb while the crystals are at a stable temperature. */
-#define CFO_COMP_ENABLE  1
+#define CFO_COMP_ENABLE  0
 
 /* Runtime DLY_RS state — per-slave arrays (frozen after calibration) */
 #define DLY_RS_DEFAULT  15800   /* ~74m initial guess for all slaves */
@@ -337,6 +337,10 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
  * solve_2d_gn — 2D TDOA Gauss-Newton least squares
  *   anchors[]   : anchor positions (cm); anchor 0 = reference (beacon)
  *   tdoa_cm[]   : TDOA measurements in cm (tdoa_cm[k] = d_k - d_0, k=1..N-1)
+ *   valid[]     : per-anchor validity mask (NULL = all valid).  A slave whose
+ *                 blink was not received this cycle has valid[k]=0 and must be
+ *                 excluded, otherwise its zero TOA would read as a bogus huge
+ *                 negative TDOA and poison the whole solve.
  *   num_anchors : total anchors N
  *   skip        : slave index to exclude (-1 = use all) for outlier rejection
  *   x0/y0       : initial guess (cm)
@@ -345,13 +349,18 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
  *============================================================================*/
 static int solve_2d_gn(const dl_anchor_entry_t *anchors,
                        const float *tdoa_cm,
+                       const uint8_t *valid,
                        uint8_t num_anchors, int skip,
                        float x0, float y0,
                        float *x_out, float *y_out, float *rms_out)
 {
     float x = x0, y = y0, rms = 0.0f;
     int iter, k;
-    int used = (int)num_anchors - 1 - (skip >= 0 ? 1 : 0);
+    int used = 0;
+
+    for (k = 1; k < (int)num_anchors; k++)
+        if (k != skip && (!valid || valid[k]))
+            used++;
 
     if (used < 2)
         return -2;
@@ -373,7 +382,7 @@ static int solve_2d_gn(const dl_anchor_entry_t *anchors,
         for (k = 1; k < (int)num_anchors; k++)
         {
             float pred, res, dx0, dy0, dxk, dyk, J0, J1;
-            if (k == skip) continue;
+            if (k == skip || (valid && !valid[k])) continue;
             pred = r[k] - r[0];
             res  = pred - tdoa_cm[k];
             dx0 = (x - (float)anchors[0].x_cm) / r[0];
@@ -1188,9 +1197,17 @@ int fusion_tag(void)
                 static float last_x = 0, last_y = 0;
                 static int   has_last = 0;
 
-                /* Extract TDOA measurements (cm, referenced to anchor 0) */
+                /* Extract TDOA measurements (cm, referenced to anchor 0).
+                 * Build a validity mask: a slave whose blink was NOT received
+                 * this cycle has toa_dtu[_si]==0 and must be excluded, or the
+                 * solver reads it as a bogus huge negative TDOA. */
+                uint8_t valid[DL_MAX_ANCHORS];
+                int n_valid = 0;
+                valid[0] = 1;  /* reference anchor (beacon) always present */
                 for (_si = 1; _si < (int)num_anchors && _si < DL_MAX_ANCHORS; _si++)
                 {
+                    valid[_si] = (toa_dtu[_si] != 0);
+                    if (valid[_si]) n_valid++;
                     int64_t diff = (int64_t)(toa_dtu[_si] - toa_dtu[0]);
                     tdoa_cm[_si] = (float)diff * TDOA_CM_PER_DTU;
                 }
@@ -1212,8 +1229,13 @@ int fusion_tag(void)
                 }
 #endif
 
-                /* Try up to 2 initial guesses: (1) last good pos, (2) centroid */
+                /* Try up to 2 initial guesses: (1) last good pos, (2) centroid.
+                 * Skip the solve entirely unless ≥2 valid TDOA (reference + 2
+                 * slaves) are available — a 2D fix needs 2 independent range
+                 * differences. */
                 ret = -1;
+                if (n_valid >= 2)
+                {
                 for (_attempt = 0; _attempt < 2; _attempt++)
                 {
                     float gx, gy;
@@ -1235,22 +1257,23 @@ int fusion_tag(void)
                         gy = _sy / (float)num_anchors;
                     }
 
-                    ret = solve_2d_gn(anchor_table, tdoa_cm, num_anchors, -1,
+                    ret = solve_2d_gn(anchor_table, tdoa_cm, valid, num_anchors, -1,
                                       gx, gy, &x_cm, &y_cm, &rms);
                     if (ret != 0)
                         continue;   /* retry with centroid init */
 
                     /* Outlier rejection: a single corrupted blink (multipath /
                      * missed-adjacent) can dominate the residual.  If the all-
-                     * anchor RMS is poor and we have ≥4 anchors, try leaving
+                     * anchor RMS is poor and we have ≥3 valid TDOA, try leaving
                      * each slave out in turn and keep the lowest-RMS solution. */
-                    if (num_anchors >= 4 && rms > OUTLIER_RMS_CM)
+                    if (n_valid >= 3 && rms > OUTLIER_RMS_CM)
                     {
                         float bx = x_cm, by = y_cm, brms = rms;
                         for (_k = 1; _k < (int)num_anchors; _k++)
                         {
                             float tx, ty, trms;
-                            if (solve_2d_gn(anchor_table, tdoa_cm, num_anchors, _k,
+                            if (!valid[_k]) continue;
+                            if (solve_2d_gn(anchor_table, tdoa_cm, valid, num_anchors, _k,
                                             gx, gy, &tx, &ty, &trms) == 0 && trms < brms)
                             {
                                 bx = tx; by = ty; brms = trms;
@@ -1261,6 +1284,7 @@ int fusion_tag(void)
 
                     last_x = x_cm; last_y = y_cm; has_last = 1;
                     break;
+                }
                 }
                 z_cm = 0;
             }
