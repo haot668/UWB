@@ -90,6 +90,7 @@ static dwt_config_t config = {
 #define CALIB_SAMPLES      10      /* cycles to average for calibration   */
 #define CALIB_OUTLIER_M    20      /* reject samples > ±20m from running avg */
 #define CALIB_MAX_CYCLES   50      /* give up calibration after N total cycles */
+#define CALIB_ABS_MAX_DTU  200000  /* reject raw_bias beyond ±~940m (slot mis-sync) */
 
 /* Runtime DLY_RS state — per-slave arrays (frozen after calibration) */
 #define DLY_RS_DEFAULT  15800   /* ~74m initial guess for all slaves */
@@ -1039,7 +1040,18 @@ int fusion_tag(void)
                         int64_t outlier_thresh_dtu = (int64_t)CALIB_OUTLIER_M * 213;
                         int accept = 1;  /* default: accept this sample */
 
-                        if (calib_cnt[i] > 0)
+                        /* Absolute sanity bound: raw_bias = DLY_RS latency +
+                         * TDOA.  The latency is a fixed hardware value (≪1µs)
+                         * and |TDOA| is bounded by anchor spacing, so raw_bias
+                         * stays well under ~1µs in a synced cycle.  A value
+                         * approaching a whole beacon cycle means the tag's
+                         * slot attribution was wrong on that first cycle —
+                         * reject it, otherwise it poisons the running average
+                         * and every real sample is then discarded as an
+                         * outlier, leaving the DLY_RS stuck at its default. */
+                        if (raw_bias > CALIB_ABS_MAX_DTU || raw_bias < -CALIB_ABS_MAX_DTU)
+                            accept = 0;
+                        else if (calib_cnt[i] > 0)
                         {
                             /* Compare against per-anchor running average */
                             int64_t running_avg = calib_sum[i] / calib_cnt[i];
@@ -1090,35 +1102,24 @@ int fusion_tag(void)
                       }
                     }
                     calib_done = 1;
-                    /* Print calibration result */
-#if 0
-                    { char _c[80]; int _cp = 0;
-                      _c[_cp++]='C'; _c[_cp++]=',';
-                      { int32_t _m1=(int32_t)(dly_rs_k1/213); if(_m1<0){_c[_cp++]='-';_m1=-_m1;} else _c[_cp++]='+';
-                        _c[_cp++]=hex[(_m1>>12)&0xF];_c[_cp++]=hex[(_m1>>8)&0xF];
-                        _c[_cp++]=hex[(_m1>>4)&0xF];_c[_cp++]=hex[_m1&0xF]; }
-                      _c[_cp++]=',';
-                      { int32_t _m2=(int32_t)(dly_rs_k2/213); if(_m2<0){_c[_cp++]='-';_m2=-_m2;} else _c[_cp++]='+';
-                        _c[_cp++]=hex[(_m2>>12)&0xF];_c[_cp++]=hex[(_m2>>8)&0xF];
-                        _c[_cp++]=hex[(_m2>>4)&0xF];_c[_cp++]=hex[_m2&0xF]; }
-                      /* Also print sample counts for diagnostics */
-                      _c[_cp++]=','; _c[_cp++]=hex[calib_cnt_k1&0xF]; _c[_cp++]=hex[calib_cnt_k2&0xF];
-                      _c[_cp++]='\r';_c[_cp++]='\n';_c[_cp]='\0';
-                      test_run_info((unsigned char *)_c); }
-#endif
+                    /* One-shot: report calibrated DLY_RS (meters).  Reveals
+                     * the true RX→TX latency the tag measured — if this is
+                     * far from ~74m the DLY_RS_DEFAULT guess was wrong. */
+                    { char _dl[64]; int _dp = 0, _di;
+                      _dl[_dp++]='D'; _dl[_dp++]='L'; _dl[_dp++]=':';
+                      for (_di = 1; _di < (int)num_anchors && _di < 4; _di++) {
+                          if (_di > 1) _dl[_dp++] = ',';
+                          _dp += uart_print_f32(&_dl[_dp], (float)dly_rs[_di] / 213.0f, 1);
+                      }
+                      _dl[_dp++]='\r'; _dl[_dp++]='\n'; _dl[_dp]='\0';
+                      test_run_info((unsigned char *)_dl); }
                 }
                 else if (calib_total >= CALIB_MAX_CYCLES)
                 {
                     /* Timeout — too many outliers, keep defaults */
                     calib_done = 1;
-#if 0
-                    { char _c[30]; int _cp = 0;
-                      _c[_cp++]='C'; _c[_cp++]=','; _c[_cp++]='T'; _c[_cp++]='O';
-                      _c[_cp++]=','; _c[_cp++]=hex[calib_cnt_k1&0xF];
-                      _c[_cp++]=hex[calib_cnt_k2&0xF];
-                      _c[_cp++]='\r';_c[_cp++]='\n';_c[_cp]='\0';
-                      test_run_info((unsigned char *)_c); }
-#endif
+                    /* One-shot: calibration timed out (all samples rejected). */
+                    test_run_info((unsigned char *)"DL:timeout\r\n");
                 }
             }
         }
