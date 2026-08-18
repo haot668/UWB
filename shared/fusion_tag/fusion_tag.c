@@ -52,7 +52,7 @@ extern UART_HandleTypeDef huart2;
  * Used to trace "tag outputs wrong coordinates" — reveals whether the
  * anchor coordinates in the beacon match the physical layout and whether
  * the TDOA measurements are small (near anchors) or large (far/wrong). */
-#define TAG_DIAG  0
+#define TAG_DIAG  1
 
 /* Default communication configuration — Channel 5, 6.8 Mbps, NO STS */
 static dwt_config_t config = {
@@ -91,6 +91,14 @@ static dwt_config_t config = {
 #define CALIB_OUTLIER_M    20      /* reject samples > ±20m from running avg */
 #define CALIB_MAX_CYCLES   50      /* give up calibration after N total cycles */
 #define CALIB_ABS_MAX_DTU  200000  /* reject raw_bias beyond ±~940m (slot mis-sync) */
+
+/* CFO compensation toggle: 1 = subtract the tag↔slave clock-frequency-offset
+ * slot-timing error from raw_bias before calibration/compensation.  The DW3000
+ * reports CFO via dwt_readclockoffset() (÷2^26 = fractional offset, positive =
+ * tag RX clock faster than slave TX).  Over the rank·3ms slot this produces a
+ * rank-dependent bias ≈0.9 m/ppm per rank step that a one-shot DLY_RS
+ * calibration can only absorb while the crystals are at a stable temperature. */
+#define CFO_COMP_ENABLE  1
 
 /* Runtime DLY_RS state — per-slave arrays (frozen after calibration) */
 #define DLY_RS_DEFAULT  15800   /* ~74m initial guess for all slaves */
@@ -713,10 +721,11 @@ int fusion_tag(void)
         int      num_rx = 0;        /* total anchors collected this cycle */
         int      i, p;
         uint64_t tx_ts_dtu[DL_MAX_ANCHORS];  /* embedded TX timestamps */
-        int16_t  cfo_raw[DL_MAX_ANCHORS];    /* CFO clock offset (raw, /16 = ppm) */
+        int16_t  cfo_raw[DL_MAX_ANCHORS];    /* CFO clock offset (raw, /2^26 = frac, ×1e6 = ppm) */
+        int64_t  raw_bias_dtu[DL_MAX_ANCHORS]; /* raw slot-compensated bias (diagnostic) */
         uint32_t bcn_tick = 0;      /* portGetTickCnt() snapshot at beacon RX */
 
-        for (i = 0; i < DL_MAX_ANCHORS; i++) { toa_dtu[i] = 0; tx_ts_dtu[i] = 0; cfo_raw[i] = 0; }
+        for (i = 0; i < DL_MAX_ANCHORS; i++) { toa_dtu[i] = 0; tx_ts_dtu[i] = 0; cfo_raw[i] = 0; raw_bias_dtu[i] = 0; }
         num_anchors = 0;
 
         /*=== Slot-synced pre-sleep: skip ~490ms idle period between cycles ===*/
@@ -1030,6 +1039,20 @@ int fusion_tag(void)
                     int64_t toa_diff  = (int64_t)(toa_dtu[i] - toa_dtu[0]);
                     int64_t slot_dtu  = (int64_t)i * (int64_t)DL_SLOT_DURATION_UUS * (int64_t)UUS_TO_DWT_TIME;
                     int64_t raw_bias  = toa_diff - slot_dtu - baseline_dtu[i];  /* = DLY_RS + tdoa */
+                    raw_bias_dtu[i] = raw_bias;  /* diagnostic: uncompensated raw bias */
+
+#if CFO_COMP_ENABLE
+                    /* CFO compensation — remove the slot-timing error caused by
+                     * the tag↔slave crystal frequency offset.  cfo_raw[i] is a
+                     * signed 12-bit value where value/2^26 = fractional clock
+                     * offset (positive = tag RX clock faster than slave TX).
+                     * Over the rank·3ms slot the tag therefore counts an extra
+                     * slot_dtu × (ε_tag − ε_slave) ticks that are NOT real
+                     * propagation — subtract them so the calibration sees a
+                     * clean DLY_RS + TDOA instead of a rank-dependent CFO bias
+                     * (≈0.9 m/ppm per rank step). */
+                    raw_bias -= (slot_dtu * (int64_t)cfo_raw[i]) >> 26;
+#endif
 
                     /* Accumulate for calibration (before DLY_RS subtraction),
                      * with outlier rejection: skip samples > ±CALIB_OUTLIER_M
@@ -1123,6 +1146,33 @@ int fusion_tag(void)
                 }
             }
         }
+
+#if TAG_DIAG
+        /* CFO + raw_bias diagnostic: prints tag↔slave clock offset (raw int16,
+         * ÷2^26 = fractional, ×1e6 = ppm) and the raw slot-compensated bias
+         * (meters) for each slave, for the first 80 cycles (~4s @20Hz).  Used
+         * to confirm whether a per-slave crystal CFO is the source of the
+         * stable far-field TDOA bias. */
+        {
+            static int _diag_cnt = 0;
+            if (_diag_cnt < 80) {
+                _diag_cnt++;
+                char _d[96]; int _p = 0, _r;
+                _d[_p++]='C'; _d[_p++]='F'; _d[_p++]=':';
+                for (_r = 1; _r < (int)num_anchors && _r < 4; _r++) {
+                    if (_r > 1) _d[_p++] = ',';
+                    _p += uart_print_f32(&_d[_p], (float)cfo_raw[_r], 0);
+                }
+                _d[_p++]=' '; _d[_p++]='R'; _d[_p++]='B'; _d[_p++]=':';
+                for (_r = 1; _r < (int)num_anchors && _r < 4; _r++) {
+                    if (_r > 1) _d[_p++] = ',';
+                    _p += uart_print_f32(&_d[_p], (float)raw_bias_dtu[_r] / 213.0f, 1);
+                }
+                _d[_p++]='\r'; _d[_p++]='\n'; _d[_p]='\0';
+                test_run_info((unsigned char *)_d);
+            }
+        }
+#endif
 
         /*=== Solve and output ===*/
         {
