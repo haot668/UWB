@@ -1139,12 +1139,25 @@ int fusion_tag(void)
                 }
                 if (all_done)
                 {
-                    /* Enough good samples — freeze all per-slave DLY_RS */
-                    { int _r;
+                    /* Enough good samples — freeze a SINGLE global DLY_RS.
+                     * DLY_RS is a fixed hardware constant (identical chip +
+                     * firmware for every slave), so calibrating it per-slave
+                     * would instead bake each slave's true TDOA — a position-
+                     * dependent term — into the compensation and erase the
+                     * absolute position.  Averaging raw_bias (= DLY_RS + TDOA)
+                     * across all slaves cancels the TDOA term (≈zero-mean for
+                     * a tag near the anchor centroid), leaving the shared
+                     * DLY_RS latency. */
+                    { int64_t _sum = 0, _cnt = 0; int _r;
                       for (_r = 1; _r < (int)num_anchors && _r < DL_MAX_ANCHORS; _r++)
                       {
-                          if (calib_cnt[_r] > 0)
-                              dly_rs[_r] = calib_sum[_r] / calib_cnt[_r];
+                          if (calib_cnt[_r] > 0) { _sum += calib_sum[_r]; _cnt += calib_cnt[_r]; }
+                      }
+                      if (_cnt > 0)
+                      {
+                          int64_t _g = _sum / _cnt;
+                          for (_r = 1; _r < DL_MAX_ANCHORS; _r++)
+                              dly_rs[_r] = _g;
                       }
                     }
                     calib_done = 1;
