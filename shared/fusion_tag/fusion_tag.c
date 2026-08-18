@@ -1286,6 +1286,10 @@ int fusion_tag(void)
                     break;
                 }
                 }
+                else
+                {
+                    ret = -2;   /* <2 valid anchors: no TDOA fix possible */
+                }
                 z_cm = 0;
             }
 
