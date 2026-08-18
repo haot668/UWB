@@ -425,6 +425,11 @@
               <FilePath>..\shared\fusion_anchor\fusion_anchor.c</FilePath>
             </File>
             <File>
+              <FileName>gw_ota.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\shared\gw_ota\gw_ota.c</FilePath>
+            </File>
+            <File>
               <FileName>gateway_cmd.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Src\gateway_cmd.c</FilePath>
