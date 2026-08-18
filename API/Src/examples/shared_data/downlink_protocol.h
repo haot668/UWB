@@ -24,8 +24,8 @@ extern "C" {
 /*============================================================================
  * Function codes
  *============================================================================*/
-#define FUNC_DOWNLINK_BEACON    0xF0u   /* Master → All: anchor positions table */
-#define FUNC_DOWNLINK_BLINK     0xF1u   /* Slave  → All: per-anchor reference  */
+#define FUNC_DOWNLINK_BEACON    0xEEu   /* Master → All: anchor positions table */
+#define FUNC_DOWNLINK_BLINK     0xEFu   /* Slave  → All: per-anchor reference  */
 
 /*============================================================================
  * Timing constants

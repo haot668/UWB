@@ -63,7 +63,7 @@ extern "C" {
 #define DWT_C0_PDOA_DEV_ID  (0xDECA0312)        //!< DW3000 MPW C0 (with PDOA) silicon device ID
 
 #define DELAY_20uUSec           (20)/*Delay of 20uSec(measured 24uSec)*/
-#define MAX_RETRIES_FOR_PLL     (6)
+#define MAX_RETRIES_FOR_PLL     (50)  /* was 6 (120us) — some boards need 1ms for PLL lock */
 #define MAX_RETRIES_FOR_PGF     (3)
 
 typedef enum

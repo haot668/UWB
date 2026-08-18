@@ -16,12 +16,25 @@ extern "C" {
 #include <stdint.h>
 
 /* === Edit these two macros to bump the version === */
-#define FW_VERSION_MAJOR  0u
-#define FW_VERSION_MINOR  1u
+/* NO 'u' suffix — used in stringification via VER_STR() */
+#define FW_VERSION_MAJOR  2
+#define FW_VERSION_MINOR  7
 
 /* Packed version for embedding in frames (2 bytes) */
 #define FW_VERSION_U16 \
     ((uint16_t)(((FW_VERSION_MAJOR) << 8) | (FW_VERSION_MINOR)))
+
+/* Single-byte packed version for frame SEQ field (4+4 bit split).
+ *   bits 7-4: major (0-15),  bits 3-0: minor (0-15)
+ *   Example: V0.1→0x01, V1.2→0x12, V15.15→0xFF */
+#define FW_VERSION_BYTE \
+    ((uint8_t)((((FW_VERSION_MAJOR) & 0xF) << 4) | ((FW_VERSION_MINOR) & 0xF)))
+
+/* Unpack a FW_VERSION_BYTE back to uint16_t for fw_version_str() */
+static inline uint16_t fw_byte_to_u16(uint8_t b)
+{
+    return (uint16_t)(((b >> 4) & 0xF) << 8) | (uint16_t)(b & 0xF);
+}
 
 /* Unpack macros */
 #define FW_VER_MAJOR(v)  ((uint8_t)(((v) >> 8) & 0xFF))
