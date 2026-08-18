@@ -12,6 +12,9 @@
  * Called from HAL_UART_RxCpltCallback in main.c */
 void gateway_uart_rx_byte(uint8_t byte);
 
+/* Return number of pending unread bytes in ring buffer (diagnostic) */
+int gateway_uart_rx_pending(void);
+
 /* Check if a complete AT command line is available (non-blocking).
  * Returns 1 and copies the null-terminated line into buf on success. */
 int uart_rx_line_available(char *buf, int maxlen);
@@ -49,5 +52,24 @@ void gateway_send_uwb_ack(uint16_t dst_addr, uint8_t func,
  * Used by slave anchors to respond to gateway commands. */
 void gateway_send_uwb_ack_ex(uint16_t dst_addr, uint16_t src_addr, uint8_t func,
                               uint8_t *payload, uint8_t payload_len);
+
+/* Gateway mode flag: 0=config(IDLE/TX), 1=TDOA(RX sniff) */
+extern int gw_tdoa_active;
+
+/* Check and expire offline devices (called from sniffer loop) */
+void gateway_check_timeout(void);
+
+/* OTA SW-ARQ: poll ACK timeout (called every 1ms from sniffer loop) */
+void gateway_ota_arq_poll(void);
+
+/* OTA SW-ARQ: handle received ACK frame (called from gateway_handle_uwb_rx).
+ * Returns 1 if ACK was processed by ARQ (first copy), 0 if duplicate/stale. */
+int gateway_ota_arq_on_ack(uint16_t seq, uint8_t status);
+
+/* Broadcast OTA: poll multi-ACK collection (called every 1ms from sniffer loop). */
+void gateway_bcast_ota_poll(void);
+
+/* Format 16-bit value as 4-digit hex string (from fusion_anchor.c) */
+extern char *fmt_uid4(char *buf, uint16_t val);
 
 #endif /* GATEWAY_CMD_H */

@@ -35,10 +35,16 @@ extern void dl_set_anchor_coord(uint8_t rank, int16_t x_cm, int16_t y_cm,
 
 extern void test_run_info(unsigned char *data);
 
+/* Gateway mode: 0=config(IDLE/TX), 1=TDOA(RX sniff). Set by START/STOP ACK. */
+int gw_tdoa_active = 0;
+
 /*============================================================================
  * String formatting helpers (avoid printf dependency)
  *============================================================================*/
 static const char gw_hex[] = "0123456789ABCDEF";
+
+/* Forward declaration — called from command handlers defined before it */
+static void gateway_rx_flush(void);
 
 /* Write 4-digit uppercase hex to buf, return bytes written */
 static int fmt_hex4(char *buf, uint16_t val)
@@ -83,6 +89,12 @@ static volatile uint8_t rx_ring[GW_RX_BUF_SIZE];
 static volatile int rx_head = 0;
 static volatile int rx_tail = 0;
 
+int gateway_uart_rx_pending(void)
+{
+    if (rx_head >= rx_tail) return rx_head - rx_tail;
+    else return GW_RX_BUF_SIZE - rx_tail + rx_head;
+}
+
 void gateway_uart_rx_byte(uint8_t byte)
 {
     int next = (rx_head + 1) % GW_RX_BUF_SIZE;
@@ -97,41 +109,99 @@ void gateway_uart_rx_byte(uint8_t byte)
 int uart_rx_line_available(char *buf, int maxlen)
 {
     int i = 0;
-    while (rx_tail != rx_head && i < maxlen - 1)
+    int tail = rx_tail;  /* snapshot — don't consume until \n found */
+    while (tail != rx_head && i < maxlen - 1)
     {
-        char c = (char)rx_ring[rx_tail];
-        rx_tail = (rx_tail + 1) % GW_RX_BUF_SIZE;
+        char c = (char)rx_ring[tail];
         if (c == '\n')
         {
             /* strip trailing \r */
             if (i > 0 && buf[i - 1] == '\r') i--;
             buf[i] = '\0';
+            rx_tail = (tail + 1) % GW_RX_BUF_SIZE;  /* commit: consume up to \n */
             return 1;
         }
         buf[i++] = c;
+        tail = (tail + 1) % GW_RX_BUF_SIZE;
     }
-    /* line too long — discard remainder */
+    /* line too long — discard by consuming up to next \n */
     if (i >= maxlen - 1)
     {
-        while (rx_tail != rx_head)
+        tail = rx_tail;
+        while (tail != rx_head)
         {
-            if (rx_ring[rx_tail] == '\n') { rx_tail = (rx_tail + 1) % GW_RX_BUF_SIZE; break; }
-            rx_tail = (rx_tail + 1) % GW_RX_BUF_SIZE;
+            if (rx_ring[tail] == '\n') {
+                rx_tail = (tail + 1) % GW_RX_BUF_SIZE;
+                buf[0] = '\0';
+                return 0;
+            }
+            tail = (tail + 1) % GW_RX_BUF_SIZE;
         }
-        buf[0] = '\0';
-        return 0;
     }
+    /* No complete line yet — don't consume anything, return 0 */
     return 0;
 }
 
 /*============================================================================
- * OTA firmware upgrade — receive from PC, forward via UWB to target device
+ * OTA firmware upgrade — SW-ARQ (Stop-and-Wait Automatic Repeat reQuest)
+ *
+ *   Flow:  Host → AT+OTA_DATA → Gateway → UWB OTA_DATA → Device
+ *          Device → UWB OTA_ACK → Gateway → +OTA_PROGRESS → Host → next chunk
+ *
+ *   Gateway sends one chunk, waits ≤100ms for ACK, retries up to 3×.
+ *   CRC failures on device are SILENT → Gateway timeout triggers retry.
  *============================================================================*/
-static uint8_t  ota_active = 0;
+#define OTA_ARQ_TIMEOUT_MS  50u    /* Flash write 1.2ms + TDMA 2-10ms + ACK TX 0.1ms ≈ 12ms max */
+#define OTA_ARQ_TIMEOUT_BLK0_MS 1000u  /* Block-0: staging erase ~660ms + margin */
+#define OTA_ARQ_MAX_RETRIES 20
+#define OTA_ARQ_BACKOFF_BASE_MS 10u  /* exponential backoff: 10,20,40,80...ms */
+
+typedef enum {
+    OTA_ARQ_IDLE = 0,
+    OTA_ARQ_WAIT_ACK
+} ota_arq_state_t;
+
+static ota_arq_state_t ota_arq_state = OTA_ARQ_IDLE;
 static uint16_t ota_dst_uid;
 static uint32_t ota_total_size;
-static uint32_t ota_offset;
-static uint8_t  ota_seq;
+static uint32_t ota_offset;        /* cumulative offset (for +OTA_PROGRESS) */
+static uint16_t ota_arq_seq;       /* current block sequence number (16-bit: max 65536 chunks) */
+static uint8_t  ota_arq_buf[253];     /* pending chunk: seq(2)+data+crc(2)+pad(2) */
+static uint8_t  ota_arq_buf_len;     /* total bytes in buf                           */
+static uint8_t  ota_arq_data_len;    /* actual firmware data bytes (excl. overhead)  */
+static uint32_t ota_arq_deadline;    /* HAL_GetTick() deadline for ACK                 */
+static int      ota_arq_retries;
+static uint8_t  ota_active;          /* OTA session active (for AT+OTA_START/END)      */
+
+/*=== Broadcast OTA types and state ===*/
+#define BCAST_OTA_MAX_DEVICES  4u
+#define BCAST_OTA_ACK_WINDOW_MS  300u   /* normal chunk: 300ms ACK window (tag blinks may fill RX buffer) */
+#define BCAST_OTA_ACK_BLK0_MS   3000u   /* block 0: 3.0s (device erases 660ms flash + safety margin) */
+#define BCAST_OTA_MAX_RETRIES     5u    /* keep total poll time <15s (host timeout) */
+
+typedef enum {
+    BCAST_OTA_IDLE = 0,
+    BCAST_OTA_PREP,
+    BCAST_OTA_ACTIVE,
+    BCAST_OTA_DONE
+} bcast_ota_state_t;
+
+typedef struct {
+    uint16_t uid;
+    uint8_t  present;
+    uint8_t  done;
+} bcast_ota_dev_t;
+
+static bcast_ota_state_t bcast_state = BCAST_OTA_IDLE;
+static bcast_ota_dev_t   bcast_devs[BCAST_OTA_MAX_DEVICES];
+static uint8_t           bcast_num_devs;
+static uint16_t          bcast_arq_seq;
+static uint8_t           bcast_arq_buf[253];
+static uint8_t           bcast_arq_buf_len;
+static uint8_t           bcast_arq_data_len;
+static uint32_t          bcast_arq_deadline;
+static int               bcast_arq_retries;
+static uint32_t          bcast_total_size;
 
 static uint16_t crc16_ccitt(const uint8_t *data, int len)
 {
@@ -168,8 +238,8 @@ static int hex_byte(char hi, char lo, uint8_t *out)
  * Device tracking — maintained from slave reports and blink sequences
  *============================================================================*/
 #define GW_MAX_DEVICES        16
-#define GW_TIMEOUT_MS          6000  /* 6 s ≈ 12 missed cycles → offline */
-#define GW_HEARTBEAT_MS       5000
+#define GW_TIMEOUT_MS         15000  /* 15 s → offline */
+#define GW_HEARTBEAT_MS        8000  /*  8 s heartbeat */
 
 
 typedef struct
@@ -178,6 +248,7 @@ typedef struct
     char     type;    /* 'A'=Anchor, 'T'=Tag, 'G'=Gateway */
     uint8_t  rank;
     uint8_t  online;
+    uint8_t  seen_count; /* debounce: ≥2 sightings before reporting online */
     uint16_t fw_ver;  /* Packed firmware version (0x0001=V0.0.1) */
     uint32_t last_seen_ms;
     uint32_t last_heartbeat_ms;
@@ -203,8 +274,14 @@ void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
         if (strcmp(gw_devs[i].uid, uid) == 0)
         {
             int was_offline = !gw_devs[i].online;
-            gw_devs[i].online = 1;
             gw_devs[i].last_seen_ms = now;
+            /* Increment debounce counter (saturating at 255) */
+            if (gw_devs[i].seen_count < 255)
+                gw_devs[i].seen_count++;
+            /* Require ≥2 sightings before marking online (phantom filter) */
+            if (gw_devs[i].seen_count < 2)
+                return;
+            gw_devs[i].online = 1;
             /* Only send +ONLINE if was offline or heartbeat due (every 5s),
              * not on every frame (avoids host UI flicker). */
             if (!was_offline && (now - gw_devs[i].last_heartbeat_ms) < GW_HEARTBEAT_MS)
@@ -220,9 +297,12 @@ void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
         d->uid[sizeof(d->uid) - 1] = '\0';
         d->type      = (type && type[0] == 'T') ? 'T' : (type && type[0] == 'G') ? 'G' : 'A';
         d->rank      = rank;
-        d->online    = 1;
+        d->online    = 0;       /* stay offline until debounce satisfied */
+        d->seen_count = 1;      /* first sighting */
         d->last_seen_ms = now;
         d->last_heartbeat_ms = now;
+        /* Do NOT send +ONLINE yet — wait for 2nd sighting */
+        return;
     }
 
 send_online:
@@ -262,12 +342,12 @@ void gateway_device_version(const char *uid, uint16_t fw_ver)
     {
         if (strcmp(gw_devs[i].uid, uid) == 0)
         {
-            gw_devs[i].fw_ver = fw_ver;
-            /* Notify PC: +FWV,<type>,<uid>,<version> */
+            /* Only report when version changes (not on every blink) */
+            if (gw_devs[i].fw_ver != fw_ver)
             {
-                char out[48];
-                int pos;
+                gw_devs[i].fw_ver = fw_ver;
                 fw_version_str(ver, fw_ver);
+                char out[48]; int pos;
                 out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
                 out[5] = gw_devs[i].type; out[6] = ',';
                 pos = 7;
@@ -280,11 +360,10 @@ void gateway_device_version(const char *uid, uint16_t fw_ver)
             return;
         }
     }
-    /* Unknown device — still report version */
+    /* Unknown device — report once */
     fw_version_str(ver, fw_ver);
     {
-        char out[48];
-        int pos;
+        char out[48]; int pos;
         out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
         out[5] = '?'; out[6] = ',';
         pos = 7;
@@ -296,7 +375,7 @@ void gateway_device_version(const char *uid, uint16_t fw_ver)
     }
 }
 
-static void gateway_check_timeout(void)
+void gateway_check_timeout(void)
 {
     uint32_t now = HAL_GetTick();
     int i;
@@ -311,6 +390,7 @@ static void gateway_check_timeout(void)
         if (age_seen > GW_TIMEOUT_MS)
         {
             gw_devs[i].online = 0;
+            gw_devs[i].last_heartbeat_ms = now;  /* prevent immediate re-online */
             {
                 char out[32];
                 int pos;
@@ -321,6 +401,10 @@ static void gateway_check_timeout(void)
                 out[pos] = '\0';
                 test_run_info((unsigned char *)out);
             }
+        }
+        else if (!gw_devs[i].online)
+        {
+            ; /* was marked offline above — skip heartbeat this round */
         }
         else if (age_hb > GW_HEARTBEAT_MS)
         {
@@ -352,6 +436,73 @@ static void gateway_check_timeout(void)
 /*============================================================================
  * UWB frame TX helpers
  *============================================================================*/
+
+/* Send a UWB command and wait for ACK with a specific func code.
+ * Returns 1 if ACK received, 0 if all retries exhausted.
+ * delay_ms: per-attempt RX poll window
+ * retries: max TX attempts */
+static int gateway_send_cmd_wait_ack(uint16_t dst, uint8_t cmd_func,
+                                      uint8_t *payload, uint8_t payload_len,
+                                      uint8_t ack_func, int delay_ms, int retries)
+{
+    int _r, ack_ok = 0;
+    for (_r = 0; _r < retries && !ack_ok; _r++) {
+        gateway_send_uwb_ack(dst, cmd_func, payload, payload_len);
+        {
+            uint32_t dl = HAL_GetTick() + (uint32_t)delay_ms;
+            /* Disable DW3000 EXTI IRQ during polling — the IRQ handler's
+             * dwt_forcetrxoff() issues SPI commands that collide with our
+             * own SPI reads (SYS_STATUS, RX_FINFO, rxdata), corrupting
+             * frame data.  The polling loop handles all RX itself. */
+            port_DisableEXT_IRQ();
+            while (HAL_GetTick() < dl) {
+                uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+
+                /* Check for received frame FIRST. */
+                if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                    uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                    if (fl >= GW_HDR_LEN && fl <= 32) {
+                        uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                        /* Diagnostic: print func code of every RX frame */
+                        { char _rx[20]; int _rxp=0;
+                          _rx[_rxp++]='R'; _rx[_rxp++]='X'; _rx[_rxp++]=':';
+                          _rx[_rxp++]=gw_hex[(rb[9]>>4)&0xF]; _rx[_rxp++]=gw_hex[rb[9]&0xF];
+                          _rx[_rxp++]=','; _rx[_rxp++]='L'; _rx[_rxp++]='=';
+                          _rx[_rxp++]=gw_hex[(fl>>4)&0xF]; _rx[_rxp++]=gw_hex[fl&0xF];
+                          _rx[_rxp++]='\r'; _rx[_rxp++]='\n'; _rx[_rxp]='\0';
+                          test_run_info((unsigned char *)_rx); }
+                        if (rb[9] == ack_func) { ack_ok = 1; break; }
+                    } else {
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                    }
+                    /* MUST re-enable RX after consuming a frame: the EXTI
+                     * IRQ handler calls dwt_forcetrxoff() which forces the
+                     * DW3000 to IDLE — RXAUTR can't keep RX running. */
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                }
+
+                /* Clean RX errors AFTER handling any good frame. */
+                if (st & SYS_STATUS_ALL_RX_ERR) {
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                }
+
+                /* No unconditional dwt_rxenable() — prevents aborting
+                 * incoming frames mid-preamble.  RX is maintained by the
+                 * explicit dwt_rxenable() calls above (after frame/error). */
+                Sleep(1);
+            }
+            /* Re-enable DW3000 EXTI IRQ after polling — the sniffer loop
+             * (or next TX) needs IRQ for normal operation.  Clear stale
+             * pending bit first so a frame received during the final ms
+             * of polling doesn't trigger a spurious IRQ. */
+            EXTI->PR1 = (1u << 12);
+            port_EnableEXT_IRQ();
+        }
+    }
+    return ack_ok;
+}
 
 /* Build and send a UWB data frame immediately.
  * Assumes radio is idle (caller should be in Phase 7 or after forcetrxoff).
@@ -389,18 +540,62 @@ void gateway_send_uwb_ack_ex(uint16_t dst_addr, uint16_t src_addr, uint8_t func,
         frame[GW_HDR_LEN + i] = payload[i];
 
     {
-        uint16_t total = GW_HDR_LEN + payload_len + 2;  /* +2 for FCS */
+        uint16_t total = GW_HDR_LEN + payload_len;  /* DW3000 auto-appends FCS */
+        int tx_ok = 0;
+
+        /* Disable DW3000 IRQ during TX to prevent EXTI handler's
+         * dwt_forcetrxoff() from aborting our transmission. */
+        port_DisableEXT_IRQ();
 
         dwt_forcetrxoff();
-        port_rf_switch_tx();
+
+        port_rf_switch_tx();  /* PA7=TX_EN=1, PA6=RX_EN=0 */
+
         dwt_writetxdata(total, frame, 0);
         dwt_writetxfctrl(total, 0, 0);
-        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
-        {
-            while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { }
+        if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS) {
+            { uint32_t tx_dl = HAL_GetTick() + 10u;
+              while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {
+                if (HAL_GetTick() > tx_dl) break;
+              }
+            }
             dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+            tx_ok = 1;
         }
-        port_rf_switch_rx();
+
+        port_rf_switch_rx();  /* PA7=TX_EN=0, PA6=RX_EN=1 */
+        dwt_forcetrxoff();
+
+        /*=== Print TX confirm BEFORE re-enabling EXTI ===
+         * UART TX takes ~1ms — if EXTI were enabled during this time,
+         * a received frame would trigger IRQ → dwt_forcetrxoff() → DW3000=IDLE,
+         * breaking any inline polling loop that follows.
+         * Printing NOW (EXTI still disabled) eliminates this gap entirely. */
+        if (func == FUNC_PREP_CMD    || func == FUNC_COORD_WRITE ||
+            func == FUNC_OTA_PREPARE || func == FUNC_STOP_TDOA  ||
+            func == FUNC_START_TDOA  || func == FUNC_OTA_END    ||
+            func == FUNC_OTA_ABORT   || func == FUNC_OTA_DATA) {
+            char _tx[24]; int _txp = 0;
+            _tx[_txp++]='T'; _tx[_txp++]='X'; _tx[_txp++]=',';
+            _tx[_txp++]='F'; _tx[_txp++]='=';
+            _tx[_txp++]=gw_hex[(func>>4)&0xF]; _tx[_txp++]=gw_hex[func&0xF];
+            _tx[_txp++]=',';
+            if (tx_ok) {
+                _tx[_txp++]='O';
+            } else {
+                _tx[_txp++]='E'; _tx[_txp++]='R'; _tx[_txp++]='R';
+            }
+            _tx[_txp++]='\r'; _tx[_txp++]='\n'; _tx[_txp]='\0';
+            test_run_info((unsigned char *)_tx);
+        }
+
+        /* Clear any EXTI pending that may have been set during TX,
+         * THEN re-enable IRQ — gap from here to caller's disable is
+         * just a few instructions (function epilogue). */
+        EXTI->PR1 = (1u << 12);
+        port_EnableEXT_IRQ();
+
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
     }
 }
 
@@ -427,52 +622,77 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
     }
-    else if (func == FUNC_COORD_ACK)
-    {
-        int16_t x = (int16_t)(frame[GW_HDR_LEN]     | (frame[GW_HDR_LEN+1] << 8));
-        int16_t y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
-        int16_t z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
-        /* +COORD,<UID_HEX4>,<X>,<Y>,<Z> */
-        out[0] = '+'; out[1] = 'C'; out[2] = 'O'; out[3] = 'O'; out[4] = 'R'; out[5] = 'D'; out[6] = ',';
-        pos = 7;
-        pos += fmt_hex4(&out[pos], src_addr);
-        out[pos++] = ',';
-        pos += fmt_dec(&out[pos], x);
-        out[pos++] = ',';
-        pos += fmt_dec(&out[pos], y);
-        out[pos++] = ',';
-        pos += fmt_dec(&out[pos], z);
-        out[pos] = '\0';
-        test_run_info((unsigned char *)out);
-    }
     else if (func == FUNC_DL_POS_REPORT)
     {
         int16_t x = (int16_t)(frame[GW_HDR_LEN]     | (frame[GW_HDR_LEN+1] << 8));
         int16_t y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
         int16_t z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
         uint16_t q = (uint16_t)(frame[GW_HDR_LEN+6] | (frame[GW_HDR_LEN+7] << 8));
-        /* Mark tag online */
+        /* Mark tag online + extract firmware version */
         {
             char uid[8];
             uid[0] = gw_hex[(src_addr >> 12) & 0xF]; uid[1] = gw_hex[(src_addr >>  8) & 0xF];
             uid[2] = gw_hex[(src_addr >>  4) & 0xF]; uid[3] = gw_hex[ src_addr        & 0xF];
             uid[4] = '\0';
             gateway_device_seen(uid, "TAG", 0);
+            /* Extract firmware version from position report (bytes 18-19) */
+            if (len >= GW_HDR_LEN + 10) {
+                uint16_t fw = (uint16_t)(frame[GW_HDR_LEN+8] | (frame[GW_HDR_LEN+9] << 8));
+                gateway_device_version(uid, fw);
+            }
         }
-        /* +POS,<UID>,<X>,<Y>,<Z>,<Q> */
+        /* +POS,<UID>,<X.XX>,<Y.YY>,<Z.ZZ>,<Q> — coords in meters */
         out[0] = '+'; out[1] = 'P'; out[2] = 'O'; out[3] = 'S'; out[4] = ',';
         pos = 5;
         pos += fmt_hex4(&out[pos], src_addr);
         out[pos++] = ',';
-        pos += fmt_dec(&out[pos], x);
+        pos += fmt_coord(&out[pos], (int)x);
         out[pos++] = ',';
-        pos += fmt_dec(&out[pos], y);
+        pos += fmt_coord(&out[pos], (int)y);
         out[pos++] = ',';
-        pos += fmt_dec(&out[pos], z);
+        pos += fmt_coord(&out[pos], (int)z);
         out[pos++] = ',';
         pos += fmt_dec(&out[pos], (int)q);
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
+    }
+    else if (func == FUNC_OTA_ACK)
+    {
+        /* +OTA_ACK,<UID_HEX4>,<SEQ>,<STATUS>
+         * seq    = frame[10..11] 16-bit echo of chunk sequence number
+         * status = frame[12]     0=OK, 1=CRC error, 2=flash error */
+        uint16_t seq    = (uint16_t)(frame[GW_HDR_LEN]) | ((uint16_t)(frame[GW_HDR_LEN + 1]) << 8);
+        uint8_t  status = frame[GW_HDR_LEN + 2];
+
+        /* Broadcast OTA: track multi-device ACKs.  If consumed by
+         * broadcast handler, skip unicast ARQ processing below. */
+        if (bcast_state == BCAST_OTA_ACTIVE) {
+            gateway_bcast_ota_on_ack(seq, status, src_addr);
+            /* Don't print per-device ACK in broadcast mode — host
+             * gets summary via +OTA_PROGRESS. */
+            return;
+        }
+
+        /* Feed into SW-ARQ state machine first (may print +OTA_PROGRESS).
+         * Only print +OTA_ACK if this was the FIRST copy — suppress duplicates
+         * from the device's 2× burst to avoid flooding the host UART parser. */
+        if (gateway_ota_arq_on_ack(seq, status)) {
+            out[0] = '+'; out[1] = 'O'; out[2] = 'T'; out[3] = 'A';
+            out[4] = '_'; out[5] = 'A'; out[6] = 'C'; out[7] = 'K';
+            out[8] = ','; pos = 9;
+            pos += fmt_hex4(&out[pos], src_addr);
+            out[pos++] = ',';
+            out[pos++] = gw_hex[(seq >> 12) & 0xF];
+            out[pos++] = gw_hex[(seq >> 8) & 0xF];
+            out[pos++] = gw_hex[(seq >> 4) & 0xF];
+            out[pos++] = gw_hex[seq & 0xF];
+            out[pos++] = ',';
+            out[pos++] = status == 0 ? '0'
+                       : status == 1 ? '1'
+                       : '2';
+            out[pos] = '\0';
+            test_run_info((unsigned char *)out);
+        }
     }
 }
 
@@ -496,15 +716,65 @@ static uint16_t parse_uid(const char *s)
 
 static int parse_int(const char *s)
 {
-    int val = 0;
-    int neg = 0;
+    int val = 0, neg = 0;
     if (*s == '-') { neg = 1; s++; }
-    while (*s >= '0' && *s <= '9')
-    {
-        val = val * 10 + (*s - '0');
-        s++;
-    }
+    while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
     return neg ? -val : val;
+}
+
+/* Parse coordinate — returns cm units.
+ * Accepts optional decimal point with up to 2 fractional digits.
+ *    "2.50" → 250    "1.0" → 100    "-3.5" → -350    "0" → 0   */
+static int parse_coord(const char *s)
+{
+    int val = 0, neg = 0, frac = 0, frac_digits = 0;
+    if (*s == '-') { neg = 1; s++; }
+    while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9' && frac_digits < 2) {
+            frac = frac * 10 + (*s - '0');
+            frac_digits++;
+            s++;
+        }
+        /* skip any remaining fractional digits beyond 2 */
+        while (*s >= '0' && *s <= '9') s++;
+    }
+    /* Normalize: if only 1 fractional digit, scale to 2 digits */
+    if (frac_digits == 1) frac *= 10;
+    val = val * 100 + frac;
+    return neg ? -val : val;
+}
+
+/* Format coordinate (cm) as meters string with 2 fractional digits.
+ *   250 → "2.50"    100 → "1.00"    -350 → "-3.50"    0 → "0.00"   */
+static int fmt_coord(char *buf, int val_cm)
+{
+    int pos = 0;
+    unsigned u, int_part, frac_part;
+    char tmp[12];
+    int i;
+
+    if (val_cm < 0) { buf[pos++] = '-'; u = (unsigned)(-val_cm); }
+    else             { u = (unsigned)val_cm; }
+
+    int_part = u / 100u;
+    frac_part = u % 100u;
+
+    /* integer part */
+    if (int_part == 0) { buf[pos++] = '0'; }
+    else {
+        i = 0;
+        while (int_part > 0) { tmp[i++] = '0' + (int_part % 10); int_part /= 10; }
+        while (i > 0) { buf[pos++] = tmp[--i]; }
+    }
+
+    /* decimal point + 2 fractional digits */
+    buf[pos++] = '.';
+    buf[pos++] = '0' + (char)(frac_part / 10u);
+    buf[pos++] = '0' + (char)(frac_part % 10u);
+
+    return pos;
 }
 
 /* Build "+FIND,<UID4>,<0/1>" and send on UART */
@@ -520,6 +790,8 @@ static void send_find_ack(uint16_t uid, int on_off)
     ack[pos] = '\0';
     test_run_info((unsigned char *)ack);
 }
+
+extern uint32_t g_find_blink_until;  /* fusion_anchor.c */
 
 /* AT+FIND=<UID>,<0/1> */
 static void gateway_find(const char *cmd)
@@ -543,37 +815,66 @@ static void gateway_find(const char *cmd)
     {
         uint16_t dst = parse_uid(uid_str);
 
-        if (dst == 0)
+        /* Forward FIND to anchor via UWB, wait for FIND_ACK (0xF3).
+         * FIND_REQ is only 11B — DW3210 corrupts last 2B of short frames.
+         * Pad 2 extra bytes (13B total) to move func+payload out of danger zone. */
         {
-            /* Master anchor — local LED toggle */
-            HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin,
-                              on_off ? GPIO_PIN_SET : GPIO_PIN_RESET);
-            send_find_ack(dst, on_off);
-        }
-        else
-        {
-            /* Forward to remote anchor via UWB */
-            uint8_t payload = (uint8_t)on_off;
-            gateway_send_uwb_ack(dst, FUNC_FIND_REQ, &payload, 1);
-            send_find_ack(dst, on_off);
+            int _r, ack_ok = 0;
+            uint8_t payload[3];
+            payload[0] = (uint8_t)on_off;
+            payload[1] = 0xCC;  /* padding — avoids DW3210 last-2B RX bug */
+            payload[2] = 0xDD;  /* padding */
+            for (_r = 0; _r < 3 && !ack_ok; _r++) {
+                gateway_send_uwb_ack(dst, FUNC_FIND_REQ, payload, 3);
+                { uint32_t dl = HAL_GetTick() + (_r < 2 ? 30u : 100u);
+                  port_DisableEXT_IRQ();
+                  while (HAL_GetTick() < dl) {
+                    uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                    if (st & SYS_STATUS_ALL_RX_ERR) {
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        Sleep(1); continue; }
+                    if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                        uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                        if (fl >= GW_HDR_LEN && fl <= 32) {
+                            uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            if (rb[9] == FUNC_FIND_ACK) { ack_ok = 1; break; }
+                        } else { dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK); }
+                        /* IRQ handler calls dwt_forcetrxoff() → must re-enter RX */
+                        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    }
+                    Sleep(1);
+                  }
+                  EXTI->PR1 = (1u << 12);
+                  port_EnableEXT_IRQ();
+                }
+            }
+            if (ack_ok) send_find_ack(dst, on_off);
+            else { char _e[24]; int _p=0; _e[_p++]='+'; _e[_p++]='F'; _e[_p++]='I'; _e[_p++]='N'; _e[_p++]='D';
+                   _e[_p++]='_'; _e[_p++]='E'; _e[_p++]='R'; _e[_p++]='R'; _e[_p++]=',';
+                   _p += fmt_hex4(&_e[_p], dst); _e[_p++]='\r'; _e[_p++]='\n'; _e[_p]='\0';
+                   test_run_info((unsigned char *)_e); }
+            gateway_rx_flush();  /* clean RX state after TX+ACK polling */
         }
     }
 }
 
-/* Build "+COORD,<UID4>,<X>,<Y>,<Z>" and send on UART */
+/* Build "+COORD,<UID4>,<X.XX>,<Y.YY>,<Z.ZZ>" and send on UART.
+ * x/y/z are in cm. */
 static void send_coord_ack(uint16_t uid, int x, int y, int z)
 {
-    char ack[40];
+    char ack[48];
     int pos;
     ack[0] = '+'; ack[1] = 'C'; ack[2] = 'O'; ack[3] = 'O'; ack[4] = 'R'; ack[5] = 'D'; ack[6] = ',';
     pos = 7;
     pos += fmt_hex4(&ack[pos], uid);
     ack[pos++] = ',';
-    pos += fmt_dec(&ack[pos], x);
+    pos += fmt_coord(&ack[pos], x);
     ack[pos++] = ',';
-    pos += fmt_dec(&ack[pos], y);
+    pos += fmt_coord(&ack[pos], y);
     ack[pos++] = ',';
-    pos += fmt_dec(&ack[pos], z);
+    pos += fmt_coord(&ack[pos], z);
     ack[pos] = '\0';
     test_run_info((unsigned char *)ack);
 }
@@ -594,87 +895,61 @@ static void gateway_coord_write(const char *cmd)
     uid_str[i] = '\0';
 
     if (*p != ',') return; p++;
-    x = parse_int(p);
+    x = parse_coord(p);
     while (*p && *p != ',') p++;
     if (*p != ',') return; p++;
-    y = parse_int(p);
+    y = parse_coord(p);
     while (*p && *p != ',') p++;
     if (*p != ',') return; p++;
-    z = parse_int(p);
+    z = parse_coord(p);
 
     {
         uint16_t dst = parse_uid(uid_str);
-        uint8_t payload[6];
-        int retry, success = 0;
-
-        /* Direct update of beacon table (gateway on same device as Master) */
+        uint8_t payload[8];
+        int ack_ok = 0;
 #ifdef FUSION_DOWNLINK_MODE
         dl_set_anchor_coord((uint8_t)dst, (int16_t)x, (int16_t)y, (int16_t)z);
 #endif
         payload[0] = x & 0xFF;  payload[1] = (x >> 8) & 0xFF;
         payload[2] = y & 0xFF;  payload[3] = (y >> 8) & 0xFF;
         payload[4] = z & 0xFF;  payload[5] = (z >> 8) & 0xFF;
+        payload[6] = 0xCC;       /* pad — avoid DW3210 last-2B RX corruption */
+        payload[7] = 0xDD;       /* pad */
 
-        for (retry = 0; retry < 3; retry++)
-        {
-            gateway_send_uwb_ack(dst, FUNC_COORD_WRITE, payload, 6);
+        /* Write coordinate directly — do NOT send PREP_CMD first.
+         * PREP_CMD put the Master into config mode (pausing TDMA) and was
+         * never resumed, so after a coordinate write during TDOA every
+         * slave dropped off the air.  The Master's RX phase (~470ms of each
+         * 500ms cycle) hears COORD_WRITE reliably with retries, and the
+         * anchor-side handler re-syncs DLY_TS after the ACK TX. */
+        ack_ok = gateway_send_cmd_wait_ack(dst, FUNC_COORD_WRITE,
+                                           payload, 8,
+                                           FUNC_COORD_ACK, 200, 5);
 
-            /* Wait up to 100ms for COORD_ACK from target anchor */
-            {
-                uint32_t start = HAL_GetTick();
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                while (HAL_GetTick() - start < 100)
-                {
-                    Sleep(1);
-                    {
-                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
-                        if (st & SYS_STATUS_ALL_RX_ERR)
-                        {
-                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
-                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                            continue;
-                        }
-                        if (st & SYS_STATUS_RXFCG_BIT_MASK)
-                        {
-                            uint32_t flen = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
-                            if (flen >= GW_HDR_LEN + 6 && flen <= 32)
-                            {
-                                uint8_t rx_buf[32];
-                                dwt_readrxdata(rx_buf, flen, 0);
-                                if (rx_buf[9] == FUNC_COORD_ACK)
-                                {
-                                    uint16_t src = (uint16_t)(rx_buf[7] | (rx_buf[8] << 8));
-                                    if (src == dst)
-                                    {
-                                        success = 1;
-                                        break;
-                                    }
-                                }
-                            }
-                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                        }
-                    }
-                }
-            }
-            if (success) break;
-        }
-
-        if (success)
-        {
-            send_coord_ack(dst, x, y, z);
-        }
-        else
-        {
-            char err[24];
-            int pos = 0;
-            err[pos++] = '+'; err[pos++] = 'C'; err[pos++] = 'O'; err[pos++] = 'O'; err[pos++] = 'R'; err[pos++] = 'D';
-            err[pos++] = '_'; err[pos++] = 'E'; err[pos++] = 'R'; err[pos++] = 'R'; err[pos++] = ',';
+        if (ack_ok) send_coord_ack(dst, x, y, z);
+        else { char err[24]; int pos = 0;
+            err[pos++]='+'; err[pos++]='C'; err[pos++]='O'; err[pos++]='O'; err[pos++]='R'; err[pos++]='D';
+            err[pos++]='_'; err[pos++]='E'; err[pos++]='R'; err[pos++]='R'; err[pos++]=',';
             pos += fmt_hex4(&err[pos], dst);
-            err[pos++] = '\r'; err[pos++] = '\n';
-            err[pos] = '\0';
-            test_run_info((unsigned char *)err);
+            err[pos++]='\r'; err[pos++]='\n'; err[pos]='\0';
+            test_run_info((unsigned char *)err); }
+        /* Diagnostic */
+        {
+            char _dx[80]; int _dxp = 0;
+            _dxp += fmt_str(&_dx[_dxp], "TX,C=");
+            _dxp += fmt_hex4(&_dx[_dxp], dst);
+            _dxp += fmt_str(&_dx[_dxp], ",(");
+            _dxp += fmt_coord(&_dx[_dxp], x);
+            _dxp += fmt_str(&_dx[_dxp], ",");
+            _dxp += fmt_coord(&_dx[_dxp], y);
+            _dxp += fmt_str(&_dx[_dxp], ",");
+            _dxp += fmt_coord(&_dx[_dxp], z);
+            _dxp += fmt_str(&_dx[_dxp], "),");
+            _dx[_dxp++] = ack_ok ? 'O' : 'F';
+            _dx[_dxp++] = '\r'; _dx[_dxp++] = '\n'; _dx[_dxp] = '\0';
+            test_run_info((unsigned char *)_dx);
         }
+        gateway_rx_flush();
     }
 }
 
@@ -726,15 +1001,22 @@ static void gateway_coord_read(const char *cmd)
     }
 }
 
-/* AT+LIST — output +ONLINE for each known device */
+/* AT+LIST — output +ONLINE for each known device.
+ * Gateway sniffs continuously, so device list is always current.
+ * Always include Gateway itself first — the host needs this to show it online
+ * on reconnect (the startup +ONLINE was already consumed). */
 static void gateway_send_list(void)
 {
     char out[48];
     int pos, i;
 
-    /* All known devices (not just online — so reconnecting host sees them) */
+    /* Gateway self-registration — must appear in every AT+LIST response */
+    test_run_info((unsigned char *)"+ONLINE,GW01,GATEWAY,0");
+
+    /* Only online devices — offline ones stay offline */
     for (i = 0; i < gw_dev_count; i++)
     {
+        if (!gw_devs[i].online) continue;
         out[0] = '+'; out[1] = 'O'; out[2] = 'N'; out[3] = 'L'; out[4] = 'I'; out[5] = 'N'; out[6] = 'E'; out[7] = ',';
         pos = 8;
         pos += fmt_str(&out[pos], gw_devs[i].uid);
@@ -753,6 +1035,326 @@ static void gateway_send_list(void)
 }
 
 /*============================================================================
+ * RX flush — force-clean DW3000 RX after TX+ACK sequence.
+ * Prevents "stuck RX" state that causes the sniffer to miss frames.
+ * Must be called after any handler that does TX + inline ACK polling
+ * (COORD, FIND, START, STOP, NETWORK) before returning to sniffer loop.
+ *============================================================================*/
+static void gateway_rx_flush(void)
+{
+    int buf_idx;
+
+    /* 1. Force DW3000 out of whatever state it's in → IDLE */
+    dwt_forcetrxoff();
+
+    /* 2. Drain both RX buffers (DW3000 has double-buffered RX).
+     *    During ACK polling, non-ACK frames may have been received
+     *    and left unread, corrupting the buffer state. */
+    for (buf_idx = 0; buf_idx < 2; buf_idx++)
+    {
+        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+        if (st & SYS_STATUS_RXFCG_BIT_MASK)
+        {
+            uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+            if (fl > 0 && fl <= 127)
+            {
+                uint8_t dummy[128];
+                dwt_readrxdata(dummy, fl, 0);
+            }
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+        }
+    }
+
+    /* 3. Clear all RX error / overflow flags accumulated during polling */
+    dwt_write32bitreg(SYS_STATUS_ID,
+        SYS_STATUS_ALL_RX_ERR | SYS_STATUS_RXFCG_BIT_MASK
+        | SYS_STATUS_RXOVRR_BIT_MASK);
+
+    /* 4. Clean IDLE→RX transition with settling time.
+     *    PLL re-lock after TX takes ~150 µs; 2 ms is generous. */
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    Sleep(2);
+}
+
+/*============================================================================
+ * OTA SW-ARQ — called from sniffer loop and UWB RX handler
+ *============================================================================*/
+
+/* Called every 1ms from the Gateway sniffer loop.
+ * Checks if we're waiting for an ACK and whether the deadline has passed. */
+void gateway_ota_arq_poll(void)
+{
+    if (ota_arq_state != OTA_ARQ_WAIT_ACK) return;
+
+    if (HAL_GetTick() < ota_arq_deadline) return;  /* still waiting */
+
+    /* Timeout — retry or abort */
+    if (ota_arq_retries < OTA_ARQ_MAX_RETRIES) {
+        ota_arq_retries++;
+        gateway_send_uwb_ack(ota_dst_uid, FUNC_OTA_DATA,
+                             ota_arq_buf, ota_arq_buf_len);
+        ota_arq_deadline = HAL_GetTick()
+            + (ota_arq_seq == 0 ? OTA_ARQ_TIMEOUT_BLK0_MS : OTA_ARQ_TIMEOUT_MS);
+    } else {
+        /* All retries exhausted for this chunk — skip it and advance.
+         * The device writes at seq-based offset, so a gap in the middle
+         * is harmless.  At OTA_END, gw_ota_finish() detects missing
+         * chunks (OTA GAP) and the host can decide to retry or abort.
+         * This is strictly better than aborting the entire session:
+         * a single failed chunk doesn't kill the whole upgrade. */
+        {
+            char _skip[48]; int _skp = 0;
+            _skp += fmt_str(&_skip[_skp], "+OTA_SKIP,");
+            _skp += fmt_hex4(&_skip[_skp], ota_dst_uid);
+            _skip[_skp++] = ','; _skp += fmt_hex4(&_skip[_skp], ota_arq_seq);
+            _skip[_skp++] = '\r'; _skip[_skp++] = '\n'; _skip[_skp] = '\0';
+            test_run_info((unsigned char *)_skip);
+        }
+        /* Advance offset and seq as-if-ACKed, so host continues */
+        ota_offset += (uint32_t)ota_arq_data_len;
+        ota_arq_seq++;
+        ota_arq_state = OTA_ARQ_IDLE;
+        /* Print +OTA_PROGRESS so host sends next chunk */
+        {
+            char out[48]; int pos;
+            out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_';
+            out[5]='P'; out[6]='R'; out[7]='O'; out[8]='G'; out[9]='R';
+            out[10]='E'; out[11]='S'; out[12]='S'; out[13]=',';
+            pos = 14;
+            { uint16_t u = ota_dst_uid;
+              out[pos++]=gw_hex[(u>>12)&0xF]; out[pos++]=gw_hex[(u>>8)&0xF];
+              out[pos++]=gw_hex[(u>>4)&0xF]; out[pos++]=gw_hex[u&0xF]; }
+            out[pos++]=',';
+            pos += fmt_dec(&out[pos], (int)ota_offset);
+            out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+            test_run_info((unsigned char *)out);
+        }
+    }
+}
+
+/* Called from gateway_handle_uwb_rx when an OTA_ACK frame is received.
+ * Returns 1 if this ACK was processed by the ARQ state machine (first copy),
+ * 0 if it was a duplicate/stale ACK that should not trigger +OTA_ACK print. */
+int gateway_ota_arq_on_ack(uint16_t seq, uint8_t status)
+{
+    if (ota_arq_state != OTA_ARQ_WAIT_ACK) return 0;
+    if (seq != ota_arq_seq) return 0;  /* stale ACK for a different chunk */
+
+    if (status == 0) {
+        /* ACK OK — chunk successfully stored by device */
+        ota_arq_state = OTA_ARQ_IDLE;
+
+        /* Advance offset and print progress → host sends next chunk */
+        ota_offset += (uint32_t)ota_arq_data_len;
+        ota_arq_seq++;
+
+        {
+            char out[48]; int pos;
+            out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_';
+            out[5]='P'; out[6]='R'; out[7]='O'; out[8]='G'; out[9]='R';
+            out[10]='E'; out[11]='S'; out[12]='S'; out[13]=',';
+            pos = 14;
+            { uint16_t u = ota_dst_uid;
+              out[pos++]=gw_hex[(u>>12)&0xF]; out[pos++]=gw_hex[(u>>8)&0xF];
+              out[pos++]=gw_hex[(u>>4)&0xF]; out[pos++]=gw_hex[u&0xF]; }
+            out[pos++]=',';
+            pos += fmt_dec(&out[pos], (int)ota_offset);
+            out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+            test_run_info((unsigned char *)out);
+        }
+    } else {
+        /* NACK (flash error) — retry immediately */
+        if (ota_arq_retries < OTA_ARQ_MAX_RETRIES) {
+            ota_arq_retries++;
+            gateway_send_uwb_ack(ota_dst_uid, FUNC_OTA_DATA,
+                                 ota_arq_buf, ota_arq_buf_len);
+            ota_arq_deadline = HAL_GetTick()
+                + (ota_arq_seq == 0 ? OTA_ARQ_TIMEOUT_BLK0_MS : OTA_ARQ_TIMEOUT_MS);
+        } else {
+            /* All NACK retries exhausted — skip chunk and advance.
+             * Device keeps reporting flash error → gap is better than abort. */
+            {
+                char _nsk[48]; int _nkp = 0;
+                _nkp += fmt_str(&_nsk[_nkp], "+OTA_SKIP_NACK,");
+                _nkp += fmt_hex4(&_nsk[_nkp], ota_dst_uid);
+                _nsk[_nkp++] = ','; _nkp += fmt_hex4(&_nsk[_nkp], ota_arq_seq);
+                _nsk[_nkp++] = '\r'; _nsk[_nkp++] = '\n'; _nsk[_nkp] = '\0';
+                test_run_info((unsigned char *)_nsk);
+            }
+            ota_offset += (uint32_t)ota_arq_data_len;
+            ota_arq_seq++;
+            ota_arq_state = OTA_ARQ_IDLE;
+            {
+                char out[48]; int pos;
+                out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_';
+                out[5]='P'; out[6]='R'; out[7]='O'; out[8]='G'; out[9]='R';
+                out[10]='E'; out[11]='S'; out[12]='S'; out[13]=',';
+                pos = 14;
+                { uint16_t u = ota_dst_uid;
+                  out[pos++]=gw_hex[(u>>12)&0xF]; out[pos++]=gw_hex[(u>>8)&0xF];
+                  out[pos++]=gw_hex[(u>>4)&0xF]; out[pos++]=gw_hex[u&0xF]; }
+                out[pos++]=',';
+                pos += fmt_dec(&out[pos], (int)ota_offset);
+                out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+                test_run_info((unsigned char *)out);
+            }
+        }
+    }
+    return 1;  /* ACK was processed by ARQ state machine */
+}
+
+/*============================================================================
+ * Broadcast OTA — parallel upgrade of all anchors
+ *
+ * The Gateway sends every chunk once with DST=0xFFFF.  Each anchor ACKs
+ * in a rank-based TDMA slot (rank × 5ms delay).  The Gateway collects
+ * ACKs from all devices in a 50ms window before sending the next chunk.
+ *============================================================================*/
+
+/* Register a device for broadcast OTA (by UID).  Returns device index or -1. */
+static int bcast_ota_register(uint16_t uid)
+{
+    uint8_t i;
+    for (i = 0; i < bcast_num_devs; i++) {
+        if (bcast_devs[i].uid == uid) return (int)i;
+    }
+    if (bcast_num_devs >= BCAST_OTA_MAX_DEVICES) return -1;
+    bcast_devs[bcast_num_devs].uid     = uid;
+    bcast_devs[bcast_num_devs].present = 0;
+    bcast_devs[bcast_num_devs].done    = 0;
+    bcast_num_devs++;
+    return (int)(bcast_num_devs - 1);
+}
+
+/* Mark a device as having ACKed the current chunk. */
+static void bcast_ota_mark_acked(uint16_t uid)
+{
+    uint8_t i;
+    for (i = 0; i < bcast_num_devs; i++) {
+        if (bcast_devs[i].uid == uid) {
+            bcast_devs[i].present = 1;
+            return;
+        }
+    }
+}
+
+/* Check if all registered devices have ACKed the current chunk. */
+static int bcast_ota_all_acked(void)
+{
+    uint8_t i;
+    for (i = 0; i < bcast_num_devs; i++) {
+        if (!bcast_devs[i].present && !bcast_devs[i].done) return 0;
+    }
+    return 1;
+}
+
+/* Reset per-chunk ACK flags for next chunk. */
+static void bcast_ota_reset_acks(void)
+{
+    uint8_t i;
+    for (i = 0; i < bcast_num_devs; i++) {
+        bcast_devs[i].present = 0;
+    }
+}
+
+/* Handle FUNC_OTA_ACK in broadcast mode — check seq and mark device.
+ * Returns 1 if this ACK was processed (seq match), 0 if stale. */
+int gateway_bcast_ota_on_ack(uint16_t seq, uint8_t status, uint16_t src_addr)
+{
+    if (bcast_state != BCAST_OTA_ACTIVE) return 0;
+    if (seq != bcast_arq_seq) return 0;  /* wrong chunk */
+    if (status != 0) return 0;           /* NACK — will be handled by retry */
+    bcast_ota_mark_acked(src_addr);
+    return 1;
+}
+
+/* Poll broadcast OTA ARQ — called every 1ms from sniffer loop. */
+void gateway_bcast_ota_poll(void)
+{
+    uint8_t i;
+
+    if (bcast_state != BCAST_OTA_ACTIVE) return;
+    if (HAL_GetTick() < bcast_arq_deadline) return;  /* still collecting */
+
+    /* Timeout — check who didn't ACK */
+    if (bcast_ota_all_acked()) {
+        /* All ACKed — report progress and advance seq for next chunk */
+        {
+            char out[32]; int pos;
+            out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_';
+            out[5]='P'; out[6]='R'; out[7]='O'; out[8]='G'; out[9]='R';
+            out[10]='E'; out[11]='S'; out[12]='S'; out[13]=',';
+            pos=14;
+            pos += fmt_dec(&out[pos], (int)(bcast_arq_seq * 96u + (uint32_t)bcast_arq_data_len));
+            out[pos++] = ','; out[pos++] = 'O'; out[pos++] = 'K';
+            out[pos] = '\0';
+            test_run_info((unsigned char *)out);
+        }
+        bcast_arq_seq++;
+        bcast_state = BCAST_OTA_PREP;  /* ready for next AT+OTA_BCAST_DATA */
+        return;
+    }
+
+    /* Some devices missed — retry or abort */
+    if (bcast_arq_retries < BCAST_OTA_MAX_RETRIES) {
+        bcast_arq_retries++;
+        /* Diagnostic: print which device(s) missed the ACK */
+        {
+            char _d[48]; int _dp = 0;
+            _d[_dp++]='R'; _d[_dp++]='E'; _d[_dp++]='T'; _d[_dp++]='R'; _d[_dp++]='Y';
+            _d[_dp++]=' '; _d[_dp++]=gw_hex[(bcast_arq_seq>>4)&0xF]; _d[_dp++]=gw_hex[bcast_arq_seq&0xF];
+            _d[_dp++]='/'; _d[_dp++]=bcast_arq_retries + '0';
+            _d[_dp++]=' '; _d[_dp++]='M'; _d[_dp++]='I'; _d[_dp++]='S'; _d[_dp++]='S'; _d[_dp++]=':';
+            for (i = 0; i < bcast_num_devs; i++) {
+                if (!bcast_devs[i].present && !bcast_devs[i].done) {
+                    _d[_dp++]=' ';
+                    _d[_dp++]=gw_hex[(bcast_devs[i].uid>>12)&0xF];
+                    _d[_dp++]=gw_hex[(bcast_devs[i].uid>>8)&0xF];
+                    _d[_dp++]=gw_hex[(bcast_devs[i].uid>>4)&0xF];
+                    _d[_dp++]=gw_hex[bcast_devs[i].uid&0xF];
+                }
+            }
+            _d[_dp++]='\r'; _d[_dp++]='\n'; _d[_dp]='\0';
+            test_run_info((unsigned char *)_d);
+        }
+        /* Retransmit to broadcast — devices that already got it will
+         * re-ACK (duplicate), devices that missed it will process.
+         *
+         * Exponential backoff: each retry gets a longer ACK window
+         * to reduce air collisions and give devices more time.
+         *   Retry 1:  300ms    Retry 5: 1500ms
+         *   Retry 2:  600ms    Retry 6: 2000ms
+         *   Retry 3:  900ms    Retry 7: 2000ms
+         *   Retry 4: 1200ms    Retry 8: 2000ms (cap) */
+        bcast_ota_reset_acks();
+        gateway_send_uwb_ack(0xFFFFu, FUNC_OTA_DATA,
+                             bcast_arq_buf, bcast_arq_buf_len);
+        {
+            uint32_t backoff_ms;
+            if (bcast_arq_seq == 0) {
+                backoff_ms = BCAST_OTA_ACK_BLK0_MS;  /* block 0: fixed long window */
+            } else if (bcast_arq_retries <= 1) {
+                backoff_ms = 300u;
+            } else {
+                backoff_ms = 300u * (uint32_t)bcast_arq_retries;
+                if (backoff_ms > 2000u) backoff_ms = 2000u;
+            }
+            bcast_arq_deadline = HAL_GetTick() + backoff_ms;
+        }
+    } else {
+        /* Max retries exhausted — abort */
+        uint8_t pad[3] = { 0xCC, 0xDD, 0xEE };
+        for (i = 0; i < 3; i++) {
+            gateway_send_uwb_ack(0xFFFFu, FUNC_OTA_ABORT, pad, 3);
+            Sleep(20);
+        }
+        bcast_state = BCAST_OTA_IDLE;
+        bcast_num_devs = 0;
+        test_run_info((unsigned char *)"+OTA_BCAST_ERROR,Timeout\r\n");
+    }
+}
+
+/*============================================================================
  * Main poll entry point — called from Phase 7
  *============================================================================*/
 void gateway_poll_uart(void)
@@ -761,9 +1363,19 @@ void gateway_poll_uart(void)
 
     gateway_check_timeout();
 
-    gateway_device_seen("0000", "GATEWAY", 0);  /* self keepalive */
     if (!uart_rx_line_available(cmd, sizeof(cmd)))
         return;
+
+    /* DEBUG: echo received command to diagnose COORD issue */
+    {
+        char _dbg[48]; int _d = 0, _i;
+        _dbg[_d++]='C'; _dbg[_d++]='M'; _dbg[_d++]='D'; _dbg[_d++]=':';
+        for (_i = 0; _i < 25 && cmd[_i]; _i++)
+            _dbg[_d++] = cmd[_i];
+        if (cmd[25]) { _dbg[_d++]='.'; _dbg[_d++]='.'; }
+        _dbg[_d++]='\r'; _dbg[_d++]='\n'; _dbg[_d]='\0';
+        test_run_info((unsigned char *)_dbg);
+    }
 
     if (strncmp(cmd, "AT+PING", 7) == 0)
     {
@@ -819,9 +1431,262 @@ void gateway_poll_uart(void)
         ack[pos] = '\0';
         test_run_info((unsigned char *)ack);
     }
+#if 0 /* === Broadcast OTA disabled — use sequential unicast instead === */
+    else if (strncmp(cmd, "AT+OTA_BCAST=", 13) == 0)
+    {
+        /* AT+OTA_BCAST=<SIZE>
+         * Broadcast OTA: send PREP_CMD to 0xFFFF, collect PREP_ACKs
+         * from all anchors (TDMA: rank*5ms delay).  Returns device count. */
+        const char *p = cmd + 13;
+        uint32_t size = 0;
+        while (*p >= '0' && *p <= '9')
+            size = size * 10 + (uint32_t)(*p++ - '0');
+
+        bcast_num_devs = 0;
+        bcast_total_size = size;
+        bcast_arq_seq = 0;
+        bcast_state = BCAST_OTA_PREP;
+
+        /* 30-burst broadcast PREP_CMD */
+        {
+            uint8_t prep_pay[3] = { 'F', 0xCC, 0xDD };
+            int burst;
+            for (burst = 0; burst < 30; burst++) {
+                gateway_send_uwb_ack(0xFFFFu, FUNC_PREP_CMD, prep_pay, 3);
+                {
+                    uint32_t dl = HAL_GetTick() + 10u;
+                    port_DisableEXT_IRQ();
+                    while (HAL_GetTick() < dl) {
+                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                        if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                            uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                            if (fl >= GW_HDR_LEN && fl <= 32) {
+                                uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                if (rb[9] == FUNC_PREP_ACK) {
+                                    uint16_t dev_uid = (uint16_t)(rb[7] | (rb[8] << 8));
+                                    bcast_ota_register(dev_uid);
+                                }
+                            } else {
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            }
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                        if (st & SYS_STATUS_ALL_RX_ERR) {
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                        Sleep(1);
+                    }
+                    EXTI->PR1 = (1u << 12);
+                    port_EnableEXT_IRQ();
+                }
+            }
+        }
+
+        if (bcast_num_devs > 0) {
+            char out[32]; int pos;
+            out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_'; out[5]='B';
+            out[6]='C'; out[7]='A'; out[8]='S'; out[9]='T'; out[10]='_'; out[11]='R';
+            out[12]='E'; out[13]='A'; out[14]='D'; out[15]='Y'; out[16]=',';
+            pos=17; pos+=fmt_dec(&out[pos],(int)bcast_num_devs); out[pos]='\0';
+            test_run_info((unsigned char *)out);
+        } else {
+            bcast_state = BCAST_OTA_IDLE;
+            test_run_info((unsigned char *)"+OTA_BCAST_ERROR,No devices\r\n");
+        }
+        gateway_rx_flush();
+    }
+    else if (strncmp(cmd, "AT+OTA_BCAST_DATA=", 18) == 0)
+    {
+        /* AT+OTA_BCAST_DATA=<HEX_DATA> — send one chunk to all anchors.
+         * Chunk format: hex-encoded firmware data (96 bytes = 192 hex chars). */
+        if (bcast_state != BCAST_OTA_PREP) {
+            /* Only accept data chunks when PREP is set (after AT+OTA_BCAST).
+             * Reject if IDLE (session ended/aborted) or ACTIVE (shouldn't happen). */
+            return;
+        }
+        {
+            const char *p = cmd + 18;
+            int hex_len = 0;
+            while (*p && *p != '\r' && *p != '\n') { hex_len++; p++; }
+            int data_len = hex_len / 2;
+            if (data_len > 248) data_len = 248;
+            p = cmd + 18;
+
+            /* Build chunk buffer: seq(2B) + data(960B) + crc(2B) + pad(2B).
+             * All chunks identical — total_size was already sent in PREP_CMD. */
+            bcast_arq_buf[0] = bcast_arq_seq & 0xFF;
+            bcast_arq_buf[1] = (bcast_arq_seq >> 8) & 0xFF;
+            {
+                int i;
+                for (i = 0; i < data_len && i < 248; i++) {
+                    uint8_t b;
+                    if (hex_byte(p[i*2], p[i*2+1], &b) != 0) break;
+                    bcast_arq_buf[2 + i] = b;
+                }
+                uint16_t crc = crc16_ccitt(&bcast_arq_buf[2], data_len);
+                bcast_arq_buf[2 + data_len]     = crc & 0xFF;
+                bcast_arq_buf[2 + data_len + 1] = (crc >> 8) & 0xFF;
+                bcast_arq_buf[2 + data_len + 2] = 0xCC;
+                bcast_arq_buf[2 + data_len + 3] = 0xDD;
+            }
+            bcast_arq_buf_len  = (uint8_t)(2 + data_len + 4);
+            bcast_arq_data_len = (uint8_t)data_len;
+
+            /*=== Inline polling: send + collect ACKs from all registered devices.
+             * Replaces old fire-and-forget approach that relied on sniffer loop
+             * timing — sniffer RX windows missed ACKs during flash erase gap.
+             * Disables EXTI and polls DW3000 directly, same pattern as
+             * gateway_send_cmd_wait_ack().  ACKs arrive after ~670ms (block 0)
+             * or ~10ms (normal chunks). ===*/
+            {
+                int retry;
+                int all_acked = 0;
+
+                /* Initial send */
+                bcast_ota_reset_acks();
+                gateway_send_uwb_ack(0xFFFFu, FUNC_OTA_DATA,
+                                     bcast_arq_buf, bcast_arq_buf_len);
+
+                for (retry = 0; retry < (int)BCAST_OTA_MAX_RETRIES && !all_acked; retry++) {
+                    uint32_t ack_window_ms;
+
+                    if (retry > 0) {
+                        /* Retry: print diagnostic, brief settle, re-send */
+                        {
+                            char _d[48]; int _dp = 0; uint8_t _j;
+                            _d[_dp++]='R'; _d[_dp++]='E'; _d[_dp++]='T'; _d[_dp++]='R'; _d[_dp++]='Y';
+                            _d[_dp++]=' '; _d[_dp++]=gw_hex[(bcast_arq_seq>>4)&0xF]; _d[_dp++]=gw_hex[bcast_arq_seq&0xF];
+                            _d[_dp++]='/'; _d[_dp++]=retry + '0';
+                            _d[_dp++]=' '; _d[_dp++]='M'; _d[_dp++]='I'; _d[_dp++]='S'; _d[_dp++]='S'; _d[_dp++]=':';
+                            for (_j = 0; _j < bcast_num_devs; _j++) {
+                                if (!bcast_devs[_j].present && !bcast_devs[_j].done) {
+                                    _d[_dp++]=' ';
+                                    _d[_dp++]=gw_hex[(bcast_devs[_j].uid>>12)&0xF];
+                                    _d[_dp++]=gw_hex[(bcast_devs[_j].uid>>8)&0xF];
+                                    _d[_dp++]=gw_hex[(bcast_devs[_j].uid>>4)&0xF];
+                                    _d[_dp++]=gw_hex[bcast_devs[_j].uid&0xF];
+                                }
+                            }
+                            _d[_dp++]='\r'; _d[_dp++]='\n'; _d[_dp]='\0';
+                            test_run_info((unsigned char *)_d);
+                        }
+                        bcast_ota_reset_acks();
+                        Sleep(50);
+                        gateway_send_uwb_ack(0xFFFFu, FUNC_OTA_DATA,
+                                             bcast_arq_buf, bcast_arq_buf_len);
+                    }
+
+                    /* Exponential backoff for ACK window.
+                     * Block 0: 3000ms first try (flash erase ~660ms), 2000ms retries.
+                     * Normal:  300ms first try, 300×retry cap 2000ms. */
+                    if (bcast_arq_seq == 0 && retry == 0)
+                        ack_window_ms = BCAST_OTA_ACK_BLK0_MS;
+                    else if (bcast_arq_seq == 0)
+                        ack_window_ms = 2000u;
+                    else if (retry <= 1)
+                        ack_window_ms = 300u;
+                    else {
+                        ack_window_ms = 300u * (uint32_t)retry;
+                        if (ack_window_ms > 2000u) ack_window_ms = 2000u;
+                    }
+
+                    {
+                        uint32_t deadline = HAL_GetTick() + ack_window_ms;
+
+                        port_DisableEXT_IRQ();
+                        while (HAL_GetTick() < deadline && !all_acked) {
+                            uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+
+                            if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                                uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                                if (fl >= GW_HDR_LEN && fl <= 32) {
+                                    uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                    if (rb[9] == FUNC_OTA_ACK) {
+                                        uint16_t aseq  = (uint16_t)(rb[GW_HDR_LEN]) | ((uint16_t)(rb[GW_HDR_LEN+1]) << 8);
+                                        uint8_t  ast   = rb[GW_HDR_LEN + 2];
+                                        uint16_t auid  = (uint16_t)(rb[7] | (rb[8] << 8));
+                                        if (aseq == bcast_arq_seq && ast == 0) {
+                                            bcast_ota_mark_acked(auid);
+                                            if (bcast_ota_all_acked()) {
+                                                all_acked = 1;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                }
+                                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                            }
+
+                            if (st & SYS_STATUS_ALL_RX_ERR) {
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                            }
+
+                            Sleep(1);
+                        }
+                        EXTI->PR1 = (1u << 12);
+                        port_EnableEXT_IRQ();
+                    }
+                }
+
+                if (all_acked) {
+                    /* All devices ACKed — report progress, advance seq */
+                    {
+                        char out[32]; int pos;
+                        out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_';
+                        out[5]='P'; out[6]='R'; out[7]='O'; out[8]='G'; out[9]='R';
+                        out[10]='E'; out[11]='S'; out[12]='S'; out[13]=',';
+                        pos=14;
+                        pos += fmt_dec(&out[pos], (int)(bcast_arq_seq * 96u + (uint32_t)bcast_arq_data_len));
+                        out[pos++] = ','; out[pos++] = 'O'; out[pos++] = 'K';
+                        out[pos] = '\0';
+                        test_run_info((unsigned char *)out);
+                    }
+                    bcast_arq_seq++;
+                    bcast_state = BCAST_OTA_PREP;  /* ready for next chunk */
+                } else {
+                    /* All retries exhausted — abort broadcast OTA */
+                    {
+                        uint8_t _pad[3] = { 0xCC, 0xDD, 0xEE };
+                        int _z;
+                        for (_z = 0; _z < 3; _z++) {
+                            gateway_send_uwb_ack(0xFFFFu, FUNC_OTA_ABORT, _pad, 3);
+                            Sleep(20);
+                        }
+                    }
+                    bcast_num_devs = 0;
+                    bcast_state = BCAST_OTA_IDLE;
+                    test_run_info((unsigned char *)"+OTA_BCAST_ERROR,Timeout\r\n");
+                }
+                gateway_rx_flush();
+            }
+        }
+    }
+    else if (strncmp(cmd, "AT+OTA_BCAST_END", 16) == 0)
+    {
+        /* AT+OTA_BCAST_END — finish broadcast OTA.
+         * Send OTA_END 5× to 0xFFFF, then resume Master TDMA. */
+        uint8_t pad[3] = { 0xCC, 0xDD, 0xEE };
+        int i;
+        for (i = 0; i < 5; i++) {
+            gateway_send_uwb_ack(0xFFFFu, FUNC_OTA_END, pad, 3);
+            Sleep(100);
+        }
+        gateway_send_uwb_ack(0x0000u, FUNC_START_TDOA, pad, 3);
+        bcast_state = BCAST_OTA_IDLE;
+        bcast_num_devs = 0;
+        test_run_info((unsigned char *)"+OTA_BCAST_DONE\r\n");
+    }
+#endif /* 0 — broadcast OTA disabled */
     else if (strncmp(cmd, "AT+OTA_START=", 13) == 0)
     {
-        /* AT+OTA_START=<UID>,<SIZE> → +OTA_READY,<UID> */
+        /* AT+OTA_START=<UID>,<SIZE>
+         * Send OTA_PREPARE on Ch9 → device ACKs + stops ranging
+         * OTA data/ACK on same Ch9 (no channel switch needed) */
         const char *p = cmd + 13;
         char uid_str[8];
         int i;
@@ -835,91 +1700,255 @@ void gateway_poll_uart(void)
         while (*p >= '0' && *p <= '9')
             ota_total_size = ota_total_size * 10 + (uint32_t)(*p++ - '0');
 
-        ota_dst_uid = parse_uid(uid_str);
-        ota_offset  = 0;
-        ota_seq     = 0;
-        ota_active  = 1;
+        ota_dst_uid    = parse_uid(uid_str);
+        ota_offset     = 0;
+        ota_arq_seq    = 0;
+        ota_active     = 1;
+        ota_arq_state  = OTA_ARQ_IDLE;
 
-        /* +OTA_READY,<UID> */
+        /* Send unified prepare command (0xF0) via 30-burst fire-and-poll.
+         * Master responds with 0xF1 ACK.  30 rapid sends at 10ms intervals
+         * (300ms total) guarantees at least one lands in an RX window.
+         * Payload: total_size(4B LE) + pad(2B) = 6B.
+         * Pad absorbs DW3210 last-2B RX corruption — without it the
+         * upper 2 bytes of total_size get clobbered. */
         {
-            char out[32];
-            int pos;
-            out[0] = '+'; out[1] = 'O'; out[2] = 'T'; out[3] = 'A'; out[4] = '_'; out[5] = 'R';
-            out[6] = 'E'; out[7] = 'A'; out[8] = 'D'; out[9] = 'Y'; out[10] = ',';
-            pos = 11;
-            pos += fmt_str(&out[pos], uid_str);
-            out[pos] = '\0';
-            test_run_info((unsigned char *)out);
+            int ack_ok = 0, burst;
+            uint8_t prep_pay[6];
+            prep_pay[0] = (uint8_t)(ota_total_size & 0xFF);
+            prep_pay[1] = (uint8_t)((ota_total_size >> 8) & 0xFF);
+            prep_pay[2] = (uint8_t)((ota_total_size >> 16) & 0xFF);
+            prep_pay[3] = (uint8_t)((ota_total_size >> 24) & 0xFF);
+            prep_pay[4] = 0xCC;  /* pad — absorbed by DW3210 RX corruption */
+            prep_pay[5] = 0xDD;  /* pad — absorbed by DW3210 RX corruption */
+
+            /* Diagnostic: print ota_total_size and prep_pay content */
+            { char _d[32]; const char _h[] = "0123456789ABCDEF"; int _di = 0;
+              _d[_di++]='P'; _d[_di++]='S'; _d[_di++]='=';
+              _d[_di++]=_h[(ota_total_size>>28)&0xF]; _d[_di++]=_h[(ota_total_size>>24)&0xF];
+              _d[_di++]=_h[(ota_total_size>>20)&0xF]; _d[_di++]=_h[(ota_total_size>>16)&0xF];
+              _d[_di++]=_h[(ota_total_size>>12)&0xF]; _d[_di++]=_h[(ota_total_size>>8)&0xF];
+              _d[_di++]=_h[(ota_total_size>>4)&0xF]; _d[_di++]=_h[ota_total_size&0xF];
+              _d[_di++]=' '; _d[_di++]='P'; _d[_di++]='P'; _d[_di++]='=';
+              _d[_di++]=_h[(prep_pay[3]>>4)&0xF]; _d[_di++]=_h[prep_pay[3]&0xF];
+              _d[_di++]=_h[(prep_pay[2]>>4)&0xF]; _d[_di++]=_h[prep_pay[2]&0xF];
+              _d[_di++]=_h[(prep_pay[1]>>4)&0xF]; _d[_di++]=_h[prep_pay[1]&0xF];
+              _d[_di++]=_h[(prep_pay[0]>>4)&0xF]; _d[_di++]=_h[prep_pay[0]&0xF];
+              _d[_di++]='\r'; _d[_di++]='\n'; _d[_di]='\0';
+              test_run_info((unsigned char *)_d); }
+
+            /* 30-burst PREP_CMD at 10ms intervals — 300ms firestorm */
+            for (burst = 0; burst < 30 && !ack_ok; burst++) {
+                gateway_send_uwb_ack(ota_dst_uid, FUNC_PREP_CMD, prep_pay, 6);
+                {
+                    uint32_t dl = HAL_GetTick() + 10u;
+                    port_DisableEXT_IRQ();
+                    while (HAL_GetTick() < dl) {
+                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                        if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                            uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                            if (fl >= GW_HDR_LEN && fl <= 32) {
+                                uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                /* Diagnostic: print func of every RX frame */
+                                { char _rx[20]; int _rxp=0;
+                                  _rx[_rxp++]='R'; _rx[_rxp++]='X'; _rx[_rxp++]=':';
+                                  _rx[_rxp++]=gw_hex[(rb[9]>>4)&0xF]; _rx[_rxp++]=gw_hex[rb[9]&0xF];
+                                  _rx[_rxp++]=','; _rx[_rxp++]='L'; _rx[_rxp++]='=';
+                                  _rx[_rxp++]=gw_hex[(fl>>4)&0xF]; _rx[_rxp++]=gw_hex[fl&0xF];
+                                  _rx[_rxp++]='\r'; _rx[_rxp++]='\n'; _rx[_rxp]='\0';
+                                  test_run_info((unsigned char *)_rx); }
+                                if (rb[9] == FUNC_PREP_ACK) { ack_ok = 1; break; }
+                            } else {
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            }
+                            /* IRQ handler calls dwt_forcetrxoff() — re-enter RX */
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                        if (st & SYS_STATUS_ALL_RX_ERR) {
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                        Sleep(1);
+                    }
+                    EXTI->PR1 = (1u << 12);
+                    port_EnableEXT_IRQ();
+                }
+            }
+
+            if (ack_ok) {
+                /* +OTA_READY,<UID> */
+                { char out[32]; int pos;
+                  out[0]='+'; out[1]='O'; out[2]='T'; out[3]='A'; out[4]='_'; out[5]='R';
+                  out[6]='E'; out[7]='A'; out[8]='D'; out[9]='Y'; out[10]=',';
+                  pos=11; pos+=fmt_str(&out[pos],uid_str); out[pos]='\0';
+                  test_run_info((unsigned char *)out); }
+            } else {
+                ota_active = 0;
+                test_run_info((unsigned char *)"+OTA_ERROR,PREPARE,No ACK\r\n");
+            }
+            /* Diagnostic */
+            {
+                char _dx[16]; int _dxp = 0;
+                _dxp += fmt_str(&_dx[_dxp], "TX,P=");
+                _dxp += fmt_hex4(&_dx[_dxp], ota_dst_uid);
+                _dx[_dxp++] = ','; _dx[_dxp++] = ack_ok ? 'O' : 'F';
+                _dx[_dxp++] = '\r'; _dx[_dxp++] = '\n'; _dx[_dxp] = '\0';
+                test_run_info((unsigned char *)_dx);
+            }
+            gateway_rx_flush();
         }
     }
     else if (strncmp(cmd, "AT+OTA_DATA=", 12) == 0)
     {
-        /* AT+OTA_DATA=<UID>,<OFFSET>,<HEX_DATA> */
-        if (!ota_active)
-        {
+        /* P0-3: Inline-polling unicast OTA_DATA handler.
+         * Send chunk → poll DW3000 directly for ACK (EXTI disabled).
+         * No dependency on sniffer loop timing.  Retries up to 15×.
+         * Block 0: 3000ms window (device erases flash ~660ms).
+         * Normal:  300ms window per attempt. */
+        const char *p;
+        char uid_str[8];
+        int i, hex_len, data_len;
+
+        if (!ota_active) {
             test_run_info((unsigned char *)"+OTA_ERROR,OTA,Not started");
             return;
         }
-        const char *p = cmd + 12;
-        char uid_str[8];
-        int i;
+
+        /* Parse: AT+OTA_DATA=<UID>,<OFFSET>,<HEX> */
+        p = cmd + 12;
         i = 0;
-        while (*p && *p != ',' && i < (int)sizeof(uid_str) - 1)
-            uid_str[i++] = *p++;
+        while (*p && *p != ',' && i < (int)sizeof(uid_str) - 1) uid_str[i++] = *p++;
         uid_str[i] = '\0';
-
         if (*p == ',') p++;
-        uint32_t offset = 0;
-        while (*p >= '0' && *p <= '9')
-            offset = offset * 10 + (uint32_t)(*p++ - '0');
-
+        while (*p >= '0' && *p <= '9') p++;  /* skip offset */
         if (*p == ',') p++;
-        /* Remaining chars are hex data — 2 chars per byte */
+        hex_len = 0; { const char *hp = p; while (*hp && *hp != '\r' && *hp != '\n') { hex_len++; hp++; } }
+        data_len = hex_len / 2;
+        if (data_len > 248) data_len = 248;
+
+        /* Build OTA_DATA payload — seq(2B) + data(960B) + crc(2B) + pad(2B).
+         * total_size was already sent in PREP_CMD (0xF0); no per-chunk header needed. */
+        ota_arq_buf[0] = ota_arq_seq & 0xFF;
+        ota_arq_buf[1] = (ota_arq_seq >> 8) & 0xFF;
+        for (i = 0; i < data_len; i++) { uint8_t b; if (hex_byte(p[i*2], p[i*2+1], &b) != 0) break; ota_arq_buf[2 + i] = b; }
+        { uint16_t crc = crc16_ccitt(&ota_arq_buf[2], data_len);
+          ota_arq_buf[2 + data_len] = crc & 0xFF; ota_arq_buf[2 + data_len + 1] = (crc >> 8) & 0xFF;
+          ota_arq_buf[2 + data_len + 2] = 0xCC; ota_arq_buf[2 + data_len + 3] = 0xDD; }
+        ota_arq_buf_len  = (uint8_t)(2 + data_len + 4);
+        ota_arq_data_len = (uint8_t)data_len;
+
+        /*=== Inline polling: send + wait for ACK ===*/
         {
-            uint8_t ota_buf[251];  /* seq(1) + data(248) + crc(2) = 251 */
-            int hex_len = 0;
-            const char *hp = p;
-            while (*hp && *hp != '\r' && *hp != '\n') { hex_len++; hp++; }
-            int data_len = hex_len / 2;
-            if (data_len > 248) data_len = 248;
+            int _retry, _acked = 0;
 
-            ota_buf[0] = ota_seq;
-            for (i = 0; i < data_len; i++)
-            {
-                uint8_t b;
-                if (hex_byte(p[i*2], p[i*2+1], &b) != 0) break;
-                ota_buf[1 + i] = b;
-            }
-            {
-                uint16_t crc = crc16_ccitt(&ota_buf[1], data_len);
-                ota_buf[1 + data_len]     = crc & 0xFF;
-                ota_buf[1 + data_len + 1] = (crc >> 8) & 0xFF;
-            }
-            gateway_send_uwb_ack(ota_dst_uid, FUNC_OTA_DATA, ota_buf, (uint8_t)(1 + data_len + 2));
+            /* Initial send */
+            gateway_send_uwb_ack(ota_dst_uid, FUNC_OTA_DATA, ota_arq_buf, ota_arq_buf_len);
 
-            ota_offset = offset + (uint32_t)data_len;
-            ota_seq++;
+            for (_retry = 0; _retry < (int)OTA_ARQ_MAX_RETRIES && !_acked; _retry++) {
+                uint32_t _timeout;
 
-            /* +OTA_PROGRESS,<UID>,<OFFSET> */
-            {
-                char out[48];
-                int pos;
-                out[0] = '+'; out[1] = 'O'; out[2] = 'T'; out[3] = 'A'; out[4] = '_'; out[5] = 'P';
-                out[6] = 'R'; out[7] = 'O'; out[8] = 'G'; out[9] = 'R'; out[10] = 'E';
-                out[11] = 'S'; out[12] = 'S'; out[13] = ',';
-                pos = 14;
-                pos += fmt_str(&out[pos], uid_str);
-                out[pos++] = ',';
-                pos += fmt_dec(&out[pos], (int)ota_offset);
-                out[pos] = '\0';
-                test_run_info((unsigned char *)out);
+                if (_retry > 0) {
+                    /* Exponential backoff: 10,20,40,80...ms up to 2s.
+                     * Gives UWB channel time to recover from deep fades.
+                     * 20 retries × ~100ms avg ≈ 2s worst case. */
+                    {
+                        uint32_t _bo = OTA_ARQ_BACKOFF_BASE_MS << (uint32_t)(_retry - 1);
+                        if (_bo > 2000u) _bo = 2000u;  /* cap at 2s */
+                        Sleep(_bo);
+                    }
+                    gateway_send_uwb_ack(ota_dst_uid, FUNC_OTA_DATA, ota_arq_buf, ota_arq_buf_len);
+                }
+
+                /* ACK window: block 0 = 3000ms first try, 1000ms retries */
+                if (ota_arq_seq == 0 && _retry == 0)
+                    _timeout = OTA_ARQ_TIMEOUT_BLK0_MS;   /* 1000ms: staging erase ~660ms */
+                else if (ota_arq_seq == 0)
+                    _timeout = 500u;                       /* blk0 retry: 500ms */
+                else
+                    _timeout = OTA_ARQ_TIMEOUT_MS;         /* 50ms: flash write + ACK */
+
+                {
+                    uint32_t _dl = HAL_GetTick() + _timeout;
+                    port_DisableEXT_IRQ();
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);  /* MUST re-enter RX — EXTI may have killed it */
+                    while (HAL_GetTick() < _dl && !_acked) {
+                        uint32_t _st = dwt_read32bitreg(SYS_STATUS_ID);
+
+                        if (_st & SYS_STATUS_RXFCG_BIT_MASK) {
+                            uint32_t _fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                            if (_fl >= GW_HDR_LEN && _fl <= 32) {
+                                uint8_t _rb[32]; dwt_readrxdata(_rb, _fl, 0);
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                /* Diagnostic disabled for OTA speed — was printing <XX> per frame */
+                                if (_rb[9] == FUNC_OTA_ACK) {
+                                    uint16_t _aseq = (uint16_t)(_rb[GW_HDR_LEN]) | ((uint16_t)(_rb[GW_HDR_LEN+1]) << 8);
+                                    uint8_t  _ast  = _rb[GW_HDR_LEN + 2];
+                                    if (_aseq == ota_arq_seq && _ast == 0) { _acked = 1; }
+                                    /* ACK rejected (wrong seq/status) — silent, ARQ will retry */
+                                }
+                            } else {
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            }
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+
+                        if (_st & SYS_STATUS_ALL_RX_ERR) {
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+
+                        Sleep(1);
+                    }
+                    EXTI->PR1 = (1u << 12);
+                    port_EnableEXT_IRQ();
+                }
             }
+
+            if (_acked) {
+                ota_offset += (uint32_t)ota_arq_data_len;
+                ota_arq_seq++;
+                { char _out[48]; int _pos;
+                  _out[0]='+'; _out[1]='O'; _out[2]='T'; _out[3]='A'; _out[4]='_'; _out[5]='P';
+                  _out[6]='R'; _out[7]='O'; _out[8]='G'; _out[9]='R'; _out[10]='E'; _out[11]='S'; _out[12]='S'; _out[13]=',';
+                  _pos=14; { uint16_t _u=ota_dst_uid; _out[_pos++]=gw_hex[(_u>>12)&0xF]; _out[_pos++]=gw_hex[(_u>>8)&0xF];
+                  _out[_pos++]=gw_hex[(_u>>4)&0xF]; _out[_pos++]=gw_hex[_u&0xF]; }
+                  _out[_pos++]=','; _pos+=fmt_dec(&_out[_pos],(int)ota_offset); _out[_pos++]='\r'; _out[_pos++]='\n'; _out[_pos]='\0';
+                  test_run_info((unsigned char *)_out); }
+            } else {
+                /* All retries exhausted — ABORT, don't fake success.
+                 * Skipping created staging gaps → gw_ota_finish GAP abort → "fake success". */
+                ota_active = 0;
+                test_run_info((unsigned char *)"+OTA_ERROR,ARQ,All 15 retries exhausted\r\n");
+            }
+            gateway_rx_flush();
         }
     }
     else if (strncmp(cmd, "AT+OTA_END=", 11) == 0)
     {
-        /* AT+OTA_END=<UID> → +OTA_DONE,<UID> */
-        ota_active = 0;
+        /* AT+OTA_END=<UID> → send OTA_END via UWB 3×, then +OTA_DONE */
+        uint16_t uid = parse_uid(cmd + 11);
+        ota_active    = 0;
+        ota_arq_state = OTA_ARQ_IDLE;
+
+        /* Pad to 13B to avoid DW3210 last-2B RX corruption (func=byte9).
+         * Send 3× with 100ms spacing — OTA_END has no ACK, must not be lost. */
+        { int _r;
+          for (_r = 0; _r < 3; _r++) {
+            uint8_t pad[3] = {0xCC, 0xDD, 0xEE};
+            gateway_send_uwb_ack(uid, FUNC_OTA_END, pad, 3);
+            gateway_rx_flush();
+            if (_r < 2) Sleep(100);
+          }
+        }
+
+        /* Resume Master TDMA if it was paused before OTA */
+        if (uid == 0x0000) {
+            uint8_t start_pad[3] = {0xCC, 0xDD, 0xEE};
+            gateway_send_cmd_wait_ack(uid, FUNC_START_TDOA,
+                                      start_pad, 3, FUNC_START_ACK, 150, 5);
+        }
+
         {
             char out[32];
             int pos;
@@ -933,19 +1962,171 @@ void gateway_poll_uart(void)
     }
     else if (strncmp(cmd, "AT+FWV", 6) == 0)
     {
-        /* AT+FWV → +FWV,<type>,<uid>,<version> for all known devices */
+        /* AT+FWV → +FWV,<type>,<uid>,<version> for gateway + all known devices */
         char out[48], ver[9];
-        int pos;
+        int pos, i;
+
         /* Gateway itself */
         fw_version_str(ver, FW_VERSION_U16);
         out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
         out[5] = 'G'; out[6] = 'W'; out[7] = ',';
-        out[8] = '0'; out[9] = '0'; out[10] = '0'; out[11] = '0'; out[12] = ',';
+        out[8] = 'G'; out[9] = 'W'; out[10] = '0'; out[11] = '1'; out[12] = ',';
         pos = 13;
         pos += fmt_str(&out[pos], ver);
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
-        /* (Device versions are auto-detected via beacon/slave reports) */
+
+        /* All known devices with version info */
+        for (i = 0; i < gw_dev_count; i++)
+        {
+            if (gw_devs[i].fw_ver == 0) continue;  /* version not yet known */
+            fw_version_str(ver, gw_devs[i].fw_ver);
+            out[0] = '+'; out[1] = 'F'; out[2] = 'W'; out[3] = 'V'; out[4] = ',';
+            out[5] = gw_devs[i].type; out[6] = ',';
+            pos = 7;
+            pos += fmt_str(&out[pos], gw_devs[i].uid);
+            out[pos++] = ',';
+            pos += fmt_str(&out[pos], ver);
+            out[pos] = '\0';
+            test_run_info((unsigned char *)out);
+        }
+    }
+    else if (strncmp(cmd, "AT+NETWORK=", 11) == 0)
+    {
+        /* AT+NETWORK=<hex_mask> — set which anchors participate */
+        unsigned int mask = 0;
+        const char *hp = cmd + 11;
+        while (*hp) {
+            char c = *hp++;
+            mask <<= 4;
+            if (c >= '0' && c <= '9') mask |= (c - '0');
+            else if (c >= 'A' && c <= 'F') mask |= (c - 'A' + 10);
+            else if (c >= 'a' && c <= 'f') mask |= (c - 'a' + 10);
+            else break;
+        }
+        {
+            uint8_t payload[2]; int _r;
+            payload[0] = mask & 0xFF;
+            payload[1] = (mask >> 8) & 0xFF;
+            /* NETWORK_CFG — send and wait for ACK */
+            {
+                int _r, ack_ok = 0;
+                for (_r = 0; _r < 3 && !ack_ok; _r++) {
+                    gateway_send_uwb_ack(0x0000, FUNC_NETWORK_CFG, payload, 2);
+                    { uint32_t dl = HAL_GetTick() + (_r < 2 ? 30u : 100u);
+                      port_DisableEXT_IRQ();
+                      while (HAL_GetTick() < dl) {
+                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                        if (st & SYS_STATUS_ALL_RX_ERR) {
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                            Sleep(1); continue; }
+                        if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                            uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                            if (fl >= GW_HDR_LEN && fl <= 32) {
+                                uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                if (rb[9] == FUNC_NETWORK_ACK) { ack_ok = 1; break; }
+                            } else { dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK); }
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                        Sleep(1);
+                      }
+                      EXTI->PR1 = (1u << 12);
+                      port_EnableEXT_IRQ();
+                    }
+                }
+                if (ack_ok) {
+                    char out[24]; int pos=0;
+                    out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
+                    out[pos++]='_'; out[pos++]='O'; out[pos++]='K'; out[pos++]=',';
+                    pos += fmt_hex4(&out[pos], (uint16_t)mask);
+                    out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+                    test_run_info((unsigned char *)out);
+                } else {
+                    test_run_info((unsigned char *)"+NET_ERR\r\n");
+                }
+                gateway_rx_flush();  /* clean RX state after TX+ACK polling */
+            }
+        }
+    }
+    else if (strncmp(cmd, "AT+STOP", 7) == 0)
+    {
+        /* Send STOP_TDOA to Master via UWB, wait for ACK */
+        {
+            uint8_t pad[3] = {0xCC, 0xDD, 0xEE}; int _r, ack_ok = 0;
+            for (_r = 0; _r < 3 && !ack_ok; _r++) {
+                gateway_send_uwb_ack(0x0000, FUNC_STOP_TDOA, pad, 3);
+                { uint32_t dl = HAL_GetTick() + (_r < 2 ? 30u : 100u);
+                  port_DisableEXT_IRQ();
+                  while (HAL_GetTick() < dl) {
+                    uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                    if (st & SYS_STATUS_ALL_RX_ERR) {
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        Sleep(1); continue; }
+                    if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                        uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                        if (fl >= GW_HDR_LEN && fl <= 32) {
+                            uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            if (rb[9] == FUNC_STOP_ACK) { ack_ok = 1; break; }
+                        } else { dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK); }
+                        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    }
+                    Sleep(1);
+                  }
+                  EXTI->PR1 = (1u << 12);
+                  port_EnableEXT_IRQ();
+                }
+            }
+            if (ack_ok) {
+                gw_tdoa_active = 0;
+                test_run_info((unsigned char *)"+STOP_OK\r\n");
+            } else {
+                test_run_info((unsigned char *)"+STOP_ERR\r\n");
+            }
+            gateway_rx_flush();  /* clean RX state after TX+ACK polling */
+        }
+    }
+    else if (strncmp(cmd, "AT+START", 8) == 0)
+    {
+        /* Send START_TDOA to Master via UWB, wait for ACK */
+        {
+            uint8_t pad[3] = {0xCC, 0xDD, 0xEE}; int _r, ack_ok = 0;
+            for (_r = 0; _r < 3 && !ack_ok; _r++) {
+                gateway_send_uwb_ack(0x0000, FUNC_START_TDOA, pad, 3);
+                { uint32_t dl = HAL_GetTick() + (_r < 2 ? 30u : 100u);
+                  port_DisableEXT_IRQ();
+                  while (HAL_GetTick() < dl) {
+                    uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                    if (st & SYS_STATUS_ALL_RX_ERR) {
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        Sleep(1); continue; }
+                    if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                        uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                        if (fl >= GW_HDR_LEN && fl <= 32) {
+                            uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            if (rb[9] == FUNC_START_ACK) { ack_ok = 1; break; }
+                        } else { dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK); }
+                        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    }
+                    Sleep(1);
+                  }
+                  EXTI->PR1 = (1u << 12);
+                  port_EnableEXT_IRQ();
+                }
+            }
+            if (ack_ok) {
+                gw_tdoa_active = 1;
+                test_run_info((unsigned char *)"+START_OK\r\n");
+            } else {
+                test_run_info((unsigned char *)"+START_ERR\r\n");
+            }
+            gateway_rx_flush();  /* clean RX state after TX+ACK polling */
+        }
     }
     /* Unknown command — silently ignore */
 }
