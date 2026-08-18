@@ -8,6 +8,9 @@ Listings/
 JLinkLog.txt
 *.ini
 
+# Keil project backups
+*.bak
+
 # Object & listing files
 *.o
 *.d
