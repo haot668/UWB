@@ -52,7 +52,7 @@ extern UART_HandleTypeDef huart2;
  * Used to trace "tag outputs wrong coordinates" — reveals whether the
  * anchor coordinates in the beacon match the physical layout and whether
  * the TDOA measurements are small (near anchors) or large (far/wrong). */
-#define TAG_DIAG  1
+#define TAG_DIAG  0
 
 /* Default communication configuration — Channel 5, 6.8 Mbps, NO STS */
 static dwt_config_t config = {
