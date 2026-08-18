@@ -1707,7 +1707,11 @@ slave_entry:
          * idles in config mode, so master power-off there must also trigger
          * failover.  Only skip during active OTA, when the Master
          * intentionally stops beaconing. */
+#ifndef GATEWAY_ROLE
         if (!got_beacon && !gw_ota_is_active())
+#else
+        if (!got_beacon)
+#endif
         {
             master_miss_count++;
             if (master_miss_count >= MASTER_LOST_THRESHOLD)
