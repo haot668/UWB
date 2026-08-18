@@ -149,9 +149,9 @@ static void MX_NVIC_Init(void)
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 
     /* DW3000 IRQ (PA12 → EXTI12 → EXTI15_10_IRQn).
-     * Only set priority; the DW3000 driver enables/disables this IRQ
-     * via port_EnableEXT_IRQ() / port_DisableEXT_IRQ(). */
-    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+     * Priority 0 = highest — must preempt all other IRQs so UWB
+     * frame RX is never delayed. */
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
 }
 
 static void MX_SPI1_Init(void)

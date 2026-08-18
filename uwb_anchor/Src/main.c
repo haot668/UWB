@@ -53,6 +53,15 @@ void test_run_info(unsigned char *data)
 
 int main(void)
 {
+    /* Quick LED blink — proves main() reached after OTA boot */
+    {   volatile uint32_t _d;
+        RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN;
+        GPIOA->MODER = (GPIOA->MODER & ~(3UL<<10)) | (1UL<<10);
+        GPIOA->BSRR = (1UL<<5);
+        for (_d=0;_d<4000000;_d++){__NOP();}
+        GPIOA->BSRR = (1UL<<21);
+    }
+
     HAL_Init();
     SystemClock_Config();
 
@@ -151,9 +160,10 @@ static void MX_NVIC_Init(void)
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 
     /* DW3000 IRQ (PA12 → EXTI12 → EXTI15_10_IRQn).
-     * Only set priority; the DW3000 driver enables/disables this IRQ
-     * via port_EnableEXT_IRQ() / port_DisableEXT_IRQ(). */
-    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+     * Priority 0 = highest (same as SysTick). Must preempt all other
+     * interrupts so UWB frame RX is never delayed — a missed SFD leads
+     * to frame loss and PREPARE/COORD failures. */
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
 }
 
 static void MX_SPI1_Init(void)
@@ -250,6 +260,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     UNUSED(htim);
 }
+
 
 void _Error_Handler(char *file, int line)
 {
