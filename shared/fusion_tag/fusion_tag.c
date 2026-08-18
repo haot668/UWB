@@ -128,6 +128,7 @@ static int      g_slot_synced  = 0;    /* 1 = have valid TDMA phase sync        
 /* TDOA solver tuning */
 #define TDOA_CM_PER_DTU  0.4691f  /* cm per DW3000 device time unit (499.2MHz × 128) */
 #define OUTLIER_RMS_CM   10.0f    /* all-anchor RMS (cm) above which leave-one-out is tried */
+#define MAX_TAG_RANGE_CM 1000.0f  /* max tag distance from anchor centroid (cm) — 10m */
 
 /* Header match patterns (SN, DST, SRC wildcarded) */
 #define HDR_LEN 10u
@@ -430,6 +431,19 @@ static int solve_2d_gn(const dl_anchor_entry_t *anchors,
     *y_out = y;
     *rms_out = rms;
     return 0;
+}
+
+/* in_tag_bounds — reject far-field spurious TDOA solutions.  TDOA is a
+ * difference measurement: a tag very far from the anchor cluster produces
+ * nearly the same TDOA pattern as one inside it, so Gauss-Newton can converge
+ * to a spurious solution tens of km away — especially after a warm-up cycle
+ * seeds last_x/last_y there, or when leave-one-out drops to two anchors.
+ * A real tag must lie within MAX_TAG_RANGE_CM of the anchor centroid; anything
+ * farther is rejected. */
+static int in_tag_bounds(float x, float y, float cx, float cy)
+{
+    float dx = x - cx, dy = y - cy;
+    return (dx * dx + dy * dy) <= (MAX_TAG_RANGE_CM * MAX_TAG_RANGE_CM);
 }
 
 /*============================================================================
@@ -1232,63 +1246,82 @@ int fusion_tag(void)
                 /* Try up to 2 initial guesses: (1) last good pos, (2) centroid.
                  * Skip the solve entirely unless ≥2 valid TDOA (reference + 2
                  * slaves) are available — a 2D fix needs 2 independent range
-                 * differences. */
-                ret = -1;
-                if (n_valid >= 2)
+                 * differences.  Every candidate is bounds-checked against the
+                 * anchor centroid so a spurious far-field solution (TDOA
+                 * ambiguity, or a warm-up cycle seeding last_x/last_y far away)
+                 * can never be reported. */
                 {
-                for (_attempt = 0; _attempt < 2; _attempt++)
-                {
-                    float gx, gy;
+                    float cx = 0.0f, cy = 0.0f;
 
-                    if (_attempt == 0 && has_last)
+                    for (_k = 0; _k < (int)num_anchors; _k++)
                     {
-                        gx = last_x;
-                        gy = last_y;
+                        cx += (float)anchor_table[_k].x_cm;
+                        cy += (float)anchor_table[_k].y_cm;
+                    }
+                    cx /= (float)num_anchors;
+                    cy /= (float)num_anchors;
+
+                    if (has_last && !in_tag_bounds(last_x, last_y, cx, cy))
+                        has_last = 0;   /* stale far-field guess — discard */
+
+                    ret = -1;
+                    if (n_valid >= 2)
+                    {
+                    for (_attempt = 0; _attempt < 2; _attempt++)
+                    {
+                        float gx, gy;
+
+                        if (_attempt == 0 && has_last)
+                        {
+                            gx = last_x;
+                            gy = last_y;
+                        }
+                        else
+                        {
+                            gx = cx;
+                            gy = cy;
+                        }
+
+                        ret = solve_2d_gn(anchor_table, tdoa_cm, valid, num_anchors, -1,
+                                          gx, gy, &x_cm, &y_cm, &rms);
+                        if (ret != 0)
+                            continue;   /* retry with centroid init */
+                        if (!in_tag_bounds(x_cm, y_cm, cx, cy))
+                        {
+                            ret = -1;
+                            continue;   /* far-field spurious solution — retry centroid */
+                        }
+
+                        /* Outlier rejection: a single corrupted blink (multipath /
+                         * missed-adjacent) can dominate the residual.  If the all-
+                         * anchor RMS is poor and we have ≥3 valid TDOA, try leaving
+                         * each slave out in turn and keep the lowest-RMS in-bounds
+                         * solution. */
+                        if (n_valid >= 3 && rms > OUTLIER_RMS_CM)
+                        {
+                            float bx = x_cm, by = y_cm, brms = rms;
+                            for (_k = 1; _k < (int)num_anchors; _k++)
+                            {
+                                float tx, ty, trms;
+                                if (!valid[_k]) continue;
+                                if (solve_2d_gn(anchor_table, tdoa_cm, valid, num_anchors, _k,
+                                                gx, gy, &tx, &ty, &trms) == 0 &&
+                                    in_tag_bounds(tx, ty, cx, cy) && trms < brms)
+                                {
+                                    bx = tx; by = ty; brms = trms;
+                                }
+                            }
+                            if (brms < rms) { x_cm = bx; y_cm = by; rms = brms; }
+                        }
+
+                        last_x = x_cm; last_y = y_cm; has_last = 1;
+                        break;
+                    }
                     }
                     else
                     {
-                        float _sx = 0, _sy = 0;
-                        for (_k = 0; _k < (int)num_anchors; _k++)
-                        {
-                            _sx += (float)anchor_table[_k].x_cm;
-                            _sy += (float)anchor_table[_k].y_cm;
-                        }
-                        gx = _sx / (float)num_anchors;
-                        gy = _sy / (float)num_anchors;
+                        ret = -2;   /* <2 valid anchors: no TDOA fix possible */
                     }
-
-                    ret = solve_2d_gn(anchor_table, tdoa_cm, valid, num_anchors, -1,
-                                      gx, gy, &x_cm, &y_cm, &rms);
-                    if (ret != 0)
-                        continue;   /* retry with centroid init */
-
-                    /* Outlier rejection: a single corrupted blink (multipath /
-                     * missed-adjacent) can dominate the residual.  If the all-
-                     * anchor RMS is poor and we have ≥3 valid TDOA, try leaving
-                     * each slave out in turn and keep the lowest-RMS solution. */
-                    if (n_valid >= 3 && rms > OUTLIER_RMS_CM)
-                    {
-                        float bx = x_cm, by = y_cm, brms = rms;
-                        for (_k = 1; _k < (int)num_anchors; _k++)
-                        {
-                            float tx, ty, trms;
-                            if (!valid[_k]) continue;
-                            if (solve_2d_gn(anchor_table, tdoa_cm, valid, num_anchors, _k,
-                                            gx, gy, &tx, &ty, &trms) == 0 && trms < brms)
-                            {
-                                bx = tx; by = ty; brms = trms;
-                            }
-                        }
-                        if (brms < rms) { x_cm = bx; y_cm = by; rms = brms; }
-                    }
-
-                    last_x = x_cm; last_y = y_cm; has_last = 1;
-                    break;
-                }
-                }
-                else
-                {
-                    ret = -2;   /* <2 valid anchors: no TDOA fix possible */
                 }
                 z_cm = 0;
             }
