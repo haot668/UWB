@@ -120,10 +120,12 @@ static uint8_t  frame_seq   = 0;
 /* Slot-synchronized listening state */
 static uint32_t g_next_bcn_tick = 0;   /* portGetTickCnt() of next expected beacon */
 static int      g_slot_synced  = 0;    /* 1 = have valid TDMA phase sync            */
+static int      g_bcn_miss_cnt = 0;    /* consecutive missed beacons while synced    */
 
 #define BCN_TIMEOUT_MS  650u   /* Unsynced beacon search timeout                   */
 #define BCN_SYNC_WIN_MS 10u    /* Synced beacon RX window (50ms cycle @20Hz)       */
 #define BCN_SYNC_POLL_MS 20u    /* Synced poll: beacon + all blinks (~10ms) + margin */
+#define BCN_MISS_MAX    3u     /* consecutive missed beacons before losing sync    */
 
 /* TDOA solver tuning */
 #define TDOA_CM_PER_DTU  0.4691f  /* cm per DW3000 device time unit (499.2MHz × 128) */
@@ -151,11 +153,17 @@ static float kf_Py[4];              /* covariance for y-axis */
 static int   kf_init_done = 0;
 static int   kf_reject_cnt = 0;     /* consecutive rejected measurements  */
 
-/* Tuning constants */
-#define KF_Q_POS     0.01f   /* position process noise spectral density (cm²/s)  */
-#define KF_Q_VEL    10.0f    /* velocity process noise spectral density (cm²/s³) */
-#define KF_R_BASE   100.0f   /* base measurement noise (cm²) when solver RMS=0   */
-#define KF_R_MULT    15.0f   /* scale measurement noise by RMS×MULT              */
+/* Tuning constants
+ *  Retuned for dynamic tracking (reduced lag).  The previous values
+ *  (KF_R_BASE=100, KF_R_MULT=15) produced an effective measurement noise of
+ *  ~1600 cm² at 10cm RMS — a ~40cm std — so the filter trusted its own
+ *  constant-velocity model far more than the raw fix and trailed the tag
+ *  during movement (lag = "卡顿").  Lower R + higher Q_VEL raise the Kalman
+ *  gain so the estimate tracks faster at the cost of slightly more jitter. */
+#define KF_Q_POS     0.1f    /* position process noise spectral density (cm²/s)  */
+#define KF_Q_VEL    50.0f    /* velocity process noise spectral density (cm²/s³) */
+#define KF_R_BASE   25.0f    /* base measurement noise (cm²) when solver RMS=0   */
+#define KF_R_MULT    4.0f    /* scale measurement noise by RMS×MULT              */
 #define KF_GATE_CM       50000.0f  /* innovation outlier gate (500 m, in cm)   */
 #define KF_REINIT_THRESH 3         /* consecutive rejections before re-seeding */
 
@@ -282,6 +290,34 @@ static int kalman_update_2d(float x_m, float y_m, float dt, float rms,
         else           *y_f = kf_pos[axis];
     }
     return 0;
+}
+
+/* kalman_predict_2d — predict-only step (no measurement update).
+ * Used to coast through a solver dropout (geometry singularity / a missed
+ * blink).  Advances kf_pos/kf_vel/P by one dt under the constant-velocity
+ * model so the reported position keeps gliding instead of freezing — a
+ * freeze-then-jump is what reads as "卡顿" during dynamic tracking. */
+static void kalman_predict_2d(float dt)
+{
+    int axis;
+    if (!kf_init_done) return;
+    for (axis = 0; axis < 2; axis++)
+    {
+        float *P   = (axis == 0) ? kf_Px : kf_Py;
+        float pos  = kf_pos[axis];
+        float vel  = kf_vel[axis];
+        float P00  = P[0], P01 = P[1], P10 = P[2], P11 = P[3];
+        float dt2  = dt * dt;
+
+        /* Matches the predict step in kalman_update_2d exactly. */
+        kf_pos[axis] = pos + vel * dt;
+        kf_vel[axis] = vel;
+        P[0] = P00 + dt*(P01 + P10) + dt2*P11
+             + (KF_Q_POS*dt + KF_Q_VEL*dt2*dt/3.0f);
+        P[1] = P01 + dt*P11 + KF_Q_VEL*dt2*0.5f;
+        P[2] = P10 + dt*P11 + KF_Q_VEL*dt2*0.5f;
+        P[3] = P11 + KF_Q_VEL*dt;
+    }
 }
 
 extern dwt_txconfig_t txconfig_options;
@@ -942,9 +978,31 @@ int fusion_tag(void)
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
             }
 
-            /* If synced window ended without any frames, lose sync */
-            if (g_slot_synced && num_rx == 0)
-                g_slot_synced = 0;
+            /*=== Slot-sync maintenance (single source of truth) ===
+             *  - Beacon received (bcn_tick set): (re)lock phase, schedule the
+             *    next beacon, clear the miss counter.
+             *  - No beacon while synced: count the miss.  A single missed
+             *    beacon (common while moving / multipath fading) must NOT drop
+             *    sync — that would force the next cycle into the 650ms
+             *    unsynced search (~13 cycles of no output = the visible
+             *    "卡顿").  Advance the expected beacon tick and stay synced;
+             *    fall back to unsynced only after BCN_MISS_MAX misses. */
+            if (bcn_tick != 0)
+            {
+                g_next_bcn_tick = bcn_tick + (uint32_t)DL_CYCLE_PERIOD_MS;
+                g_slot_synced   = 1;
+                g_bcn_miss_cnt  = 0;
+            }
+            else if (g_slot_synced)
+            {
+                g_bcn_miss_cnt++;
+                g_next_bcn_tick += (uint32_t)DL_CYCLE_PERIOD_MS;
+                if (g_bcn_miss_cnt >= (int)BCN_MISS_MAX)
+                {
+                    g_slot_synced   = 0;
+                    g_bcn_miss_cnt = 0;
+                }
+            }
         }
 
         /* OTA timeout poll — L1 rollback: if no data for 5s, resume ranging */
@@ -1007,8 +1065,10 @@ int fusion_tag(void)
         /*=== Output result ===*/
         if (num_rx < 2)
         {
-            /* Missed too many blinks — try to re-sync next cycle */
-            g_slot_synced = 0;
+            /* Too little data to solve this cycle (no beacon, or beacon only
+             * with no blinks).  Slot sync is maintained separately in the
+             * beacon-miss block above — do NOT drop sync here, or a single
+             * blink drop would force a 650ms re-acquisition stall. */
             continue;
         }
 
@@ -1397,10 +1457,13 @@ int fusion_tag(void)
             }
             else
             {
-                /* Coast on solver failure: reuse the last filtered position
-                 * instead of emitting zeros/ERR.  Keeps the reported position
-                 * stable during brief geometry-induced singularities. */
+                /* Coast on solver failure: propagate the filtered state
+                 * forward one cycle under the constant-velocity model instead
+                 * of freezing at kf_pos.  Keeps the tag gliding through brief
+                 * geometry-induced singularities / a missed blink (freeze-then-
+                 * jump reads as "卡顿" in dynamic tracking). */
                 if (kf_init_done) {
+                    kalman_predict_2d((float)DL_CYCLE_PERIOD_MS / 1000.0f);
                     tx_xi = (int16_t)kf_pos[0];
                     tx_yi = (int16_t)kf_pos[1];
                     tx_zi = 0;
@@ -1458,13 +1521,8 @@ int fusion_tag(void)
                 /* EXTI stays disabled — tag uses polling for RX */
             }
 
-        /*=== Update slot sync for next cycle ===
-         *   Master sends beacons every 500ms via DLY_TS.  We snapshotted
-         *   portGetTickCnt() at beacon RX; the next beacon is expected
-         *   exactly 500ms later.  Even if the solver fails (ERR DIVERGE),
-         *   we still have valid phase sync from the received beacon.    ===*/
-        g_next_bcn_tick = bcn_tick + (uint32_t)DL_CYCLE_PERIOD_MS;
-        g_slot_synced  = 1;
+        /* Slot sync for the next cycle is maintained in the beacon-miss block
+         * immediately after the RX poll (single source of truth). */
         }
     }
 }
