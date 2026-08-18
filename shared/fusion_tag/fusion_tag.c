@@ -46,6 +46,14 @@ extern UART_HandleTypeDef huart2;
  * Change to 0 for production use — protocol spec TBD. */
 #define TAG_DEBUG_OUTPUT  1
 
+/* Positioning diagnostics:
+ *   1 = print anchor table (once) + compensated TDOA (every cycle)
+ *   0 = off
+ * Used to trace "tag outputs wrong coordinates" — reveals whether the
+ * anchor coordinates in the beacon match the physical layout and whether
+ * the TDOA measurements are small (near anchors) or large (far/wrong). */
+#define TAG_DIAG  1
+
 /* Default communication configuration — Channel 5, 6.8 Mbps, NO STS */
 static dwt_config_t config = {
     UWB_CHANNEL,     /* Channel number (5 or 9). */
@@ -749,6 +757,35 @@ int fusion_tag(void)
                                 float _bcm = sqrtf(_bx*_bx + _by*_by + _bz*_bz);
                                 baseline_dtu[i] = (int64_t)(_bcm / ((float)SPEED_OF_LIGHT * 100.0f / (499.2e6f * 128.0f)));
                             }
+#if TAG_DIAG
+                            /* One-shot: dump the anchor table the tag is actually
+                             * solving against (decimal meters).  If these don't
+                             * match the host's configured coordinates, the beacon
+                             * is carrying stale/wrong coords (COORD write failed
+                             * or defaults mismatch) — that's the root cause of a
+                             * far-off fixed position. */
+                            {
+                                static int _ac_printed = 0;
+                                if (!_ac_printed) {
+                                    _ac_printed = 1;
+                                    char _ac[128]; int _p = 0, _ai;
+                                    _ac[_p++] = 'A'; _ac[_p++] = 'C'; _ac[_p++] = ':';
+                                    for (_ai = 0; _ai < (int)n && _ai < 4; _ai++) {
+                                        _ac[_p++] = ' ';
+                                        _ac[_p++] = '#'; _ac[_p++] = '0' + _ai;
+                                        _ac[_p++] = '(';
+                                        _p += uart_print_f32(&_ac[_p], (float)anchor_table[_ai].x_cm / 100.0f, 2);
+                                        _ac[_p++] = ',';
+                                        _p += uart_print_f32(&_ac[_p], (float)anchor_table[_ai].y_cm / 100.0f, 2);
+                                        _ac[_p++] = ',';
+                                        _p += uart_print_f32(&_ac[_p], (float)anchor_table[_ai].z_cm / 100.0f, 2);
+                                        _ac[_p++] = ')';
+                                    }
+                                    _ac[_p++] = '\r'; _ac[_p++] = '\n'; _ac[_p] = '\0';
+                                    test_run_info((unsigned char *)_ac);
+                                }
+                            }
+#endif
                         }
                         toa_dtu[0]  = get_rx_timestamp_u64();
                         tx_ts_dtu[0] = unpack_40bit_ts(&rx_buffer[DL_BCN_TX_TS_IDX]);
@@ -1069,6 +1106,23 @@ int fusion_tag(void)
                     int64_t diff = (int64_t)(toa_dtu[_si] - toa_dtu[0]);
                     tdoa_cm[_si] = (float)diff * TDOA_CM_PER_DTU;
                 }
+
+#if TAG_DIAG
+                /* Compensated TDOA (meters) — small (≈±3m) means the tag is
+                 * inside the anchor hull; tens of meters means either the
+                 * anchor coords are wrong or the DLY_RS/slot compensation is
+                 * grossly off. */
+                {
+                    char _td[64]; int _tp = 0, _ti;
+                    _td[_tp++] = 'T'; _td[_tp++] = 'D'; _td[_tp++] = ':';
+                    for (_ti = 1; _ti < (int)num_anchors && _ti < 4; _ti++) {
+                        if (_ti > 1) _td[_tp++] = ',';
+                        _tp += uart_print_f32(&_td[_tp], tdoa_cm[_ti] / 100.0f, 2);
+                    }
+                    _td[_tp++] = '\r'; _td[_tp++] = '\n'; _td[_tp] = '\0';
+                    test_run_info((unsigned char *)_td);
+                }
+#endif
 
                 /* Try up to 2 initial guesses: (1) last good pos, (2) centroid */
                 ret = -1;
