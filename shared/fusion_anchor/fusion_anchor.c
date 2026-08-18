@@ -27,6 +27,7 @@
 #include <example_selection.h>
 #include "auto_anchor.h"
 #include "gateway_protocol.h"
+#include "auto_deploy.h"
 #include "firmware_version.h"
 #include "../gw_ota/gw_ota.h"
 #if ENABLE_GATEWAY
@@ -271,6 +272,349 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
     if (zero_src) { rx[7] = saved_s0; rx[8] = saved_s1; }
     return match;
 }
+
+/*============================================================================
+ * Auto-deploy — anchor-to-anchor SS-TWR self-ranging + trilateration
+ *
+ * Host "自动部署": gateway → master FUNC_AUTODEPLOY(0xEC). Master runs a
+ * blocking SS-TWR session: ranges each slave (d(0,i)), commands slave 1 to
+ * range the rest (d(1,j)), trilaterates 2D coords, writes the beacon table,
+ * and broadcasts FUNC_AUTODEPLOY_RES(0xDE) so the host can refresh the map.
+ *
+ * SS-TWR math follows Decawave ex_06a/06b. Antenna delays (TX_ANT_DLY ==
+ * RX_ANT_DLY) cancel in the round-trip, so
+ *   tof = (rtd_init - rtd_resp*(1-clockOffsetRatio)) / 2 * DWT_TIME_UNITS.
+ * 32-bit timestamps suffice (round-trip << 67ms wrap).
+ *============================================================================*/
+#ifdef FUSION_DOWNLINK_MODE
+
+/* Responder turnaround: poll RX → resp TX (UWB us), matches ex_06b. */
+#define RANGE_RESP_DLY_UUS    1100u
+/* Initiator wait for poll→resp / rpt exchange (ms). */
+#define RANGE_RX_TIMEOUT_MS   200u
+/* Feed IWDG during blocking waits (no-op if the dog isn't running). */
+#define AUTODEPLOY_FEED_DOG() do { IWDG->KR = 0xAAAA; } while(0)
+
+/* Compact little-endian packers (keep auto-deploy code footprint small). */
+static void hdr10(uint8_t *f, uint16_t dst, uint16_t src, uint8_t func)
+{
+    f[0] = 0x41; f[1] = 0x88; f[2] = 0;
+    f[3] = 0xCA; f[4] = 0xDE;
+    f[5] = (uint8_t)dst;        f[6] = (uint8_t)(dst >> 8);
+    f[7] = (uint8_t)src;        f[8] = (uint8_t)(src >> 8);
+    f[9] = func;
+}
+static void st16(uint8_t *f, uint16_t v) { f[0] = (uint8_t)v; f[1] = (uint8_t)(v >> 8); }
+static void st32(uint8_t *f, uint32_t v) { st16(f, (uint16_t)v); st16(f + 2, (uint16_t)(v >> 16)); }
+static void st32s(uint8_t *f, int32_t v) { st32(f, (uint32_t)v); }
+
+/* Immediate TX of a pre-built frame; wait for TXFRS. 0 = ok, -1 = fail.
+ * Caller must have forced the DW3000 to IDLE, switched RF to TX, and
+ * disabled the EXTI IRQ (so the RX ISR can't stomp the TX). */
+static int range_tx_frame(uint8_t *frame, uint16_t len)
+{
+    uint32_t tx_dl;
+    dwt_writetxdata(len, frame, 0);
+    dwt_writetxfctrl(len, 0, 0);
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) return -1;
+    tx_dl = HAL_GetTick() + 10u;
+    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {
+        if (HAL_GetTick() > tx_dl) return -1;
+    }
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+    return 0;
+}
+
+/* Poll for a frame with `func`; return frame_len or 0 on timeout. Stray
+ * frames (beacons/blinks) are ignored and RX re-armed. */
+static int range_wait_rx(uint8_t func, uint32_t timeout_ms)
+{
+    uint32_t deadline = HAL_GetTick() + timeout_ms;
+    uint32_t status_reg, frame_len;
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    while (HAL_GetTick() < deadline) {
+        Sleep(1);
+        AUTODEPLOY_FEED_DOG();
+        status_reg = dwt_read32bitreg(SYS_STATUS_ID);
+        if (status_reg & SYS_STATUS_ALL_RX_ERR) {
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            continue;
+        }
+        if (!(status_reg & SYS_STATUS_RXFCG_BIT_MASK)) continue;
+        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+        frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+        if (frame_len > sizeof(rx_buffer)) {
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            continue;
+        }
+        dwt_readrxdata(rx_buffer, frame_len, 0);
+        if (rx_buffer[9] == func) return (int)frame_len;
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+    dwt_forcetrxoff();
+    return 0;
+}
+
+/* SS-TWR initiator: range `target_rank`, store distance (cm). 0/-1.
+ * Integer math only (no float/soft-lib):
+ *   tof = (rtd_init - rtd_resp*(1-cfo/2^26)) / 2 * DWT_TIME_UNITS
+ *   dist_cm = tof * SPEED_OF_LIGHT * 100 = diff_dtu * 0.23451784 cm */
+static int anchor_ss_twr(uint16_t target_rank, int32_t *dist_cm)
+{
+    uint8_t poll[RANGE_POLL_LEN];
+    uint32_t poll_tx_ts, resp_rx_ts, poll_rx_ts, resp_tx_ts;
+    int32_t rtd_init, rtd_resp, rtd_resp_corr, diff;
+    int16_t cfo;
+    int flen;
+
+    hdr10(poll, target_rank, (uint16_t)ANCHOR_ID_VAL, FUNC_RANGE_POLL);
+    poll[10] = 0xCC; poll[11] = 0xDD;
+
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    if (range_tx_frame(poll, RANGE_POLL_LEN) != 0) {
+        port_rf_switch_rx();
+        return -1;
+    }
+    poll_tx_ts = dwt_readtxtimestamplo32();
+
+    port_rf_switch_rx();
+    flen = range_wait_rx(FUNC_RANGE_RESP, RANGE_RX_TIMEOUT_MS);
+    if (flen < RANGE_RESP_LEN) return -1;
+
+    resp_rx_ts = dwt_readrxtimestamplo32();
+    cfo = dwt_readclockoffset();                      /* int16, units 2^-26 */
+    poll_rx_ts = (uint32_t)rx_buffer[RANGE_RESP_POLL_IDX]
+               | ((uint32_t)rx_buffer[RANGE_RESP_POLL_IDX + 1] << 8)
+               | ((uint32_t)rx_buffer[RANGE_RESP_POLL_IDX + 2] << 16)
+               | ((uint32_t)rx_buffer[RANGE_RESP_POLL_IDX + 3] << 24);
+    resp_tx_ts = (uint32_t)rx_buffer[RANGE_RESP_TX_IDX]
+               | ((uint32_t)rx_buffer[RANGE_RESP_TX_IDX + 1] << 8)
+               | ((uint32_t)rx_buffer[RANGE_RESP_TX_IDX + 2] << 16)
+               | ((uint32_t)rx_buffer[RANGE_RESP_TX_IDX + 3] << 24);
+
+    rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
+    rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
+    /* CFO: rescale responder turnaround into initiator clock (arith >>). */
+    rtd_resp_corr = rtd_resp - (int32_t)(((int64_t)rtd_resp * cfo) >> 26);
+    diff = rtd_init - rtd_resp_corr;                  /* = 2*tof in DTU */
+    *dist_cm = (int32_t)(((int64_t)diff * 234518) / 1000000);
+    dwt_forcetrxoff();
+    return 0;
+}
+
+/* SS-TWR responder: called inline on FUNC_RANGE_POLL. Predicts the resp TX
+ * time via delayed TX and embeds poll_rx_ts + predicted resp_tx_ts. */
+static void anchor_ss_twr_respond(uint16_t my_rank)
+{
+    uint8_t resp[RANGE_RESP_LEN];
+    uint64_t poll_rx_ts = get_rx_timestamp_u64();
+    uint32_t resp_tx_time;
+    uint64_t resp_tx_ts;
+    uint32_t tx_dl;
+
+    resp_tx_time = (uint32_t)((poll_rx_ts + (uint64_t)RANGE_RESP_DLY_UUS * UUS_TO_DWT_TIME) >> 8);
+    dwt_setdelayedtrxtime(resp_tx_time);
+    resp_tx_ts = ((uint64_t)(resp_tx_time & 0xFFFFFFFEUL) << 8) + (uint64_t)TX_ANT_DLY;
+
+    hdr10(resp, (uint16_t)(rx_buffer[7] | (rx_buffer[8] << 8)), my_rank, FUNC_RANGE_RESP);
+    st32(&resp[RANGE_RESP_POLL_IDX], (uint32_t)poll_rx_ts);
+    st32(&resp[RANGE_RESP_TX_IDX], (uint32_t)resp_tx_ts);
+    resp[RANGE_RESP_LEN - 2] = 0xCC;
+    resp[RANGE_RESP_LEN - 1] = 0xDD;
+
+    port_DisableEXT_IRQ();
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    dwt_writetxdata(RANGE_RESP_LEN, resp, 0);
+    dwt_writetxfctrl(RANGE_RESP_LEN, 0, 0);
+    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+        dwt_starttx(DWT_START_TX_IMMEDIATE);
+    }
+    tx_dl = HAL_GetTick() + 10u;
+    while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {
+        if (HAL_GetTick() > tx_dl) break;
+    }
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+    port_rf_switch_rx();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    EXTI->PR1 = (1u << 12);
+    port_EnableEXT_IRQ();
+}
+
+/* Slave acting as initiator: report target + distance to master (0x0000). */
+static void range_send_report(uint16_t target_rank, int32_t dist_cm)
+{
+    uint8_t rpt[RANGE_RPT_LEN];
+    hdr10(rpt, 0, (uint16_t)ANCHOR_ID_VAL, FUNC_RANGE_RPT);
+    st16(&rpt[RANGE_RPT_TARGET_IDX], target_rank);
+    st32s(&rpt[RANGE_RPT_DIST_IDX], dist_cm);
+    rpt[RANGE_RPT_LEN - 2] = 0xCC;
+    rpt[RANGE_RPT_LEN - 1] = 0xDD;
+
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    range_tx_frame(rpt, RANGE_RPT_LEN);
+    port_rf_switch_rx();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Master: command slave `slave1_rank` to range `target_rank` and report back. */
+static void range_send_cmd(uint16_t slave1_rank, uint16_t target_rank)
+{
+    uint8_t cmd[RANGE_CMD_LEN];
+    hdr10(cmd, slave1_rank, 0, FUNC_RANGE_CMD);
+    st16(&cmd[RANGE_CMD_TARGET_IDX], target_rank);
+    cmd[RANGE_CMD_LEN - 2] = 0xCC;
+    cmd[RANGE_CMD_LEN - 1] = 0xDD;
+
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    range_tx_frame(cmd, RANGE_CMD_LEN);
+    port_rf_switch_rx();
+}
+
+/* Master: broadcast one anchor's auto-deploy result (rank,x,y,z). */
+static void autodeploy_send_result(uint8_t rank, int16_t x_cm, int16_t y_cm, int16_t z_cm)
+{
+    uint8_t res[AUTODEPLOY_RES_LEN];
+    hdr10(res, 0xFFFF, 0, FUNC_AUTODEPLOY_RES);
+    res[AUTODEPLOY_RES_RANK_IDX] = rank;
+    st16(&res[AUTODEPLOY_RES_X_IDX], (uint16_t)x_cm);
+    st16(&res[AUTODEPLOY_RES_Y_IDX], (uint16_t)y_cm);
+    st16(&res[AUTODEPLOY_RES_Z_IDX], (uint16_t)z_cm);
+    res[AUTODEPLOY_RES_LEN - 2] = 0xCC;
+    res[AUTODEPLOY_RES_LEN - 1] = 0xDD;
+
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    range_tx_frame(res, AUTODEPLOY_RES_LEN);
+    port_rf_switch_rx();
+}
+
+/* Slave initiator wrapper for FUNC_RANGE_CMD: range target, report back. */
+static void slave_range_initiator(uint16_t target_rank)
+{
+    int32_t dc = -1;
+    int ok;
+    port_DisableEXT_IRQ();
+    ok = anchor_ss_twr(target_rank, &dc);
+    if (ok != 0 || dc <= 0 || dc >= 100000) dc = -1;
+    range_send_report(target_rank, dc);
+    EXTI->PR1 = (1u << 12);
+    port_EnableEXT_IRQ();
+}
+
+/* Integer floor sqrt (Newton). n < 2^31; result fits uint16 cm range. */
+static uint32_t isqrt_u32(uint32_t n)
+{
+    uint32_t x = n, y;
+    if (n == 0) return 0;
+    y = (x + 1u) >> 1;
+    while (y < x) { x = y; y = (x + n / x) >> 1; }
+    return x;
+}
+
+/* Master auto-deploy session. mask bit i = anchor rank i participates.
+ * Blocks until done; leaves DW3000 back in RX. Rank 0 = master = origin. */
+static void run_autodeploy_session(uint16_t mask)
+{
+    static int32_t d[DL_MAX_ANCHORS][DL_MAX_ANCHORS];  /* d[i][j] cm, -1 = invalid (static: off-stack) */
+    static uint8_t rank[DL_MAX_ANCHORS];
+    uint8_t n = 0;
+    uint8_t slave1 = 0xFF;                       /* first participating slave rank */
+    int i, j, try;
+
+    for (i = 0; i < DL_MAX_ANCHORS; i++)
+        for (j = 0; j < DL_MAX_ANCHORS; j++)
+            d[i][j] = -1;
+
+    port_DisableEXT_IRQ();
+
+    /* Collect participating ranks from mask (bit i set). */
+    for (i = 0; i < DL_MAX_ANCHORS; i++) {
+        if (mask & (1u << i)) {
+            if (n < DL_MAX_ANCHORS) rank[n++] = (uint8_t)i;
+        }
+    }
+    for (i = 0; i < (int)n; i++) {
+        if (rank[i] != 0) { slave1 = rank[i]; break; }
+    }
+
+    /* ① Master ranges each participating slave (d(0,i)), with retry. */
+    for (i = 0; i < (int)n; i++) {
+        uint8_t t = rank[i];
+        if (t == 0) continue;
+        for (try = 0; try < 3; try++) {
+            int32_t dist;
+            if (anchor_ss_twr(t, &dist) == 0 && dist > 0 && dist < 100000) {
+                d[0][t] = dist; d[t][0] = dist;
+                break;
+            }
+        }
+    }
+
+    /* ② Command slave1 to range each remaining slave (d(1,j)), with retry. */
+    if (n >= 3 && slave1 != 0xFF && d[0][slave1] > 0) {
+        for (i = 0; i < (int)n; i++) {
+            uint8_t t = rank[i];
+            int flen;
+            if (t == 0 || t == slave1) continue;
+            for (try = 0; try < 2; try++) {
+                range_send_cmd(slave1, t);
+                flen = range_wait_rx(FUNC_RANGE_RPT, RANGE_RX_TIMEOUT_MS);
+                if (flen >= RANGE_RPT_LEN
+                    && (uint16_t)(rx_buffer[RANGE_RPT_TARGET_IDX] | (rx_buffer[RANGE_RPT_TARGET_IDX + 1] << 8)) == t) {
+                    int32_t dc = (int32_t)((uint32_t)rx_buffer[RANGE_RPT_DIST_IDX]
+                                 | ((uint32_t)rx_buffer[RANGE_RPT_DIST_IDX + 1] << 8)
+                                 | ((uint32_t)rx_buffer[RANGE_RPT_DIST_IDX + 2] << 16)
+                                 | ((uint32_t)rx_buffer[RANGE_RPT_DIST_IDX + 3] << 24));
+                    if (dc > 0 && dc < 100000) {
+                        d[slave1][t] = dc; d[t][slave1] = dc;
+                        break;
+                    }
+                }
+                dwt_forcetrxoff();
+            }
+        }
+    }
+
+    /* ③ Trilaterate 2D coords and write the beacon table.
+     *    rank 0 → (0,0); rank slave1 → (d01,0); others → two-circle on +Y. */
+    for (i = 0; i < (int)n; i++) {
+        uint8_t r = rank[i];
+        if (r == 0) { dl_set_anchor_coord(0, 0, 0, 0); continue; }
+        if (d[0][r] <= 0) continue;              /* unmeasured → keep old */
+        if (r == slave1) {
+            dl_set_anchor_coord(r, (int16_t)d[0][r], 0, 0);
+        } else if (slave1 != 0xFF && d[0][slave1] > 0 && d[slave1][r] > 0) {
+            int64_t c = d[0][slave1], a = d[0][r], b = d[slave1][r];
+            int32_t x = (int32_t)((c * c + a * a - b * b) / (2 * c));
+            int64_t y2 = a * a - (int64_t)x * x;
+            int32_t y = (int32_t)isqrt_u32((uint32_t)((y2 > 0) ? y2 : 0));
+            dl_set_anchor_coord(r, (int16_t)x, (int16_t)y, 0);
+        } else {
+            dl_set_anchor_coord(r, (int16_t)d[0][r], 0, 0);   /* fallback +X */
+        }
+    }
+    g_dl_num_anchors = n;
+
+    /* ④ Broadcast results, then the END marker. */
+    for (i = 0; i < (int)n; i++) {
+        uint8_t r = rank[i];
+        autodeploy_send_result(r, g_dl_beacon_table[r].x_cm,
+                                  g_dl_beacon_table[r].y_cm,
+                                  g_dl_beacon_table[r].z_cm);
+    }
+    autodeploy_send_result(AUTODEPLOY_RES_END, 0, 0, 0);
+
+    dwt_forcetrxoff();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    EXTI->PR1 = (1u << 12);
+    port_EnableEXT_IRQ();
+}
+#endif /* FUSION_DOWNLINK_MODE */
 
 #if DISCOVERY_ENABLED
 
@@ -1206,6 +1550,15 @@ static void main_anchor_loop(void)
                       EXTI->PR1 = (1u << 12);
                       port_EnableEXT_IRQ(); }
                 }
+                /* AUTODEPLOY (0xEC) — run anchor auto-deploy session (blocking).
+                 * Master only: gateway → master. mask bit i = rank i participates. */
+                else if (rx_buffer[9] == FUNC_AUTODEPLOY && frame_len >= GW_HDR_LEN + 2)
+                {
+                    uint16_t mask = (uint16_t)(rx_buffer[GW_HDR_LEN] | (rx_buffer[GW_HDR_LEN + 1] << 8));
+                    g_config_mode = 1;   /* stop TDOA: next beacon TDOA_ACTIVE=0 */
+                    run_autodeploy_session(mask);
+                    is_first_beacon = 1; /* next beacon re-syncs DLY_TS base */
+                }
 #ifndef GATEWAY_ROLE  /* Master/Slave only — Gateway forwards, doesn't receive */
                 /* OTA_PREPARE (0xE5) — stay on Ch9, stop ranging during OTA */
                 else if (rx_buffer[9] == FUNC_OTA_PREPARE)
@@ -1689,6 +2042,20 @@ slave_entry:
                       dwt_rxenable(DWT_START_RX_IMMEDIATE);
                       EXTI->PR1 = (1u << 12);
                       port_EnableEXT_IRQ(); }
+                }
+                /* RANGE_POLL (0xE0) — SS-TWR responder */
+                else if (rx_buffer[9] == FUNC_RANGE_POLL
+                         && (uint16_t)(rx_buffer[5] | (rx_buffer[6] << 8)) == my_rank)
+                {
+                    anchor_ss_twr_respond((uint16_t)my_rank);
+                }
+                /* RANGE_CMD (0xDC) — SS-TWR initiator, report back to master */
+                else if (rx_buffer[9] == FUNC_RANGE_CMD
+                         && frame_len >= GW_HDR_LEN + 2
+                         && (uint16_t)(rx_buffer[5] | (rx_buffer[6] << 8)) == my_rank)
+                {
+                    uint16_t target = (uint16_t)(rx_buffer[GW_HDR_LEN] | (rx_buffer[GW_HDR_LEN + 1] << 8));
+                    slave_range_initiator(target);
                 }
                 /* Re-enable RX after handling frame */
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
