@@ -33,8 +33,8 @@ extern "C" {
  * Timing constants
  *============================================================================*/
 #define DL_SLOT_DURATION_UUS     3000u   /* TDMA slot duration (microseconds)   */
-#define DL_CYCLE_PERIOD_MS       100u    /* Full cycle period (ms) — 10 Hz       */
-#define DL_CYCLE_PERIOD_UUS      100000u /* Full cycle in uus (beacon + 4 blinks) */
+#define DL_CYCLE_PERIOD_MS       50u     /* Full cycle period (ms) — 20 Hz       */
+#define DL_CYCLE_PERIOD_UUS      50000u  /* Full cycle in uus (beacon + 4 blinks) */
 #define DL_MASTER_LOST_THRESHOLD 10u     /* Consecutive missed beacons → re-disc */
 /*============================================================================
  * Frame lengths (payload only — FCS auto-appended by DW3000)
