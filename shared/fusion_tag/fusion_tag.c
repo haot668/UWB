@@ -139,12 +139,15 @@ static float kf_vel[2] = {0, 0};   /* filtered velocity  [cm/s]       */
 static float kf_Px[4];              /* covariance for x-axis */
 static float kf_Py[4];              /* covariance for y-axis */
 static int   kf_init_done = 0;
+static int   kf_reject_cnt = 0;     /* consecutive rejected measurements  */
 
 /* Tuning constants */
 #define KF_Q_POS     0.01f   /* position process noise spectral density (cm²/s)  */
 #define KF_Q_VEL    10.0f    /* velocity process noise spectral density (cm²/s³) */
 #define KF_R_BASE   100.0f   /* base measurement noise (cm²) when solver RMS=0   */
 #define KF_R_MULT    15.0f   /* scale measurement noise by RMS×MULT              */
+#define KF_GATE_CM       50000.0f  /* innovation outlier gate (500 m, in cm)   */
+#define KF_REINIT_THRESH 3         /* consecutive rejections before re-seeding */
 
 /* kalman_update_2d — run one predict+update cycle.
  *   x_m, y_m : raw measurement from solver (cm)
@@ -173,8 +176,42 @@ static int kalman_update_2d(float x_m, float y_m, float dt, float rms,
         kf_Py[0] = 100.0f; kf_Py[1] = 0.0f;
         kf_Py[2] = 0.0f;   kf_Py[3] = 100.0f;
         kf_init_done = 1;
+        kf_reject_cnt = 0;
         *x_f = x_m; *y_f = y_m;
         return 0;
+    }
+
+    /*=== Stale-state recovery ===
+     * If the filter is seeded with a bad first fix (e.g. a warm-up cycle before
+     * DLY_RS calibration), every subsequent *correct* measurement looks like a
+     * >500m outlier and is rejected forever, freezing the position at the bad
+     * value.  Count consecutive 2D rejections; after K in a row, trust the
+     * latest measurement and re-seed the filter. */
+    {
+        float px = kf_pos[0] + kf_vel[0] * dt;
+        float py = kf_pos[1] + kf_vel[1] * dt;
+        float ix = x_m - px;
+        float iy = y_m - py;
+        if (ix > KF_GATE_CM || ix < -KF_GATE_CM ||
+            iy > KF_GATE_CM || iy < -KF_GATE_CM)
+        {
+            if (++kf_reject_cnt >= KF_REINIT_THRESH)
+            {
+                kf_pos[0] = x_m;  kf_pos[1] = y_m;
+                kf_vel[0] = 0.0f; kf_vel[1] = 0.0f;
+                kf_Px[0] = 100.0f; kf_Px[1] = 0.0f;
+                kf_Px[2] = 0.0f;   kf_Px[3] = 100.0f;
+                kf_Py[0] = 100.0f; kf_Py[1] = 0.0f;
+                kf_Py[2] = 0.0f;   kf_Py[3] = 100.0f;
+                kf_reject_cnt = 0;
+                *x_f = x_m; *y_f = y_m;
+                return 0;
+            }
+        }
+        else
+        {
+            kf_reject_cnt = 0;
+        }
     }
 
     for (axis = 0; axis < 2; axis++)
@@ -201,7 +238,7 @@ static int kalman_update_2d(float x_m, float y_m, float dt, float rms,
 
         /*=== Outlier gate: reject if innovation > 500m ===*/
         float innov = z - pos_pred;
-        if (innov > 50000.0f || innov < -50000.0f)
+        if (innov > KF_GATE_CM || innov < -KF_GATE_CM)
         {
             /* Measurement rejected — output prediction only */
             kf_pos[axis] = pos_pred;
