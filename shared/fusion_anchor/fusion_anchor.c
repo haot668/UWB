@@ -557,6 +557,32 @@ static int auto_discovery(auto_disc_t *disc)
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
             for (gp = 0; gp < 20; gp++)
             {
+                /* Active grace: re-announce our Master win every ~500ms so a
+                 * simultaneous winner (split-brain) hears us and yields.  A
+                 * purely passive listen cannot break the tie — neither winner
+                 * is beaconing yet, so both silently pass and both become
+                 * Master, assigning duplicate ranks to the slaves that join
+                 * each.  UID-staggered TX slot avoids the two winners TXing
+                 * on the same poll and colliding again. */
+                if ((gp % 5) == (int)(disc->my_uid32 % 5u))
+                {
+                    dwt_forcetrxoff();
+                    port_rf_switch_tx();
+                    tx_beacon[2] = (uint8_t)gp;
+                    tx_beacon[AUTO_BCN_GROUP_IDX] = 0;
+                    tx_beacon[AUTO_BCN_COUNT_IDX] = 1;
+                    pack_uid(&tx_beacon[AUTO_UID_IDX], disc->my_uid32);
+                    dwt_writetxdata(BEACON_LEN, tx_beacon, 0);
+                    dwt_writetxfctrl(BEACON_LEN, 0, 0);
+                    if (dwt_starttx(DWT_START_TX_IMMEDIATE) == DWT_SUCCESS)
+                    {
+                        { uint32_t tx_dl = HAL_GetTick() + 10u; while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) { if (HAL_GetTick() > tx_dl) break; } }
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK);
+                    }
+                    port_rf_switch_rx();
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                }
+
                 Sleep(100);
                 status_reg = dwt_read32bitreg(SYS_STATUS_ID);
                 if (status_reg & SYS_STATUS_ALL_RX_ERR) {

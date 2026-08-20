@@ -23,3 +23,6 @@ JLinkLog.txt
 *.out
 *.iex
 *.htm
+
+# Keil build logs
+_build*.log
