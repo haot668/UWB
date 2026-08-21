@@ -910,10 +910,22 @@ int fusion_tag(void)
                                     | ((uint16_t)(rx_buffer[8]) << 8);
                     if (rank16 > 0 && rank16 < DL_MAX_ANCHORS && toa_dtu[rank16] == 0)
                     {
-                        toa_dtu[rank16]  = get_rx_timestamp_u64();
-                        tx_ts_dtu[rank16] = unpack_40bit_ts(&rx_buffer[DL_BLINK_TX_TS_IDX]);
-                        cfo_raw[rank16]   = dwt_readclockoffset();
-                        num_rx++;
+                        uint64_t _brx = get_rx_timestamp_u64();
+                        /* Reject cross-cycle blinks: a legit TDMA blink lands
+                         * within rank*3ms + processing (< ~15ms) of the beacon.
+                         * A blink > half the 50ms cycle (25ms) later belongs to
+                         * a later cycle — the 650ms unsynced window can catch it
+                         * when this rank's own blink was lost, and attributing it
+                         * here yields a ~50ms+ garbage TDOA that diverges the
+                         * solver ("ERR DIVERGE" -> frozen tag). */
+                        if ((int64_t)(_brx - toa_dtu[0]) <=
+                            (int64_t)(DL_CYCLE_PERIOD_UUS / 2u) * (int64_t)UUS_TO_DWT_TIME)
+                        {
+                            toa_dtu[rank16]  = _brx;
+                            tx_ts_dtu[rank16] = unpack_40bit_ts(&rx_buffer[DL_BLINK_TX_TS_IDX]);
+                            cfo_raw[rank16]   = dwt_readclockoffset();
+                            num_rx++;
+                        }
                         /* K,<rank>,CFO=<raw> */
                         /* { char _k[18]; int _kp = 0;
                           _k[_kp++]='K'; _k[_kp++]=',';
