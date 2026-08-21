@@ -123,3 +123,64 @@ uint64_t unpack_40bit_ts(const uint8_t *buf)
          | ((uint64_t)buf[3] << 24)
          | ((uint64_t)buf[4] << 32);
 }
+
+/*============================================================================
+ * DS-TWR compute (Decawave official formula)
+ *
+ *   Tr1 = T_resp_rx_tag    - T_poll_tx_tag    (tag clock)
+ *   Tre = T_resp_tx_anchor - T_poll_rx_anchor  (anchor clock)
+ *   Tr2 = T_final_rx_anchor - T_resp_tx_anchor (anchor clock)
+ *   Tfe = T_final_tx_tag   - T_resp_rx_tag    (tag clock)
+ *
+ *   TOF_dtu = (Tr1*Tr2 - Tre*Tfe) / (Tr1 + Tr2 + Tre + Tfe)
+ *
+ *   Tr1 and Tfe are in TAG's clock; Tr2 and Tre are in ANCHOR's clock.
+ *   The numerator/denominator product with both clocks cancels the
+ *   first-order clock-rate error.  Result is in DW3210 time units.
+ *
+ *   distance_mm = TOF_dtu × 4.690782 mm/DTU
+ *                 (1 DTU at 63.8976 GHz = c*1000/63.8976e9 mm)
+ *
+ *   Returns 0 on success, -1 if any of the round-trip / reply intervals is
+ *   zero or the denominator is zero (degenerate measurement).
+ *============================================================================*/
+int dstwr_compute(const dst_twr_timestamps_t *ts,
+                  int32_t *distance_mm, uint32_t *tof_dtu)
+{
+    /* Sanity: any zero timestamp means we didn't RX all required frames. */
+    if (ts->T_poll_rx == 0 || ts->T_resp_tx == 0 ||
+        ts->T_resp_rx == 0 || ts->T_poll_tx == 0 ||
+        ts->T_final_rx == 0 || ts->T_final_tx == 0)
+        return -1;
+
+    /* Cast each delta to int64_t (signed) — intervals are small (~ms), but
+     * wraparound at 17.2 s system rollover must not produce silent underflow. */
+    int64_t Tr1 = (int64_t)(ts->T_resp_rx - ts->T_poll_tx);   /* tag-clock */
+    int64_t Tre = (int64_t)(ts->T_resp_tx - ts->T_poll_rx);   /* anchor-clock */
+    int64_t Tr2 = (int64_t)(ts->T_final_rx - ts->T_resp_tx);  /* anchor-clock */
+    int64_t Tfe = (int64_t)(ts->T_final_tx - ts->T_resp_rx);  /* tag-clock */
+
+    /* Guard against wraparound (timestamps are 40-bit, 17.2s rollover):
+     * any negative delta > 8s indicates wraparound happened during this
+     * cycle — reject measurement rather than output garbage. */
+    if (Tr1 < 0) Tr1 += (int64_t)1 << 40;
+    if (Tre < 0) Tre += (int64_t)1 << 40;
+    if (Tr2 < 0) Tr2 += (int64_t)1 << 40;
+    if (Tfe < 0) Tfe += (int64_t)1 << 40;
+
+    int64_t num = Tr1 * Tr2 - Tre * Tfe;
+    int64_t den = Tr1 + Tr2 + Tre + Tfe;
+    if (den <= 0) return -1;
+
+    /* Round to nearest DTU (avoid systematic bias from integer truncation). */
+    int64_t tof = (num + (den >> 1)) / den;
+    if (tof < 0) tof = 0;        /* can't be negative — clamp */
+
+    /* Convert DTU → mm: 1 DTU = c × 1000 / 63.8976e9 mm ≈ 4.690782 mm. */
+    const uint32_t MM_PER_DTU_Q8 = 1201;   /* 4.690782 × 256 ≈ 1200.84 */
+    uint32_t d_mm = (uint32_t)((uint64_t)tof * MM_PER_DTU_Q8 >> 8);
+
+    *tof_dtu      = (uint32_t)tof;
+    *distance_mm  = (int32_t)d_mm;
+    return 0;
+}
