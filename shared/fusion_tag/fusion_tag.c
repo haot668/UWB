@@ -38,7 +38,7 @@ extern void test_run_info(unsigned char *data);
 extern UART_HandleTypeDef huart2;
 #endif
 
-#define APP_NAME "TAG V0.3"
+#define APP_NAME "TAG V0.4"
 
 /* Tag serial output mode:
  *   1 = Debug:   human-readable text  (P,X=...,Y=...,Z=...,Q=...)
@@ -1325,6 +1325,42 @@ int fusion_tag(void)
                     }
                     _td[_tp++] = '\r'; _td[_tp++] = '\n'; _td[_tp] = '\0';
                     test_run_info((unsigned char *)_td);
+                }
+#endif
+
+#if TAG_DIAG
+                /* Per-cycle RX mask + slot sync state.  Format:
+                 *   D,<seq>,RX:<b>,<r1>,<r2>,<r3>,SL:<L/S>,miss=<NN>
+                 * RX bits:  1 = blink/beacon received this cycle, 0 = missed.
+                 *           The first bit (b) is the master beacon; the rest
+                 *           are rank-1/2/3 slave blinks (always 4 positions
+                 *           even when num_anchors < 4 — trailing 0s flag the
+                 *           missing slot).
+                 * SL:L/S : slot locked (TDMA phase valid) / searching (free 650ms RX).
+                 * miss    : consecutive beacon misses since last lock (hex).
+                 * Single line per cycle, ~24 bytes → ~30 KB/min @ 20 Hz,
+                 * well under UART BW and easy to grep against the P line. */
+                {
+                    char _dd[48]; int _dp = 0, _xi;
+                    int beacon_ok = (bcn_tick != 0);
+                    _dd[_dp++] = 'D'; _dd[_dp++] = ',';
+                    _dd[_dp++] = hex[(frame_seq >> 4) & 0xF];
+                    _dd[_dp++] = hex[ frame_seq       & 0xF];
+                    _dd[_dp++] = ','; _dd[_dp++] = 'R'; _dd[_dp++] = 'X'; _dd[_dp++] = ':';
+                    _dd[_dp++] = beacon_ok ? '1' : '0';
+                    for (_xi = 1; _xi < 4; _xi++) {
+                        _dd[_dp++] = ',';
+                        _dd[_dp++] = (toa_dtu[_xi] != 0) ? '1' : '0';
+                    }
+                    _dd[_dp++] = ','; _dd[_dp++] = 'S'; _dd[_dp++] = 'L'; _dd[_dp++] = ':';
+                    _dd[_dp++] = g_slot_synced ? 'L' : 'S';
+                    _dd[_dp++] = ','; _dd[_dp++] = 'm'; _dd[_dp++] = 'i';
+                    _dd[_dp++] = 's'; _dd[_dp++] = 's'; _dd[_dp++] = '=';
+                    int _mc = g_bcn_miss_cnt & 0xFF;
+                    _dd[_dp++] = hex[(_mc >> 4) & 0xF];
+                    _dd[_dp++] = hex[ _mc       & 0xF];
+                    _dd[_dp++] = '\r'; _dd[_dp++] = '\n'; _dd[_dp] = '\0';
+                    test_run_info((unsigned char *)_dd);
                 }
 #endif
 
