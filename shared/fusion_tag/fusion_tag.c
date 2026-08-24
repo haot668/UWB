@@ -425,9 +425,17 @@ int fusion_tag(void)
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         uint32_t rx_start = HAL_GetTick();
-        uint32_t solve_ctr = 0;
+        uint32_t last_solve_ms = rx_start;
         while ((HAL_GetTick() - rx_start) < DL_RX_WINDOW_MS) {
             Sleep(1);
+            uint32_t now = HAL_GetTick();
+
+            /* 20 Hz solve: fixed 50 ms interval (checked every iteration) */
+            if ((int32_t)(now - last_solve_ms) >= 50) {
+                last_solve_ms += 50;
+                tag_solve_and_report();
+            }
+
             uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
             if (status & SYS_STATUS_ALL_RX_ERR) {
                 dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
@@ -451,12 +459,6 @@ int fusion_tag(void)
                 tag_rx_timesync(rx_buf, frame_len);
             }
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
-
-            solve_ctr++;
-            if (solve_ctr >= 20) {
-                solve_ctr = 0;
-                tag_solve_and_report();
-            }
         }
 
 #ifndef GATEWAY_ROLE
