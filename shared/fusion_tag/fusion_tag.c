@@ -114,7 +114,6 @@ static int solve_2d_gn(const dl_anchor_entry_t *anchors,
     int used[DL_MAX_TRACKED_ANCHORS];
     int n_used = 0;
     int i, j, iter;
-    float cx = 0, cy = 0;
     float dx[DL_MAX_TRACKED_ANCHORS], dy[DL_MAX_TRACKED_ANCHORS];
     float dist[DL_MAX_TRACKED_ANCHORS];
     float H[2][2], g[2], step[2];
@@ -128,13 +127,6 @@ static int solve_2d_gn(const dl_anchor_entry_t *anchors,
         used[n_used++] = i;
     }
     if (n_used < 2) return -2;
-
-    for (i = 0; i < num_anchors; i++) {
-        cx += anchors[i].x_cm;
-        cy += anchors[i].y_cm;
-    }
-    cx /= (float)num_anchors;
-    cy /= (float)num_anchors;
 
     for (iter = 0; iter < 8; iter++) {
         for (i = 0; i < n_used; i++) {
@@ -221,40 +213,38 @@ static void tag_solve_and_report(void)
         }
     }
 
-    /* Build per-anchor TDOA relative to ref using pairwise global-time diff */
+    /* Build packed TDOA array: anchors are packed 0..n_active-1 so
+     * solve_2d_gn receives contiguous data (skip=-1). */
     float tdoa_cm[DL_MAX_TRACKED_ANCHORS];
-    uint8_t valid[DL_MAX_TRACKED_ANCHORS];
+    uint8_t valid_arr[DL_MAX_TRACKED_ANCHORS];
     dl_anchor_entry_t anchors[DL_MAX_TRACKED_ANCHORS];
-    int max = DL_MAX_TRACKED_ANCHORS;
-    for (i = 0; i < max; i++) { tdoa_cm[i] = 0; valid[i] = 0; }
+    for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) { tdoa_cm[i] = 0; valid_arr[i] = 0; }
 
-    anchors[0] = s_trackers[ref].pos;
-    valid[0] = 1;
+    int n_valid = 0;
     for (i = 0; i < n_active; i++) {
         int idx = active_idx[i];
-        if (idx == ref) continue;
-        /* Pairwise TDOA: convert both RX moments to ref's global time
-         * and subtract — yields (D_other - D_ref)/c * DTU_PER_CM */
+        /* Pairwise TDOA relative to ref */
         int64_t tdoa_dtu = clock_sync_tdoa_dtu(
             &s_trackers[ref].sync,
             &s_trackers[idx].sync,
             s_trackers[ref].last_rx_ts_local,
             s_trackers[idx].last_rx_ts_local);
-        tdoa_cm[idx] = (float)tdoa_dtu * TDOA_CM_PER_DTU;
-        valid[idx] = 1;
-        anchors[idx] = s_trackers[idx].pos;
+        tdoa_cm[n_valid] = (float)tdoa_dtu * TDOA_CM_PER_DTU;
+        anchors[n_valid] = s_trackers[idx].pos;
+        valid_arr[n_valid] = 1;
+        n_valid++;
     }
+    if (n_valid < 3) return;
 
     /* Initial guess: centroid of all anchors */
     float cx = 0, cy = 0;
-    int n_a = n_active;
-    for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) if (valid[i]) {
+    for (i = 0; i < n_valid; i++) {
         cx += anchors[i].x_cm; cy += anchors[i].y_cm;
     }
-    cx /= (float)n_a; cy /= (float)n_a;
+    cx /= (float)n_valid; cy /= (float)n_valid;
 
     float x_cm = 0, y_cm = 0, rms = 0;
-    int ret = solve_2d_gn(anchors, tdoa_cm, valid, n_active, -1,
+    int ret = solve_2d_gn(anchors, tdoa_cm, valid_arr, n_valid, -1,
                           cx, cy, &x_cm, &y_cm, &rms);
     if (ret != 0) return;
 
