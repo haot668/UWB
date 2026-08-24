@@ -287,10 +287,31 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                        ? 100
                        : HAL_GetTick() - g_anchor.last_heard_ms[slot];
 
-    clock_sync_update(&g_anchor.neighbors[slot], cfo_raw,
+    bool ok = clock_sync_update(&g_anchor.neighbors[slot], cfo_raw,
                       rx_local, tx_remote, dt_ms);
     g_anchor.last_heard_ms[slot] = HAL_GetTick();
     g_anchor.rx_count++;
+
+    /* Diagnostics: print sync state after each update
+     * Format: ARX[R=rank] CFO=±xxxxx F=xxxxxxx O=xxxxxxxx Q=xx N=xx U=xx
+     *   F = factor * 1e6 (e.g. 1000189 = 1.000189)
+     *   O = offset_dtu (int64 hex)
+     *   Q = quality * 100 (e.g. 85 = 0.85)
+     *   U = outlier count */
+    {
+        char dbg[80];
+        int pos = 0;
+        const AnchorClockSync *s = &g_anchor.neighbors[slot];
+        pos += sprintf(dbg + pos, "ARX[R=%u]", src_rank);
+        pos += sprintf(dbg + pos, " CFO=%+dd", cfo_raw);
+        pos += sprintf(dbg + pos, " F=%07lu", (unsigned long)(s->factor * 1e6));
+        pos += sprintf(dbg + pos, " O=%08lX", (unsigned long)s->offset_dtu);
+        pos += sprintf(dbg + pos, " Q=%02u", (unsigned int)(s->quality * 100));
+        pos += sprintf(dbg + pos, " N=%02u", s->outlier_count);
+        pos += sprintf(dbg + pos, " U=%02u", s->update_count);
+        pos += sprintf(dbg + pos, " %s\r\n", ok ? "OK" : "OUTL");
+        DBG_PRINT(dbg);
+    }
 }
 
 /*============================================================================
@@ -419,6 +440,30 @@ static void anchor_loop(void)
             /* OTA timed out — resume ranging */
         }
 #endif
+
+        /* Periodic sync-state summary every ~5 s (50 × 100 ms cycles) */
+        static uint32_t s_summary_ctr;
+        if (++s_summary_ctr >= 50) {
+            s_summary_ctr = 0;
+            char summary[128];
+            int pos = 0;
+            pos += sprintf(summary + pos, "ASUM[R=%u] ", g_anchor.rank);
+            int ni = 0;
+            for (int i = 0; i < ANCHOR_MAX_NEIGHBORS; i++) {
+                if (!g_anchor.neighbors[i].initialized) continue;
+                const AnchorClockSync *s = &g_anchor.neighbors[i];
+                uint32_t age_ms = (g_anchor.last_heard_ms[i] == 0) ? 0
+                            : (HAL_GetTick() - g_anchor.last_heard_ms[i]);
+                pos += sprintf(summary + pos, "N%d:F=%07lu:Q=%02u:A=%04u ",
+                    ni,
+                    (unsigned long)(s->factor * 1e6),
+                    (unsigned int)(s->quality * 100),
+                    age_ms);
+                ni++;
+            }
+            pos += sprintf(summary + pos, "\r\n");
+            DBG_PRINT(summary);
+        }
     }
 }
 
