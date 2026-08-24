@@ -14,12 +14,6 @@ uint64_t get_sys_timestamp_u64(void);
 void     pack_40bit_ts(uint8_t *buf, uint64_t ts);
 uint64_t unpack_40bit_ts(const uint8_t *buf);
 
-/* DS-TWR compute (Decawave official formula) — see ds_twr_protocol.h
- *   Returns 0 on success, -1 if division-by-zero (all-zero timestamps). */
-#include "ds_twr_protocol.h"
-int dstwr_compute(const dst_twr_timestamps_t *ts,
-                  int32_t *distance_mm, uint32_t *tof_dtu);
-
 #ifdef __cplusplus
 }
 #endif

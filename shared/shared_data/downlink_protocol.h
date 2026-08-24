@@ -90,6 +90,7 @@ extern "C" {
  *   [20-21] pad (DW3210 RX corruption)
  *============================================================================*/
 #define DL_POS_REPORT_LEN          22u
+#define DL_MAX_ANCHORS             16u    /* Backward-compat for tdoa_solver.c */
 
 /*============================================================================
  * Per-anchor position entry (7 bytes, int16 cm — full field range)
@@ -99,6 +100,9 @@ extern "C" {
  *   [5-6]   z_cm       (int16 LE, cm)
  *============================================================================*/
 #define DL_ANCHOR_ENTRY_SIZE  7u
+
+/* TDOA conversion: 1 DW3000 device time unit ≈ 15.65 ps ≈ 0.4691 cm */
+#define TDOA_CM_PER_DTU         0.4691f
 
 typedef struct {
     uint8_t  id;
