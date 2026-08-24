@@ -26,3 +26,7 @@ JLinkLog.txt
 
 # Keil build logs
 _build*.log
+
+# Keil debug configuration
+DebugConfig/
+*.dbgconf
