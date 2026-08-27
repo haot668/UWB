@@ -30,3 +30,6 @@ _build*.log
 # Keil debug configuration
 DebugConfig/
 *.dbgconf
+
+# Claude Code settings & skills
+.claude/
