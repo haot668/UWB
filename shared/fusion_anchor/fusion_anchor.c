@@ -468,6 +468,13 @@ static void anchor_loop(void)
     }
 }
 
+/* Stub: AT+RATE command from gateway — not implemented in Phase 1.1
+ * (fixed 100 ms period via DL_TIMESYNC_PERIOD_MS). */
+void dl_set_beacon_interval(uint16_t ms)
+{
+    (void)ms;
+}
+
 /*============================================================================
  * Anchor init — one-time setup before anchor_loop()
  *============================================================================*/
