@@ -290,7 +290,8 @@ static void tag_solve_and_report(void)
         tx[14] = zi & 0xFF; tx[15] = (zi >> 8) & 0xFF;
         tx[16] = qi & 0xFF; tx[17] = (qi >> 8) & 0xFF;
         tx[18] = FW_VERSION_U16 & 0xFF; tx[19] = (FW_VERSION_U16 >> 8) & 0xFF;
-        for (int k = 20; k < 47; k++) tx[k] = 0;
+        int k;
+        for (k = 20; k < 47; k++) tx[k] = 0;
         tx[47] = 0;
         HAL_UART_Transmit(&huart2, tx, 47, 10);
     }
@@ -473,7 +474,8 @@ int fusion_tag(void)
             s_summary_ctr = 0;
             char out[128]; int pos = 0;
             pos += sprintf(out + pos, "TSUM");
-            for (int i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
+            int i;
+            for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
                 if (!s_trackers[i].is_active) continue;
                 const AnchorClockSync *s = &s_trackers[i].sync;
                 uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0

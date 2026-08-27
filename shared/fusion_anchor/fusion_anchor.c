@@ -449,7 +449,8 @@ static void anchor_loop(void)
             int pos = 0;
             pos += sprintf(summary + pos, "ASUM[R=%u] ", g_anchor.rank);
             int ni = 0;
-            for (int i = 0; i < ANCHOR_MAX_NEIGHBORS; i++) {
+            int i;
+            for (i = 0; i < ANCHOR_MAX_NEIGHBORS; i++) {
                 if (!g_anchor.neighbors[i].initialized) continue;
                 const AnchorClockSync *s = &g_anchor.neighbors[i];
                 uint32_t age_ms = (g_anchor.last_heard_ms[i] == 0) ? 0
