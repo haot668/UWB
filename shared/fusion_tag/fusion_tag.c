@@ -29,10 +29,12 @@
 #include "firmware_version.h"
 #include "../gw_ota/gw_ota.h"
 #include "clock_sync.h"
+#include "deca_device_api.h"
 
 #if defined(TEST_FUSION_TAG)
 
 extern void test_run_info(unsigned char *data);
+extern dwt_txconfig_t txconfig_options;
 #if !TAG_DEBUG_OUTPUT
 extern UART_HandleTypeDef huart2;
 #endif
