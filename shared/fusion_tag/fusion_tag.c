@@ -395,7 +395,6 @@ int fusion_tag(void)
     test_run_info((unsigned char *)"IDLE OK\r\n");
 
     /* Hardware init (deca + port + LED) */
-    port_init_dw_chip();
     test_run_info((unsigned char *)"INIT OK\r\n");
     reset_DWIC();
     Sleep(2);
