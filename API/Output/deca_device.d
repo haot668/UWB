@@ -1,0 +1,10 @@
+.\output\deca_device.o: Src\decadriver\deca_device.c
+.\output\deca_device.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\assert.h
+.\output\deca_device.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\stdlib.h
+.\output\deca_device.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\output\deca_device.o: Src\decadriver\deca_types.h
+.\output\deca_device.o: D:\Tools\keil5\ARM\ARMCC\Bin\..\include\stddef.h
+.\output\deca_device.o: Src\decadriver\deca_regs.h
+.\output\deca_device.o: Src\decadriver\deca_vals.h
+.\output\deca_device.o: Src\decadriver\deca_device_api.h
+.\output\deca_device.o: Src\decadriver\deca_version.h

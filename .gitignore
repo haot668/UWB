@@ -1,0 +1,35 @@
+# Keil MDK build output
+Output/
+Listings/
+
+# IDE temp files
+*.uvguix.*
+*.Administrator
+JLinkLog.txt
+*.ini
+
+# Keil project backups
+*.bak
+
+# Object & listing files
+*.o
+*.d
+*.crf
+*.lst
+*.dep
+*.hex
+*.bin
+*.axf
+*.out
+*.iex
+*.htm
+
+# Keil build logs
+_build*.log
+
+# Keil debug configuration
+DebugConfig/
+*.dbgconf
+
+# Claude Code settings & skills
+.claude/

@@ -1,0 +1,22 @@
+; *************************************************************
+; *** Scatter-Loading Description File for STM32L412KBU6    ***
+; *** Flash: 128KB @ 0x08000000                             ***
+; *** SRAM1:  32KB @ 0x20000000                             ***
+; *** SRAM2:   8KB @ 0x10000000                             ***
+; *************************************************************
+
+LR_IROM1 0x08000000 0x00020000  {    ; 128KB Flash
+  ER_IROM1 0x08000000 0x00020000  {  ; all code
+    *.o (RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+    .ANY (+XO)
+  }
+  RW_IRAM1 0x20000000 0x00008000  {  ; 32KB SRAM1
+    *.o (.ramfunc)  ; RAM functions (OTA copy, etc.)
+    .ANY (+RW +ZI)
+  }
+  RW_IRAM2 0x10000000 0x00002000  {  ; 8KB SRAM2
+    .ANY (+RW +ZI)
+  }
+}

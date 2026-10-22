@@ -1,0 +1,15 @@
+; Bootloader-only scatter file (standalone test)
+LR_IROM1 0x08000000 0x00002000  {        ; 8 KB for bootloader
+  ER_IROM1 0x08000000 0x00002000  {
+    *.o (RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+    .ANY (+XO)
+  }
+  RW_IRAM1 0x20000000 0x00008000  {
+    .ANY (+RW +ZI)
+  }
+  RW_IRAM2 0x10000000 0x00002000  {
+    .ANY (+RW +ZI)
+  }
+}
