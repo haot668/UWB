@@ -24,6 +24,7 @@ static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_NVIC_Init(void);
+static void MX_RTC_Init(void);
 
 extern example_ptr example_pointer;
 extern int unit_test_main(void);
@@ -73,6 +74,24 @@ int main(void)
     MX_USART2_UART_Init();
     MX_SPI1_Init();
     MX_NVIC_Init();
+    MX_RTC_Init();
+
+    /* RTC 时钟精度测试：打印初始化后的时间 */
+    {
+        char dbg[64];
+        /* 直接读 RTC 寄存器，避免 HAL 重复定义问题 */
+        uint32_t tr = RTC->TR;  /* Time register */
+        uint32_t dr = RTC->DR;  /* Date register */
+        uint8_t hour   = (uint8_t)((tr & (RTC_TR_HT | RTC_TR_HU)) >> RTC_TR_HU_Pos);
+        uint8_t minute = (uint8_t)((tr & (RTC_TR_MNT | RTC_TR_MNU)) >> RTC_TR_MNU_Pos);
+        uint8_t second = (uint8_t)((tr & (RTC_TR_ST | RTC_TR_SU)) >> RTC_TR_SU_Pos);
+        uint8_t year   = (uint8_t)((dr & (RTC_DR_YT | RTC_DR_YU)) >> RTC_DR_YU_Pos);
+        uint8_t month  = (uint8_t)((dr & (RTC_DR_MT | RTC_DR_MU)) >> RTC_DR_MU_Pos);
+        uint8_t day    = (uint8_t)((dr & (RTC_DR_DT | RTC_DR_DU)) >> RTC_DR_DU_Pos);
+        sprintf(dbg, "RTC_INIT %02x:%02x:%02x 20%02x/%02x/%02x\r\n",
+                hour, minute, second, year, month, day);
+        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, strlen(dbg), 100);
+    }
 
     port_DisableEXT_IRQ();
     setup_DWICRSTnIRQ(0);
@@ -106,7 +125,17 @@ void SystemClock_Config(void)
 
     HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
 
+    /*--- Enable LSE (32.768 kHz) for RTC and low-power timers ---*/
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE;
+    RCC_OscInitStruct.LSEState = RCC_LSE_ON;  /* 32.768kHz 晶振（PC14-PC15） */
+    ret = HAL_RCC_OscConfig(&RCC_OscInitStruct);
+    if (ret != HAL_OK) {
+        /* LSE 启动失败，继续用内部 LSI（RTC 走时精度会下降）*/
+        /* 警告：板子上 LSE 晶振可能虚焊或损坏 */
+    }
+
     /*--- Try HSE first (8MHz external TCXO) ---*/
+    /* 注意：HSE 配置会覆盖 OscillatorType，但 LSE 已经 ON，不会被关闭 */
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
     RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
     RCC_OscInitStruct.MSIState = RCC_MSI_OFF;
@@ -149,6 +178,15 @@ void SystemClock_Config(void)
         _Error_Handler(__FILE__, __LINE__);
     }
 
+    /*--- Configure RTC clock source to LSE ---*/
+    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC;
+    PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSE;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+    {
+        _Error_Handler(__FILE__, __LINE__);
+    }
+
     HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq() / 1000);
     HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
     HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
@@ -166,6 +204,42 @@ static void MX_NVIC_Init(void)
     HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
 }
 
+static void MX_RTC_Init(void)
+{
+    /* 直接操作 RTC 寄存器，绕过 HAL 的重复定义问题 */
+    /* LSE 32.768kHz 已由 SystemClock_Config 配置为 RTC 时钟源 */
+    /* STM32L412 RTC: ICSR(0x0C) 有 INIT/INITF/RSF, CR(0x18) 有 INIT 控制 */
+    volatile uint32_t count = 0;
+
+    /* 解锁写保护 */
+    RTC->WPR = 0xCA;
+    RTC->WPR = 0x53;
+
+    /* 进入初始化模式 */
+    RTC->ICSR |= RTC_ICSR_INIT;  /* SET INIT = 1 */
+    /* 等待 INITF=1 */
+    while (!(RTC->ICSR & RTC_ICSR_INITF) && ++count < 100000) { }
+    if (count >= 100000) { return; }  /* 超时保护 */
+
+    /* 设置预分频: 32768/128/256 = 1Hz */
+    /* PRER[31:16] = PREDIV_A-1 = 127, PRER[14:0] = PREDIV_S-1 = 255 */
+    RTC->PRER = (127UL << 16) | 255UL;
+
+    /* 24 小时制，无夏令时 */
+    RTC->CR &= ~RTC_CR_FMT;  /* FMT=0: 24h */
+
+    /* 退出初始化模式，允许计数 */
+    RTC->ICSR &= ~RTC_ICSR_INIT;  /* CLEAR INIT = 0 */
+
+    /* 等待日历同步完成 (RSF=1)，LSE 稳定需要 ~2个 RTCCLK */
+    count = 0;
+    while (!(RTC->ICSR & RTC_ICSR_RSF) && ++count < 1000000) { }
+    /* RSF 会在退出 INIT 后由硬件置 1，表示日历已同步 */
+
+    /* 锁定写保护 */
+    RTC->WPR = 0xFF;
+}
+
 static void MX_SPI1_Init(void)
 {
     hspi1.Instance = SPI1;
@@ -175,7 +249,7 @@ static void MX_SPI1_Init(void)
     hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
     hspi1.Init.NSS = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;  /* 80MHz/4 = 20MHz (DW3210 max) */
     hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
