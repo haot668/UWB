@@ -25,6 +25,12 @@
 #include <shared_functions.h>
 #include <example_selection.h>
 #include "downlink_protocol.h"
+/* tdoa_solve provided by shared/downlink/tdoa_solver.c (compiled separately) */
+int tdoa_solve(const dl_anchor_entry_t *anchors,
+               const uint64_t *toa_dtu,
+               uint8_t num_anchors,
+               float *x_cm_out, float *y_cm_out, float *z_cm_out,
+               float *rms_out);
 #include "gateway_protocol.h"
 #include "firmware_version.h"
 #include "../gw_ota/gw_ota.h"
@@ -70,19 +76,30 @@ static const uint8_t match_timesync[] = {0x41, 0x88, 0,
  *============================================================================*/
 typedef struct {
     uint16_t           rank;             /* 1..N-1 (rank 0 reserved for master) */
-    uint8_t            cs_level;         /* 0 = root, 1+ = child */
-    uint64_t           parent_eui64;
     dl_anchor_entry_t  pos;              /* Latest position from TimeSync */
     AnchorClockSync    sync;             /* Kalman clock filter */
-    uint64_t           last_rx_ts_local; /* tag's local RX timestamp */
-    uint64_t           last_tx_ts_remote;/* anchor's TX timestamp from TimeSync */
     uint32_t           last_seen_ms;
     uint8_t            is_active;
     int16_t            cfo_raw_last;
     float              quality;
+    uint32_t           rx_cycle;         /* local fallback cycle counter (80 ms) */
+    uint16_t           cycle_id;         /* TDMA cycle id carried in the beacon (P0-4) */
+    uint8_t            slot;             /* TDMA slot index (255=unknown) */
+    uint64_t           last_rx_ts;       /* Raw RX local timestamp for TDOA */
 } TagAnchorTracker;
 
 static TagAnchorTracker s_trackers[DL_MAX_TRACKED_ANCHORS];
+
+/* P0-4 diagnostics: how many beacons were paired and how many had to be
+ * dropped because they belonged to a different TDMA cycle. */
+static uint32_t s_n_pair = 0;             /* beacons used in a TDOA pair      */
+static uint32_t s_n_cycle_mismatch = 0;   /* beacons dropped: wrong cycle id  */
+
+/* The Root (cs_level = 0) defines the grid; our rate relative to the Root's
+ * clock scales the slot spacing in the slot compensation. */
+static uint16_t s_root_rank      = 0;
+static double   s_root_rate      = 1.0;    /* (our clock)/(Root's clock)       */
+static uint8_t  s_root_rate_valid = 0;
 
 /*============================================================================
  * Output and protocol helpers
@@ -104,150 +121,255 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
 }
 
 /*============================================================================
- * Solver (kept from original — Gauss-Newton 2D)
- *============================================================================*/
-static int solve_2d_gn(const dl_anchor_entry_t *anchors,
-                       const float *tdoa_cm,
-                       const uint8_t *valid,
-                       uint8_t num_anchors, int skip,
-                       float x0, float y0,
-                       float *x_out, float *y_out, float *rms_out)
-{
-    int used[DL_MAX_TRACKED_ANCHORS];
-    int n_used = 0;
-    int i, j, iter;
-    float dx[DL_MAX_TRACKED_ANCHORS], dy[DL_MAX_TRACKED_ANCHORS];
-    float dist[DL_MAX_TRACKED_ANCHORS];
-    float H[2][2], g[2], step[2];
-    float b[DL_MAX_TRACKED_ANCHORS];
-    float last_resid = 1e30f, det;
-    float new_x = x0, new_y = y0;
-
-    for (i = 0; i < num_anchors; i++) {
-        if (!valid[i]) continue;
-        if (skip >= 0 && i == skip) continue;
-        used[n_used++] = i;
-    }
-    if (n_used < 2) return -2;
-
-    for (iter = 0; iter < 8; iter++) {
-        for (i = 0; i < n_used; i++) {
-            int a = used[i];
-            dx[a] = new_x - anchors[a].x_cm;
-            dy[a] = new_y - anchors[a].y_cm;
-            float d = sqrtf(dx[a]*dx[a] + dy[a]*dy[a]);
-            if (d < 1.0f) d = 1.0f;
-            dist[a] = d;
-        }
-        H[0][0] = H[0][1] = H[1][0] = H[1][1] = 0;
-        g[0] = g[1] = 0;
-        float resid = 0;
-        int idx = 0;
-        for (i = 0; i < n_used; i++) {
-            int a = used[i];
-            for (j = i + 1; j < n_used; j++) {
-                int b_idx = used[j];
-                float h_a_x = dx[a] / dist[a];
-                float h_a_y = dy[a] / dist[a];
-                float h_b_x = dx[b_idx] / dist[b_idx];
-                float h_b_y = dy[b_idx] / dist[b_idx];
-                H[0][0] += h_a_x*h_a_x + h_b_x*h_b_x;
-                H[0][1] += h_a_x*h_a_y + h_b_x*h_b_y;
-                H[1][1] += h_a_y*h_a_y + h_b_y*h_b_y;
-                float t_pred = dist[a] - dist[b_idx];
-                float t_obs  = tdoa_cm[a] - tdoa_cm[b_idx];
-                float r = t_obs - t_pred;
-                b[idx++] = r;
-                resid += r * r;
-                g[0] += r * (h_a_x - h_b_x);
-                g[1] += r * (h_a_y - h_b_y);
-            }
-        }
-        H[1][0] = H[0][1];
-
-        det = H[0][0] * H[1][1] - H[0][1] * H[1][0];
-        if (fabsf(det) < 1e-6f) {
-            H[0][0] += 1.0f; H[1][1] += 1.0f;
-            det = H[0][0] * H[1][1] - H[0][1] * H[1][0];
-        }
-        step[0] = (H[1][1] * g[0] - H[0][1] * g[1]) / det;
-        step[1] = (H[0][0] * g[1] - H[0][1] * g[0]) / det;
-
-        float step_len = sqrtf(step[0]*step[0] + step[1]*step[1]);
-        if (step_len < 0.05f) break;
-        if (resid > last_resid) {
-            step[0] *= 0.5f; step[1] *= 0.5f;
-        }
-        last_resid = resid;
-        new_x += step[0];
-        new_y += step[1];
-    }
-
-    *x_out = new_x;
-    *y_out = new_y;
-    *rms_out = sqrtf(last_resid / (float)(n_used * (n_used - 1) / 2));
-    return 0;
-}
-
-/*============================================================================
  * Pairwise TDOA computation and solve trigger
  *============================================================================*/
 static void tag_solve_and_report(void)
 {
-    /* Find active trackers (rank 0 reserved as reference) */
+    int i;
+    uint32_t now_ms = HAL_GetTick();
+
+    /* Find fresh active trackers (within FRESH_MS_MAX ms) */
     int n_active = 0;
     int active_idx[DL_MAX_TRACKED_ANCHORS];
-    int i, j;
     for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
-        if (s_trackers[i].is_active) {
-            active_idx[n_active++] = i;
-        }
+        if (!s_trackers[i].is_active) continue;
+        uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
+                          : (now_ms - s_trackers[i].last_seen_ms);
+        if (age_ms > 500) continue;  /* measurement too stale */
+        active_idx[n_active++] = i;
     }
     if (n_active < 3) return;
 
-    /* Choose ref = oldest / highest-quality */
+    /* Choose ref = highest quality + newest
+     * Score = quality * 1000 - age_ms (higher is better) */
     int ref = active_idx[0];
-    float best_q = s_trackers[ref].quality;
+    uint32_t ref_age = now_ms - s_trackers[ref].last_seen_ms;
+    float ref_score = s_trackers[ref].quality * 1000.0f - (float)ref_age;
     for (i = 1; i < n_active; i++) {
-        if (s_trackers[active_idx[i]].quality > best_q) {
-            best_q = s_trackers[active_idx[i]].quality;
-            ref = active_idx[i];
+        int idx = active_idx[i];
+        uint32_t age = now_ms - s_trackers[idx].last_seen_ms;
+        float score = s_trackers[idx].quality * 1000.0f - (float)age;
+        if (score > ref_score) {
+            ref_score = score;
+            ref = idx;
         }
     }
 
-    /* Build packed TDOA array: anchors are packed 0..n_active-1 so
-     * solve_2d_gn receives contiguous data (skip=-1). */
-    float tdoa_cm[DL_MAX_TRACKED_ANCHORS];
-    uint8_t valid_arr[DL_MAX_TRACKED_ANCHORS];
-    dl_anchor_entry_t anchors[DL_MAX_TRACKED_ANCHORS];
-    for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) { tdoa_cm[i] = 0; valid_arr[i] = 0; }
+    /* Build packed arrays for tdoa_solve:
+     * Slot-based TDOA: toa_equiv = rx - slot × 5ms
+     * This normalizes all beacons to slot=0 (Root's TX time).
+     * No anchor clock sync needed: Tag's local clock is the common reference.
+     *
+     * DTU bookkeeping (P0-4): one DW3000 device time unit is 15.65 ps, so
+     * 1 µs = 63,898 DTU and one 5 ms TDMA slot = 5000 × 63898 = 319,490,000
+     * DTU.  The old constant (192,000) belonged to a 38.4 DTU/µs clock and was
+     * 1664× too small: the slot compensation could never cancel the 0..75 ms
+     * spread between the slots, every TDOA was rejected and the solver
+     * collapsed onto the centroid of the anchors. */
+    #define DTU_PER_SLOT  ((int64_t)DL_SLOT_DTU_US * (int64_t)UUS_TO_DWT_TIME)
 
-    int n_valid = 0;
+    /* Acceptance window for a TDOA difference.  Light covers 1 m in 3.3356 ns
+     * = 213,140 DTU, so ±100 m of path difference covers any indoor
+     * deployment.  The dominant error source (a beacon from a different TDMA
+     * cycle, 80 ms = 5.1 M DTU) is removed by the cycle-id pairing below,
+     * not by this window. */
+    #define TDOA_DTU_PER_METER  213140LL
+    #define TDOA_MAX_DTU        (100LL * TDOA_DTU_PER_METER)   /* 21,314,000 */
+
+    /* ── Slot spacing is defined in the ROOT's clock, not in ours ──────────
+     * The anchors place their beacons on the Root's grid: anchor k transmits
+     * at  G + slot_k × 5 ms  where G and the 5 ms are the ROOT's clock.
+     * Our own crystal differs from the Root's by up to ±20 ppm, so 5 ms is
+     * 5 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
+     * clock).  Subtracting the nominal 5 ms instead would leave a per-anchor
+     * error of slot × 5 ms × 20 ppm = up to 700 ns ≈ 21 cm at slot 7 — far
+     * above the 0.67 ns the 20 cm target needs.  f is measured from the
+     * Root's own beacon (its in-frame TX timestamp vs. our RX timestamp),
+     * which is exactly the clock_sync factor of the Root's tracker. */
+    double slot_rate = 1.0;
+    if (s_root_rate_valid) slot_rate = s_root_rate;
+    if (!(slot_rate > 0.5 && slot_rate < 2.0)) slot_rate = 1.0;
+    const int64_t slot_dtu_eff = (int64_t)((double)DTU_PER_SLOT * slot_rate);
+
+    uint64_t toa_dtu[DL_MAX_TRACKED_ANCHORS];
+    dl_anchor_entry_t anchors[DL_MAX_TRACKED_ANCHORS];
+    int valid_idx[DL_MAX_TRACKED_ANCHORS];  /* tracker index for each valid anchor */
+
+    /* Select anchors with known slot (skip slot=255) */
+    int sel_idx[DL_MAX_TRACKED_ANCHORS];
+    int n_sel = 0;
     for (i = 0; i < n_active; i++) {
         int idx = active_idx[i];
-        /* Pairwise TDOA relative to ref */
-        int64_t tdoa_dtu = clock_sync_tdoa_dtu(
-            &s_trackers[ref].sync,
-            &s_trackers[idx].sync,
-            s_trackers[ref].last_rx_ts_local,
-            s_trackers[idx].last_rx_ts_local);
-        tdoa_cm[n_valid] = (float)tdoa_dtu * TDOA_CM_PER_DTU;
-        anchors[n_valid] = s_trackers[idx].pos;
-        valid_arr[n_valid] = 1;
-        n_valid++;
+        if (s_trackers[idx].slot != 255) {
+            sel_idx[n_sel++] = idx;
+        }
     }
+
+    /* ── P0-4: only beacons of the SAME TDMA cycle may be paired ─────────
+     * The slot-compensated TDOA
+     *     toa = rx_local - slot × 5 ms
+     * cancels the cycle origin only when every beacon belongs to the same
+     * cycle — one cycle of skew is 80 ms = 5.1 M DTU and would poison every
+     * pair it enters.  Find the cycle most of the visible anchors are
+     * currently in and drop the rest. */
+    uint16_t best_cycle_sel = 0, best_cycle_all = 0;
+    int best_cnt_sel = 0, best_cnt_all = 0, i2, j2, k2;
+    for (i2 = 0; i2 < n_sel; i2++) {
+        uint16_t c = s_trackers[sel_idx[i2]].cycle_id;
+        int cnt = 0;
+        for (j2 = 0; j2 < n_sel; j2++)
+            if (s_trackers[sel_idx[j2]].cycle_id == c) cnt++;
+        if (cnt > best_cnt_sel) { best_cnt_sel = cnt; best_cycle_sel = c; }
+    }
+    for (i2 = 0; i2 < n_active; i2++) {
+        uint16_t c = s_trackers[active_idx[i2]].cycle_id;
+        int cnt = 0;
+        for (j2 = 0; j2 < n_active; j2++)
+            if (s_trackers[active_idx[j2]].cycle_id == c) cnt++;
+        if (cnt > best_cnt_all) { best_cnt_all = cnt; best_cycle_all = c; }
+    }
+
+    /* Filter the slot-known set down to the dominant cycle */
+    k2 = 0;
+    for (i2 = 0; i2 < n_sel; i2++) {
+        int idx = sel_idx[i2];
+        if (s_trackers[idx].cycle_id == best_cycle_sel) {
+            sel_idx[k2++] = idx;
+        } else {
+            s_n_cycle_mismatch++;
+            { char dbg[64];
+              sprintf(dbg, "TDOA_CYCLE_MISMATCH R=%u cyc=%u!=cyc=%u\r\n",
+                  s_trackers[idx].rank, s_trackers[idx].cycle_id, best_cycle_sel);
+              test_run_info((unsigned char *)dbg); }
+        }
+    }
+    n_sel = k2;
+
+    int ref_idx;
+    int n_valid;
+    bool use_slot_compensation = (n_sel >= 3);
+
+    if (use_slot_compensation) {
+        /* ── Slot-compensated TDOA ────────────────────────────────────────
+         * toa_equiv = rx - slot × 5ms (normalizes all to slot=0)
+         * Works when anchors are in Root's TDMA table. */
+
+        /* Select ref = lowest slot number (Root = slot 0) */
+        ref_idx = sel_idx[0];
+        for (i = 1; i < n_sel; i++) {
+            if (s_trackers[sel_idx[i]].slot < s_trackers[ref_idx].slot) {
+                ref_idx = sel_idx[i];
+            }
+        }
+
+        uint8_t ref_slot = s_trackers[ref_idx].slot;
+        toa_dtu[0] = (uint64_t)((int64_t)s_trackers[ref_idx].last_rx_ts
+                                - (int64_t)ref_slot * slot_dtu_eff);
+        anchors[0] = s_trackers[ref_idx].pos;
+        valid_idx[0] = ref_idx;
+
+        n_valid = 1;
+        for (i = 0; i < n_sel; i++) {
+            int idx = sel_idx[i];
+            if (idx == ref_idx) continue;
+
+            uint8_t k_slot = s_trackers[idx].slot;
+            uint64_t rx_k = s_trackers[idx].last_rx_ts;
+            int64_t toa_equiv = (int64_t)rx_k - (int64_t)k_slot * slot_dtu_eff;
+            int64_t tdoa_dtu = toa_equiv - (int64_t)toa_dtu[0];
+
+            if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
+            s_n_pair++;
+
+            toa_dtu[n_valid] = (uint64_t)toa_equiv;
+            anchors[n_valid] = s_trackers[idx].pos;
+            valid_idx[n_valid] = idx;
+            n_valid++;
+        }
+    } else {
+        /* ── Fallback: raw RX TDOA (no slot compensation) ─────────────────
+         * The anchors have no known slot (slot = 255 — the Root never
+         * confirmed them, or they are in ALOHA fallback mode), so the slot
+         * offset cannot be subtracted.  The raw difference is only valid
+         * within ONE cycle, so the same-cycle filter is applied here too. */
+        if (best_cnt_all < 3) {
+            /* Fewer than three anchors in one cycle — a solve would be
+             * geometrically degenerate, so report and wait for the next
+             * cycle instead of mixing cycles. */
+            { char dbg[48];
+              sprintf(dbg, "TDOA_CYCLE_WAIT n=%d\r\n", best_cnt_all);
+              test_run_info((unsigned char *)dbg); }
+            return;
+        }
+
+        ref_idx = -1;
+        for (i = 0; i < n_active; i++) {
+            int idx = active_idx[i];
+            if (s_trackers[idx].cycle_id == best_cycle_all
+                && s_trackers[idx].slot == 255) {
+                ref_idx = idx;
+                break;
+            }
+        }
+        if (ref_idx < 0) {
+            /* No off-grid anchor in the dominant cycle — the raw fallback
+             * would mix a slot-compensated anchor into the difference. */
+            { char dbg[48];
+              sprintf(dbg, "TDOA_CYCLE_WAIT n=%d\r\n", best_cnt_all);
+              test_run_info((unsigned char *)dbg); }
+            return;
+        }
+        toa_dtu[0] = s_trackers[ref_idx].last_rx_ts;
+        anchors[0] = s_trackers[ref_idx].pos;
+        valid_idx[0] = ref_idx;
+
+        n_valid = 1;
+        for (i = 0; i < n_active; i++) {
+            int idx = active_idx[i];
+            if (idx == ref_idx) continue;
+            if (s_trackers[idx].cycle_id != best_cycle_all) {
+                s_n_cycle_mismatch++;
+                continue;
+            }
+
+            int64_t tdoa_dtu = (int64_t)(s_trackers[idx].last_rx_ts - toa_dtu[0]);
+            if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
+            s_n_pair++;
+
+            toa_dtu[n_valid] = s_trackers[idx].last_rx_ts;
+            anchors[n_valid] = s_trackers[idx].pos;
+            valid_idx[n_valid] = idx;
+            n_valid++;
+        }
+    }
+
     if (n_valid < 3) return;
 
-    /* Initial guess: centroid of all anchors */
-    float cx = 0, cy = 0;
-    for (i = 0; i < n_valid; i++) {
-        cx += anchors[i].x_cm; cy += anchors[i].y_cm;
-    }
-    cx /= (float)n_valid; cy /= (float)n_valid;
+    /* Debug: print raw TDOA values */
+    { char dbg[128]; int pos = 0;
+      pos += sprintf(dbg + pos, "TDOA_DBG REF=R%d TOA=%llu",
+          s_trackers[ref_idx].rank, (unsigned long long)toa_dtu[0]);
+      for (i = 1; i < n_valid; i++) {
+          int idx = valid_idx[i];
+          pos += sprintf(dbg + pos, " R%d=%lld",
+              anchors[i].id,
+              (long long)((int64_t)toa_dtu[i] - (int64_t)toa_dtu[0]));
+      }
+      pos += sprintf(dbg + pos, "\r\n");
+      test_run_info((unsigned char *)dbg); }
 
-    float x_cm = 0, y_cm = 0, rms = 0;
-    int ret = solve_2d_gn(anchors, tdoa_cm, valid_arr, n_valid, -1,
-                          cx, cy, &x_cm, &y_cm, &rms);
+    /* P0-4 summary: how many pairs were formed and how many beacons had to
+     * be dropped because they belonged to a different TDMA cycle.  A rising
+     * mismatch counter means the anchors are not on one common grid. */
+    { char dbg[96]; int pos = 0;
+      pos += sprintf(dbg + pos, "TSUM n=%d pair=%u mism=%u cyc=%u\r\n",
+          n_valid, (unsigned)s_n_pair, (unsigned)s_n_cycle_mismatch,
+          (unsigned)s_trackers[ref_idx].cycle_id);
+      test_run_info((unsigned char *)dbg); }
+
+    float x_cm = 0, y_cm = 0, z_cm = 0, rms = 0;
+    int ret = tdoa_solve(anchors, toa_dtu, (uint8_t)n_valid,
+                         &x_cm, &y_cm, &z_cm, &rms);
     if (ret != 0) return;
 
 #if TAG_DEBUG_OUTPUT
@@ -267,7 +389,7 @@ static void tag_solve_and_report(void)
         p = sprintf(tmp, "%.2f", y_cm / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = ','; out[pos++] = 'Z'; out[pos++] = '=';
-        p = sprintf(tmp, "%.2f", 0.0f);
+        p = sprintf(tmp, "%.2f", z_cm / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = ','; out[pos++] = 'Q'; out[pos++] = '=';
         p = sprintf(tmp, "%.2f", rms / 100.0f);
@@ -319,6 +441,10 @@ static int alloc_tracker_slot(uint16_t rank)
     for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
         if (!s_trackers[i].is_active && s_trackers[i].rank == 0) {
             s_trackers[i].rank = rank;
+            s_trackers[i].slot = 255;      /* unknown until beacon received */
+            s_trackers[i].last_rx_ts = 0;
+            s_trackers[i].rx_cycle = 0;
+            s_trackers[i].cycle_id = 0;    /* P0-4: TDMA cycle id (0 = unknown) */
             clock_sync_init(&s_trackers[i].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
             return i;
         }
@@ -333,56 +459,153 @@ static int alloc_tracker_slot(uint16_t rank)
         }
     }
     s_trackers[worst].rank = rank;
+    s_trackers[worst].slot = 255;
+    s_trackers[worst].last_rx_ts = 0;
+    s_trackers[worst].rx_cycle = 0;
+    s_trackers[worst].cycle_id = 0;      /* P0-4 */
     clock_sync_init(&s_trackers[worst].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
     return worst;
 }
 
-static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
+static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_ts)
 {
     if (frame_len < DL_TIMESYNC_LEN) return;
 
     uint16_t src_rank = (uint16_t)rx_buf[7] | ((uint16_t)rx_buf[8] << 8);
-    if (src_rank == 0 || src_rank > DL_MAX_TRACKED_ANCHORS) return;
+    if (src_rank == 0) return;
 
     uint64_t tx_remote = unpack_40bit_ts(&rx_buf[DL_TS_TX_TS_IDX]);
-    uint64_t rx_local  = get_rx_timestamp_u64();
-    /* reject obviously bogus timestamps */
-    int64_t diff = (int64_t)(rx_local - tx_remote);
-    if (diff < 0 || diff > (int64_t)(200 * 1000 * UUS_TO_DWT_TIME)) return;
+    uint64_t rx_local  = rx_hw_ts;
 
-    int slot = find_tracker_slot(src_rank);
-    if (slot < 0) slot = alloc_tracker_slot(src_rank);
+    /* P0-2 (tag side): only a beacon whose TX instant is known exactly may
+     * enter the TDOA solve.  An imprecise frame (bootstrap / ALOHA) was
+     * transmitted at an unknown instant — off the grid by up to 30 µs — so
+     * its slot compensation is meaningless. */
+    uint8_t ts_flags   = (frame_len >= DL_TS_FLAGS_IDX + 1)
+                       ? rx_buf[DL_TS_FLAGS_IDX] : 0;
+    uint8_t ts_precise = (ts_flags & DL_TS_FLAG_TX_TS_PRECISE) ? 1 : 0;
+    if (!ts_precise) {
+        static uint32_t s_n_imprecise;
+        if ((s_n_imprecise++ % 20) == 0) {
+            char dbg[48];
+            sprintf(dbg, "TS_IMPRECISE R=%u dropped\r\n", src_rank);
+            test_run_info((unsigned char *)dbg);
+        }
+        return;
+    }
+
+    /* Diagnostic: print RX timestamp diff between consecutive frames.
+     * If all anchors report identical rx_local, RX timestamp latch is broken. */
+    {
+        static uint64_t s_last_rx;
+        char dbg[96];
+        sprintf(dbg, "RX_TS R=%u tx=%llu rx=%llu diff=%lld\r\n",
+            src_rank,
+            (unsigned long long)tx_remote,
+            (unsigned long long)rx_local,
+            (long long)(rx_local - s_last_rx));
+        test_run_info((unsigned char *)dbg);
+        s_last_rx = rx_local;
+    }
+
+    int tracker_slot = find_tracker_slot(src_rank);
+    if (tracker_slot < 0) tracker_slot = alloc_tracker_slot(src_rank);
+
+    /* Track which TDMA cycle this RX belongs to.  The authoritative value is
+     * the cycle id carried in the beacon (P0-4) — every anchor of the same
+     * grid cycle stamps the same id, so the Tag can pair beacons that truly
+     * belong to the same cycle.  The millisecond counter is only a fallback
+     * for beacons that do not carry an id. */
+    s_trackers[tracker_slot].rx_cycle = HAL_GetTick() / DL_TIMESYNC_PERIOD_MS;
+    /* Record raw RX timestamp for TDOA */
+    s_trackers[tracker_slot].last_rx_ts = rx_local;
+    /* Parse TDMA slot index from beacon */
+    s_trackers[tracker_slot].slot = rx_buf[DL_TS_SLOT_IDX];
+    /* P0-4: TDMA cycle id of this beacon */
+    s_trackers[tracker_slot].cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
+                                | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
 
     int16_t cfo_raw = dwt_readclockoffset();
-    uint32_t dt_ms = s_trackers[slot].last_seen_ms == 0
-                       ? 100
-                       : HAL_GetTick() - s_trackers[slot].last_seen_ms;
 
-    bool ok = clock_sync_update(&s_trackers[slot].sync, cfo_raw, rx_local, tx_remote, dt_ms);
-    s_trackers[slot].last_rx_ts_local  = rx_local;
-    s_trackers[slot].last_tx_ts_remote = tx_remote;
-    s_trackers[slot].cs_level          = rx_buf[DL_TS_CS_LEVEL_IDX];
-    s_trackers[slot].parent_eui64     = 0;  /* TODO unpack */
-    s_trackers[slot].cfo_raw_last      = cfo_raw;
-    s_trackers[slot].quality           = s_trackers[slot].sync.quality;
-    s_trackers[slot].last_seen_ms      = HAL_GetTick();
-    s_trackers[slot].is_active         = 1;
-
-    /* Diagnostics: print sync state after each update
-     * Format: TRX[R=rank] CFO=±xxxxx F=xxxxxxx O=xxxxxxxx Q=xx N=xx U=xx
-     *   F = factor * 1e6, O = offset_dtu (hex), Q = quality*100, U = update_count */
+    /* Diagnostic: show the raw CFO value and the rate it implies.
+     * The DW3000 register is s[-15:-26] fixed point → the divisor is 2^26
+     * (67,108,864), NOT 2^16.  With the old 65536 divisor the printed
+     * "factor" was off by a factor of 1024 and hid the real behaviour. */
     {
-        char out[80]; int pos = 0;
-        const AnchorClockSync *s = &s_trackers[slot].sync;
-        pos += sprintf(out + pos, "TRX[R=%u]", src_rank);
-        pos += sprintf(out + pos, " CFO=%+dd", cfo_raw);
-        pos += sprintf(out + pos, " F=%07lu", (unsigned long)(s->factor * 1e6));
-        pos += sprintf(out + pos, " O=%08lX", (unsigned long)s->offset_dtu);
-        pos += sprintf(out + pos, " Q=%02u", (unsigned int)(s->quality * 100));
-        pos += sprintf(out + pos, " N=%02u", s->outlier_count);
-        pos += sprintf(out + pos, " U=%02u", s->update_count);
-        pos += sprintf(out + pos, " %s\r\n", ok ? "OK" : "OUTL");
-        test_run_info((unsigned char *)out);
+        static int16_t s_last_cfo;
+        char dbg2[64];
+        sprintf(dbg2, "CFO cfo_raw=%d factor_meas=%.9f\r\n",
+            cfo_raw, 1.0 + (double)cfo_raw / 67108864.0);
+        if (cfo_raw != s_last_cfo || s_last_cfo == 0) {
+            test_run_info((unsigned char *)dbg2);
+            s_last_cfo = cfo_raw;
+        }
+    }
+
+    /* Force-accept first 5 updates so Kalman filter can converge */
+    bool force_accept = (s_trackers[tracker_slot].sync.update_count < 5);
+
+    bool ok = clock_sync_update(&s_trackers[tracker_slot].sync, cfo_raw,
+                                rx_local, tx_remote, HAL_GetTick());
+    if (!ok && !force_accept) return;
+
+    /* Debug: print raw RX data + Kalman state for first 10 frames per tracker */
+    {
+        static uint8_t s_print_count[DL_MAX_TRACKED_ANCHORS];
+        if (s_print_count[tracker_slot] < 10) {
+            s_print_count[tracker_slot]++;
+            AnchorClockSync *s = &s_trackers[tracker_slot].sync;
+            char dbg[96];
+            int len = sprintf(dbg, "RX_RAW R=%u tx=%llu rx=%llu f=%.9f fppm=%.1f ofs=%.0f q=%.0f\r\n",
+                src_rank,
+                (unsigned long long)tx_remote,
+                (unsigned long long)rx_local,
+                s->factor,
+                (double)(s->factor - 1.0) * 1e6,
+                s->offset_dtu,
+                s->quality);
+            test_run_info((unsigned char *)dbg);
+        }
+    }
+
+    /* Update tracker position from Timesync frame (coordinates appended after standard TS payload) */
+    int16_t x = 0, y = 0, z = 0;
+    if (frame_len >= DL_TS_COORD_IDX + 6) {
+        x = (int16_t)((uint16_t)rx_buf[DL_TS_COORD_IDX + 0] | ((uint16_t)rx_buf[DL_TS_COORD_IDX + 1] << 8));
+        y = (int16_t)((uint16_t)rx_buf[DL_TS_COORD_IDX + 2] | ((uint16_t)rx_buf[DL_TS_COORD_IDX + 3] << 8));
+        z = (int16_t)((uint16_t)rx_buf[DL_TS_COORD_IDX + 4] | ((uint16_t)rx_buf[DL_TS_COORD_IDX + 5] << 8));
+        s_trackers[tracker_slot].pos.id = src_rank;
+        s_trackers[tracker_slot].pos.x_cm = x;
+        s_trackers[tracker_slot].pos.y_cm = y;
+        s_trackers[tracker_slot].pos.z_cm = z;
+
+        /* Debug: dump anchor coordinates, rate-limited to 1 per 5 s per anchor */
+        {
+            static uint32_t s_last_coord_print[DL_MAX_TRACKED_ANCHORS];
+            uint32_t now = HAL_GetTick();
+            if ((now - s_last_coord_print[tracker_slot]) > 5000) {
+                s_last_coord_print[tracker_slot] = now;
+                char dbg[64]; sprintf(dbg, "ANCHOR_COORD R=%u X=%d Y=%d Z=%d\r\n", src_rank, x, y, z);
+                test_run_info((unsigned char *)dbg);
+            }
+        }
+    }
+
+    /* Update tracker metadata */
+    s_trackers[tracker_slot].cfo_raw_last      = cfo_raw;
+    s_trackers[tracker_slot].quality           = s_trackers[tracker_slot].sync.quality;
+    s_trackers[tracker_slot].last_seen_ms      = HAL_GetTick();
+    s_trackers[tracker_slot].is_active         = 1;
+
+    /* The Root (cs_level = 0) owns the grid the other anchors are placed on,
+     * so its clock is the reference for the slot spacing.  Our clock_sync
+     * factor towards the Root is the rate ratio (our clock)/(Root's clock)
+     * that the slot compensation needs (see the TDOA block). */
+    if (frame_len >= DL_TS_LEVEL_IDX + 1 && rx_buf[DL_TS_LEVEL_IDX] == 0) {
+        s_root_rank = src_rank;
+        s_root_rate = s_trackers[tracker_slot].sync.factor;
+        s_root_rate_valid = (s_trackers[tracker_slot].sync.update_count >= 8)
+                            ? 1 : 0;
     }
 }
 
@@ -398,6 +621,7 @@ int fusion_tag(void)
     test_run_info((unsigned char *)"INIT OK\r\n");
     reset_DWIC();
     Sleep(2);
+    port_rf_switch_init();  /* Initialize PA6/PA7 for RF switch */
     if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
         test_run_info((unsigned char *)"INIT FAIL\r\n");
         return -1;
@@ -453,12 +677,15 @@ int fusion_tag(void)
             }
             uint8_t rx_buf[128];
             dwt_readrxdata(rx_buf, frame_len, 0);
+            /* Read RX HW timestamp BEFORE re-enabling RX, while RX_TIME
+             * latch still holds the timestamp for the received frame. */
+            uint64_t rx_hw_ts = get_rx_timestamp_u64();
             if (!match_header(rx_buf, match_timesync, 10, 1, 0, 1)) {
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
                 continue;
             }
             if (rx_buf[9] == FUNC_DOWNLINK_BEACON) {
-                tag_rx_timesync(rx_buf, frame_len);
+                tag_rx_timesync(rx_buf, frame_len, rx_hw_ts);
             }
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
@@ -481,9 +708,9 @@ int fusion_tag(void)
                 const AnchorClockSync *s = &s_trackers[i].sync;
                 uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
                             : (HAL_GetTick() - s_trackers[i].last_seen_ms);
-                pos += sprintf(out + pos, " R%d:F=%07lu:Q=%02u:A=%04u",
+                pos += sprintf(out + pos, " R%d:F=%+07ld:Q=%02u:A=%04u",
                     s_trackers[i].rank,
-                    (unsigned long)(s->factor * 1e6),
+                    (long)((s->factor - 1.0) * 1e6),
                     (unsigned int)(s->quality * 100),
                     age_ms);
             }
