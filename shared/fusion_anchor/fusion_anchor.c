@@ -161,7 +161,7 @@ static AnchorState g_anchor;
 static struct {
     uint64_t root_tx_ts;       /* Root's TX timestamp, EXTENDED to 64 bit      */
     uint64_t root_tx_raw;      /* last raw 40-bit value (wrap detection)      */
-    uint64_t root_ts_last_raw; /* previous raw 40-bit value                    */
+    uint64_t root_local_ts;    /* our SYS_TIME when that Root frame arrived    */
     uint64_t base_origin;      /* cycle origin in OUR clock (Root ts mapped)   */
     uint64_t base_local_time;  /* our SYS_TIME when that beacon was received   */
     uint32_t root_rx_ms;       /* SysTick when we received that beacon         */
@@ -273,6 +273,25 @@ static void tx_delay_note(uint64_t delta_dtu)
     for (i = 0; i < s_tx_delay_n; i++) sum += s_tx_delay_buf[i];
     s_tx_delay_dtu = (uint32_t)(sum / s_tx_delay_n);
     if (s_tx_delay_n >= TX_DELAY_MIN) s_tx_delay_valid = 1;
+}
+
+/*============================================================================
+ * P1-9: the ONE place where the anchor leaves the grid.
+ *
+ * Losing the slot silently is the worst failure mode of the TDMA: the
+ * anchor simply stops transmitting on the grid and the Tag sees a missing
+ * anchor with no explanation.  Every reset of my_slot_idx therefore goes
+ * through this function, which logs the reason.
+ *==========================================================================*/
+static void anchor_clear_slot(const char *reason)
+{
+    if (g_anchor.my_slot_idx != 255) {
+        char dbg[72];
+        sprintf(dbg, "SLOT_CLEAR %s (was %u)\r\n",
+                reason, (unsigned)g_anchor.my_slot_idx);
+        DBG_PRINT(dbg);
+    }
+    g_anchor.my_slot_idx = 255;
 }
 
 /*============================================================================
@@ -762,7 +781,7 @@ static bool tdma_may_tx(uint64_t *target_out, uint16_t *cycle_out)
              * slot instant any more: it leaves the grid instead of
              * transmitting at a guessed instant (a mis-timed beacon
              * poisons the TDOA of every other anchor in that cycle). */
-            g_anchor.my_slot_idx = 255;
+            anchor_clear_slot("ROOT_SCHEDULE_STALE");
             return false;
         }
         /* The Root owns slot 0 and is the clock source of the whole
@@ -1252,7 +1271,7 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
         s_aloha_mode = 0;
         s_aloha_sent_ms = 0;
         g_anchor.run_state = STATE_SCAN;
-        g_anchor.my_slot_idx = 255;
+        anchor_clear_slot("NET_FORCE_RESET");
         int ni;
         for (ni = 0; ni < ANCHOR_MAX_NEIGHBORS; ni++) {
             g_anchor.neighbors[ni].initialized = false;
@@ -1290,6 +1309,8 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
     s_last_tx_target = 0;
     g_tdma_ref.have_root_ref = false;
     g_tdma_ref.root_cycle_id = 0;
+    g_tdma_ref.root_tx_ts = 0;
+    g_tdma_ref.root_local_ts = 0;
 
     if (g_anchor.rank == designated_root) {
         /* I am the Root — start immediately */
@@ -1321,7 +1342,7 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
                         : (uint32_t)(g_anchor.rank + 65536u - designated_root);
         s_net_slot_idx = (uint8_t)((diff % (NET_MAX_SLOTS - 1u)) + 1u);  /* slot 1..15 */
         if (s_net_slot_idx >= NET_MAX_SLOTS) s_net_slot_idx = NET_MAX_SLOTS - 1;
-        g_anchor.my_slot_idx = 255;   /* not admitted yet (P1-2) */
+        anchor_clear_slot("NOT_ADMITTED_YET");   /* P1-2 */
         s_net_state = NET_STARTING;
         s_net_start_ms = HAL_GetTick();
         s_aloha_sent_ms = 0;
@@ -1484,7 +1505,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                 /* Timeout: Root never heard our ALOHA. Fall back to ALOHA mode.
                  * Mark slot invalid so tdma_may_tx() uses its stale-slot ALOHA path. */
                 s_net_state = NET_RUNNING;
-                g_anchor.my_slot_idx = 255;
+                anchor_clear_slot("CONFIRM_TIMEOUT");
                 s_aloha_sent_ms = 0;
                 s_aloha_mode = 1;  /* enter ALOHA fallback — TX allowed even if slot=255 */
                 { char dbg[48]; sprintf(dbg, "NET_CONFIRM_TIMEOUT→ALOHA\r\n"); DBG_PRINT(dbg); }
@@ -1587,16 +1608,42 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     if (sender_level == 0 && ts_precise) {
         uint64_t now_local = now_sys_ext();
 
-        /* Extend the Root's 40-bit timestamp to 64 bit (wraps every ~17 s) */
-        uint64_t root_ext = (g_tdma_ref.root_tx_ts & ~0xFFFFFFFFFFULL)
-                          | (tx_remote & 0xFFFFFFFFFFULL);
-        if (g_tdma_ref.root_ts_last_raw != 0
-            && (tx_remote & 0xFFFFFFFFFFULL) < g_tdma_ref.root_ts_last_raw
-            && (g_tdma_ref.root_ts_last_raw - (tx_remote & 0xFFFFFFFFFFULL)) > (1ULL << 39)) {
-            root_ext += (1ULL << 40);
+        /* Extend the Root's 40-bit timestamp to 64 bit (it wraps every
+         * ~17.2 s).
+         *
+         * P1-5: the extension used to be derived from the PREVIOUS Root
+         * frame (self-referential), so an outage longer than one wrap left
+         * the high part wrong by a multiple of 2^40 and it could never
+         * recover.  The wrap count is now taken from OUR clock: the two
+         * crystals run at the same rate (the clock-sync factor is within
+         * a few ppm), so the number of wraps the Root's counter went
+         * through during an outage is known from the elapsed local time.
+         * The absolute offset between the two clocks is unknown — and
+         * irrelevant: only the RELATIVE progression is used. */
+        uint64_t raw = tx_remote & 0xFFFFFFFFFFULL;
+        uint64_t root_ext;
+        if (!g_tdma_ref.have_root_ref) {
+            /* First Root frame: the Root's counter starts at 0 when it is
+             * powered on, so its epoch is simply the raw value. */
+            root_ext = raw;
+        } else {
+            /* Estimate the Root's counter from OUR clock: both crystals
+             * run at the same rate (within a few ppm), so the Root's
+             * counter advanced by ~elapsed since the previous frame.  The
+             * unknown constant offset between the two clocks cancels out,
+             * only the progression is used. */
+            uint64_t elapsed = now_local - g_tdma_ref.root_local_ts;
+            uint64_t expect = g_tdma_ref.root_tx_ts + elapsed;
+            root_ext = (expect & ~0xFFFFFFFFFFULL) | raw;
+            /* Pick the wrap that puts the value closest to the estimate. */
+            if (root_ext + (1ULL << 39) < expect) {
+                root_ext += (1ULL << 40);
+            } else if (root_ext > expect + (1ULL << 39)) {
+                root_ext -= (1ULL << 40);
+            }
         }
-        g_tdma_ref.root_ts_last_raw = tx_remote & 0xFFFFFFFFFFULL;
         g_tdma_ref.root_tx_ts = root_ext;
+        g_tdma_ref.root_local_ts = now_local;
         g_tdma_ref.root_rx_ms = HAL_GetTick();
         g_tdma_ref.root_slot = 0;
         g_tdma_ref.have_root_ref = true;
@@ -2076,7 +2123,7 @@ static void anchor_loop(void)
                     g_anchor.scan_start_ms = now_ms;
                     g_anchor.parent_rank = 0;
                     g_anchor.cs_level = 1;
-                    g_anchor.my_slot_idx = 255;
+                    anchor_clear_slot("ORPHAN");
                     s_net_state = NET_IDLE;  /* wait for new NETWORK_START */
                     DBG_PRINT("ORPHAN→SCAN\r\n");
                 }
@@ -2411,6 +2458,7 @@ static int anchor_init(void)
     g_tdma_ref.have_root_ref = false;
     g_tdma_ref.root_slot = 0;
     g_tdma_ref.root_tx_ts = 0;
+    g_tdma_ref.root_local_ts = 0;
     g_tdma_ref.root_rx_ms = 0;
 
     /* Manual network state: start in NET_IDLE (silent, waiting for Gateway command) */
