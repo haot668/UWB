@@ -229,7 +229,7 @@ extern "C" {
 #define DL_TS_FLAG_TX_TS_PRECISE  0x01u  /* tx_timestamp40 is exact (delayed TX)    */
 
 /*============================================================================
- * TWR correction frame (Root → Child unicast, 17 bytes)
+ * TWR correction frame (Root → broadcast, variable length)
  *   The Root solved the Root↔Child propagation delay from the round trip
  *   and tells the child how far its own beacon was off the grid.  The child
  *   shifts its next slot instant accordingly, which removes the systematic
@@ -244,21 +244,41 @@ extern "C" {
  *   CHILD's clock (p_root / f_root), which is the unit the child needs to
  *   shift its own grid origin.
  *
- *   [0-9]   header (10 B, dst = child rank)
- *   [10-11] target_rank     (uint16 LE, the child this correction is for)
- *   [12-15] corr_dtu        (uint32 LE, Root→Child path delay in DTU)
- *   [16]    quality         (0..255, 255 = good)
+ *   P1-3: the corrections of ALL children travel in ONE frame, one batch
+ *   per TDMA cycle.  The previous scheme (one unicast per cycle, round
+ *   robin over the children) delayed a child's correction by up to N
+ *   cycles — 1.3 s for 16 anchors — which made a "2 cycle" freshness
+ *   limit impossible and let the path delay go badly stale.  With the
+ *   batch every child learns its own delay every cycle.
+ *
+ *   [0-9]   header (10 B, dst = 0xFFFF broadcast)
+ *   [10]    entry count N (1..DL_TWR_CORR_MAX_ENTRIES)
+ *   [11]    quality: age of the OLDEST entry, in TDMA cycles
+ *   [12..]  N entries of DL_TWR_CORR_ENTRY_LEN bytes:
+ *             target_rank  (uint16 LE, the child this correction is for)
+ *             corr_dtu     (uint16 LE, Root→Child path delay in DTU)
+ *
+ *   corr_dtu fits in 16 bit: the plausible range is 40..22,000 DTU.
  *============================================================================*/
-#define FUNC_TWR_CORR           0xE7u   /* Root → Child unicast: path correction  */
-#define DL_TWR_CORR_LEN          17u
-#define DL_TWR_CORR_RANK_IDX    10u
-#define DL_TWR_CORR_PROP_IDX    12u    /* uint32 LE, delay in DTU (child clock)   */
-#define DL_TWR_CORR_QUAL_IDX    16u
+#define FUNC_TWR_CORR           0xE7u   /* Root → broadcast: path corrections     */
+#define DL_TWR_CORR_HDR_LEN     12u    /* header + count + quality               */
+#define DL_TWR_CORR_COUNT_IDX   10u
+#define DL_TWR_CORR_QUAL_IDX    11u
+#define DL_TWR_CORR_ENTRY_IDX   12u
+#define DL_TWR_CORR_ENTRY_LEN   4u     /* rank (u16) + corr_dtu (u16)            */
+#define DL_TWR_CORR_MAX_ENTRIES 16u
+#define DL_TWR_CORR_MAX_LEN     (DL_TWR_CORR_HDR_LEN \
+                                 + DL_TWR_CORR_ENTRY_LEN * DL_TWR_CORR_MAX_ENTRIES)
 
 /* Plausible Root→Child path delay, in DTU (child clock):
  *   0.2 m = 42.6 DTU .. 100 m = 21,320 DTU. */
 #define DL_TWR_CORR_MIN_DTU     40u
 #define DL_TWR_CORR_MAX_DTU     22000u
+
+/* Freshness limit (P1-3): if our own entry has not been refreshed for more
+ * than this many TDMA cycles, the correction is stale — the path delay may
+ * have changed (the anchor moved) — and the child leaves the grid. */
+#define DL_TWR_CORR_MAX_AGE_CYCLES 2u
 
 /* Backwards-compatible alias — the cs_level byte moved to 27 (P0-1). */
 #define DL_TS_CS_LEVEL_IDX        DL_TS_LEVEL_IDX

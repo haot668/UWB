@@ -215,6 +215,12 @@ static uint16_t s_ref_cycle   = 0;
  * the grid.  Subtracted from our slot instant. */
 static uint32_t s_twr_corr_dtu    = 0;
 static uint8_t  s_twr_corr_valid  = 0;
+/* Freshness of that correction (P1-3): the Root cycle id in effect when the
+ * correction was received.  If our own entry stops arriving, the path delay
+ * may have changed (we may have been moved) — the correction then goes
+ * stale and we leave the grid until a fresh one shows up. */
+static uint16_t s_twr_corr_cycle  = 0;
+static uint8_t  s_twr_corr_stale  = 0;
 
 /* Root side: one link state per tracked neighbour. */
 typedef struct {
@@ -228,8 +234,7 @@ typedef struct {
 } TwrLinkState;
 
 static TwrLinkState s_twr_link[ANCHOR_MAX_NEIGHBORS];
-static uint8_t      s_twr_tx_cursor = 0;   /* rotating child for corrections */
-static uint32_t     s_twr_last_tx_ms = 0;  /* when the last correction went out */
+static uint32_t     s_twr_last_tx_ms = 0;  /* when the last correction batch went out */
 
 /*============================================================================
  * Device TX delay calibration (K_dev)
@@ -1106,51 +1111,100 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     g_anchor.tx_count++;
 }
 
+/* The Root's current TDMA cycle id (the one stamped into its beacon). */
+static uint16_t root_current_cycle(void)
+{
+    if (s_root_grid_base == 0) return 0;
+    uint64_t period = (uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME;
+    uint64_t now = now_sys_ext();
+    if (now < s_root_grid_base) return 0;
+    return (uint16_t)(((now - s_root_grid_base) / period) & 0xFFFFu);
+}
+
 /*============================================================================
- * DS-TWR correction frame — Root → Child (unicast)
+ * DS-TWR correction batch — Root -> broadcast
  *
- * Carries the one-way propagation delay Root→Child that the Root measured
+ * Carries the one-way propagation delay Root->Child that the Root measured
  * from the round trip.  The child subtracts it from its own slot instant, so
  * its beacon lands exactly on the Root's grid instead of one propagation
  * delay late.  Without this every anchor contributes a systematic, distance
  * dependent bias to the Tag's TDOA solution.
  *
- * Frame (17 B):
+ * Frame (12 + 4*N bytes):
  *   [0..1]  frame type 0x41 0x88
  *   [2]     sequence
  *   [3..4]  source EUI64 tag 0xCA 0xDE
- *   [5..6]  destination rank (unicast)
+ *   [5..6]  destination (0xFFFF broadcast)
  *   [7..8]  source rank (Root)
  *   [9]     FUNC_TWR_CORR
- *   [10..11]target rank (uint16 LE, redundant with dst, for validation)
- *   [12..15]propagation delay, DTU (uint32 LE, in the CHILD's clock)
- *   [16]    quality / status
+ *   [10]    entry count N (1..16)
+ *   [11]    quality: age of the OLDEST entry, in TDMA cycles
+ *   [12..]  N entries of 4 bytes:
+ *            target rank (uint16 LE)
+ *            propagation delay, DTU (uint16 LE, in the CHILD's clock)
+ *
+ * P1-3: ALL children are served in ONE frame, once per TDMA cycle.  The old
+ * scheme (one unicast per cycle, round robin over the children) delayed a
+ * child's correction by up to N cycles — 1.3 s with 16 anchors — so the
+ * path delay was long stale before it reached the child and a "2 cycle"
+ * freshness limit could not be enforced at all.
  *============================================================================*/
-static void anchor_tx_twr_corr(uint16_t dst_rank, uint32_t corr_dtu, uint8_t quality)
+static void anchor_twr_corr_poll(void)
 {
-    uint8_t pkt[DL_TWR_CORR_LEN];
+    if (g_anchor.cs_level != 0) return;              /* Root only */
+    if (s_root_grid_base == 0) return;
+
+    uint32_t now_ms = HAL_GetTick();
+    /* One batch per TDMA cycle. */
+    if ((now_ms - s_twr_last_tx_ms) < (DL_TIMESYNC_PERIOD_MS - 15u)) return;
+
+    uint8_t pkt[DL_TWR_CORR_MAX_LEN];
     memset(pkt, 0, sizeof(pkt));
 
     pkt[0] = 0x41; pkt[1] = 0x88;
     pkt[2] = (uint8_t)(g_anchor.seq & 0xFF);
     pkt[3] = 0xCA; pkt[4] = 0xDE;
-    pkt[5] = (uint8_t)(dst_rank & 0xFF);
-    pkt[6] = (uint8_t)(dst_rank >> 8);
+    pkt[5] = 0xFF; pkt[6] = 0xFF;                    /* broadcast */
     pkt[7] = (uint8_t)(g_anchor.rank & 0xFF);
     pkt[8] = (uint8_t)(g_anchor.rank >> 8);
     pkt[9] = FUNC_TWR_CORR;
-    pkt[DL_TWR_CORR_RANK_IDX]     = (uint8_t)(dst_rank & 0xFF);
-    pkt[DL_TWR_CORR_RANK_IDX + 1] = (uint8_t)(dst_rank >> 8);
-    pkt[DL_TWR_CORR_PROP_IDX]     = (uint8_t)(corr_dtu & 0xFF);
-    pkt[DL_TWR_CORR_PROP_IDX + 1] = (uint8_t)((corr_dtu >> 8) & 0xFF);
-    pkt[DL_TWR_CORR_PROP_IDX + 2] = (uint8_t)((corr_dtu >> 16) & 0xFF);
-    pkt[DL_TWR_CORR_PROP_IDX + 3] = (uint8_t)((corr_dtu >> 24) & 0xFF);
-    pkt[DL_TWR_CORR_QUAL_IDX] = quality;
+
+    uint16_t cur_cycle = root_current_cycle();
+    uint8_t  n = 0;
+    uint8_t  max_age = 0;
+    int i;
+    for (i = 0; i < ANCHOR_MAX_NEIGHBORS && n < DL_TWR_CORR_MAX_ENTRIES; i++) {
+        TwrLinkState *L = &s_twr_link[i];
+        if (!L->have || !L->corr_valid) continue;
+        if (!g_anchor.neighbors[i].initialized) continue;
+        uint16_t rank = g_anchor.neighbors[i].neighbor_rank;
+        if (rank == 0xFFFFu) continue;
+        uint32_t d = L->corr_dtu;
+        if (d < DL_TWR_CORR_MIN_DTU || d > DL_TWR_CORR_MAX_DTU) continue;
+
+        uint8_t *e = &pkt[DL_TWR_CORR_ENTRY_IDX
+                          + n * DL_TWR_CORR_ENTRY_LEN];
+        e[0] = (uint8_t)(rank & 0xFF);
+        e[1] = (uint8_t)(rank >> 8);
+        e[2] = (uint8_t)(d & 0xFF);
+        e[3] = (uint8_t)((d >> 8) & 0xFF);
+
+        /* Age of this link's measurement, in TDMA cycles — the child uses
+         * the same number to judge whether its own entry is still fresh. */
+        uint8_t age = (uint8_t)((cur_cycle - L->ref_cycle) & 0xFFFFu);
+        if (age > max_age) max_age = age;
+        n++;
+    }
+    if (n == 0) return;
+
+    pkt[DL_TWR_CORR_COUNT_IDX] = n;
+    pkt[DL_TWR_CORR_QUAL_IDX]  = max_age;
+    uint32_t len = DL_TWR_CORR_ENTRY_IDX + (uint32_t)n * DL_TWR_CORR_ENTRY_LEN;
 
     port_DisableEXT_IRQ();
     dwt_forcetrxoff();
-    dwt_writetxdata(DL_TWR_CORR_LEN, pkt, 0);
-    dwt_writetxfctrl(DL_TWR_CORR_LEN, 0, 0);
+    dwt_writetxdata(len, pkt, 0);
+    dwt_writetxfctrl(len, 0, 0);
     dwt_starttx(DWT_START_TX_IMMEDIATE);
     { uint32_t dl = HAL_GetTick() + 10u;
       while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK)) {
@@ -1161,82 +1215,77 @@ static void anchor_tx_twr_corr(uint16_t dst_rank, uint32_t corr_dtu, uint8_t qua
 
     g_anchor.seq++;
     g_anchor.tx_count++;
-}
-
-/* Root side: send the pending correction, one child per call, round-robin.
- * Called right after the Root's own grid beacon (slot 0) so the frame lands
- * in the slot-0 window and never collides with a child's slot. */
-static void anchor_twr_corr_poll(void)
-{
-    if (g_anchor.cs_level != 0) return;              /* Root only */
-    if (s_root_grid_base == 0) return;
-
-    uint32_t now_ms = HAL_GetTick();
-    if ((now_ms - s_twr_last_tx_ms) < 60u) return;   /* at most one per cycle */
-
-    int i;
-    for (i = 0; i < ANCHOR_MAX_NEIGHBORS; i++) {
-        int j = (s_twr_tx_cursor + i) % ANCHOR_MAX_NEIGHBORS;
-        TwrLinkState *L = &s_twr_link[j];
-        if (!L->have || !L->corr_valid) continue;
-        if (!g_anchor.neighbors[j].initialized) continue;
-
-        anchor_tx_twr_corr(g_anchor.neighbors[j].neighbor_rank,
-                           L->corr_dtu, 0x01);
-        s_twr_tx_cursor = (uint8_t)((j + 1) % ANCHOR_MAX_NEIGHBORS);
-        s_twr_last_tx_ms = now_ms;
-        { char dbg[56];
-          sprintf(dbg, "TWR_CORR TX R=%u %lu dtu (%.1f cm)\r\n",
-                  (unsigned)g_anchor.neighbors[j].neighbor_rank,
-                  (unsigned long)L->corr_dtu,
-                  (double)L->corr_dtu * CM_PER_DTU_F);
-          DBG_PRINT(dbg); }
-        return;
-    }
+    s_twr_last_tx_ms = now_ms;
+    { char dbg[64];
+      sprintf(dbg, "TWR_CORR TX n=%u age=%u\r\n",
+              (unsigned)n, (unsigned)max_age);
+      DBG_PRINT(dbg); }
 }
 
 /*============================================================================
  * DS-TWR correction received from the Root (child side)
+ *
+ * The Root ships the corrections of ALL children in one broadcast frame
+ * (P1-3); we pick the entry addressed to our own rank.
  *============================================================================*/
 static void anchor_handle_twr_corr(const uint8_t *rx_buf, uint32_t frame_len)
 {
-    if (frame_len < DL_TWR_CORR_LEN) return;
+    if (frame_len < DL_TWR_CORR_HDR_LEN) return;
 
     uint16_t dst = (uint16_t)rx_buf[5] | ((uint16_t)rx_buf[6] << 8);
     if (dst != 0xFFFF && dst != g_anchor.rank) return;   /* not for us */
 
-    uint16_t tgt = (uint16_t)(rx_buf[DL_TWR_CORR_RANK_IDX]
-                   | ((uint16_t)rx_buf[DL_TWR_CORR_RANK_IDX + 1] << 8));
-    if (tgt != g_anchor.rank) return;                     /* stale/other child */
+    uint8_t n = rx_buf[DL_TWR_CORR_COUNT_IDX];
+    if (n == 0 || n > DL_TWR_CORR_MAX_ENTRIES) return;
+    if (frame_len < (uint32_t)(DL_TWR_CORR_ENTRY_IDX
+                               + n * DL_TWR_CORR_ENTRY_LEN)) return;
 
-    uint32_t corr = (uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX]
-                  | ((uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX + 1] << 8)
-                  | ((uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX + 2] << 16)
-                  | ((uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX + 3] << 24);
+    /* Pick our own entry out of the batch (P1-3). */
+    uint8_t k;
+    for (k = 0; k < n; k++) {
+        const uint8_t *e = rx_buf + DL_TWR_CORR_ENTRY_IDX
+                           + k * DL_TWR_CORR_ENTRY_LEN;
+        uint16_t tgt = (uint16_t)e[0] | ((uint16_t)e[1] << 8);
+        if (tgt != g_anchor.rank) continue;
 
-    /* Sanity: 0.2 m .. 100 m, in DTU (1 m = 213.20 DTU) */
-    if (corr < DL_TWR_CORR_MIN_DTU || corr > DL_TWR_CORR_MAX_DTU) {
-        char dbg[48];
-        sprintf(dbg, "TWR_CORR bad prop=%lu dtu\r\n", (unsigned long)corr);
-        DBG_PRINT(dbg);
+        uint32_t corr = (uint32_t)e[2] | ((uint32_t)e[3] << 8);
+
+        /* Sanity: 0.2 m .. 100 m, in DTU (1 m = 213.20 DTU) */
+        if (corr < DL_TWR_CORR_MIN_DTU || corr > DL_TWR_CORR_MAX_DTU) {
+            char dbg[48];
+            sprintf(dbg, "TWR_CORR bad prop=%lu dtu\r\n", (unsigned long)corr);
+            DBG_PRINT(dbg);
+            return;
+        }
+
+        /* The delay is already expressed in OUR clock units — the Root
+         * divides the solved path by f_root before sending it. */
+        uint32_t prop = corr;
+
+        if (!s_twr_corr_valid) {
+            s_twr_corr_dtu = prop;
+            s_twr_corr_valid = 1;
+        } else {
+            /* IIR smoothing, same filter the Root uses on its own
+             * measurement. */
+            s_twr_corr_dtu = (s_twr_corr_dtu * 3u + prop) / 4u;
+        }
+        /* Freshness bookkeeping (P1-3): the Root cycle this correction
+         * belongs to. */
+        s_twr_corr_cycle = g_tdma_ref.root_cycle_id;
+        if (s_twr_corr_stale) {
+            s_twr_corr_stale = 0;
+            { char dbg[48];
+              sprintf(dbg, "TWR_CORR FRESH (re-joined grid)\r\n");
+              DBG_PRINT(dbg); }
+        }
+        { char dbg[72];
+          sprintf(dbg, "TWR_CORR RX prop=%lu dtu (%.1f cm) age=%u\r\n",
+                  (unsigned long)prop, (double)prop * CM_PER_DTU_F,
+                  (unsigned)rx_buf[DL_TWR_CORR_QUAL_IDX]);
+          DBG_PRINT(dbg); }
         return;
     }
-
-    /* The delay is already expressed in OUR clock units — the Root divides
-     * the solved path by f_root before sending it. */
-    uint32_t prop = corr;
-
-    if (!s_twr_corr_valid) {
-        s_twr_corr_dtu = prop;
-        s_twr_corr_valid = 1;
-    } else {
-        /* IIR smoothing, same filter the Root uses on its own measurement. */
-        s_twr_corr_dtu = (s_twr_corr_dtu * 3u + prop) / 4u;
-    }
-    { char dbg[56];
-      sprintf(dbg, "TWR_CORR RX prop=%lu dtu (%.1f cm)\r\n",
-              (unsigned long)prop, (double)prop * CM_PER_DTU_F);
-      DBG_PRINT(dbg); }
 }
 
 /*============================================================================
@@ -1567,7 +1616,11 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
              * pre-computed slot, otherwise TX would be blocked for 3 s. */
             {
                 uint8_t real_slot = find_my_slot(g_anchor.rank);
-                if (real_slot != 255) {
+                /* P1-3: while our DS-TWR correction is stale we stay off
+                 * the grid — a beacon without a valid correction would be
+                 * one propagation delay off and would poison the Tag's
+                 * TDOA.  A fresh correction re-admits us. */
+                if (real_slot != 255 && !s_twr_corr_stale) {
                     g_anchor.my_slot_idx = real_slot;
                     s_net_slot_idx = real_slot;   /* authoritative slot (P1-2) */
                 }
@@ -1587,7 +1640,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
             s_aloha_sent_ms = 0;
             {
                 uint8_t real_slot = find_my_slot(g_anchor.rank);
-                if (real_slot != 255) {
+                if (real_slot != 255 && !s_twr_corr_stale) {  /* P1-3 */
                     g_anchor.my_slot_idx = real_slot;
                     s_net_slot_idx = real_slot;
                 }
@@ -1652,6 +1705,28 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
         if (frame_len >= DL_TS_CYCLE_IDX + 2) {
             g_tdma_ref.root_cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
                                     | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
+        }
+
+        /* Freshness of our DS-TWR correction (P1-3).  The Root ships a
+         * batch every cycle; if our own entry has not been refreshed for
+         * more than DL_TWR_CORR_MAX_AGE_CYCLES cycles, the path delay we
+         * hold is stale (we may have been moved) — so we drop it and leave
+         * the grid until a fresh correction arrives.  Beaconing with a
+         * stale correction would put us one propagation delay off the grid
+         * and poison the Tag's TDOA. */
+        if (s_twr_corr_valid && !s_twr_corr_stale) {
+            uint16_t age = (uint16_t)((g_tdma_ref.root_cycle_id
+                                       - s_twr_corr_cycle) & 0xFFFFu);
+            if (age > DL_TWR_CORR_MAX_AGE_CYCLES) {
+                char dbg[64];
+                sprintf(dbg, "TWR_CORR STALE age=%u cyc=%u\r\n",
+                        (unsigned)age, (unsigned)s_twr_corr_cycle);
+                DBG_PRINT(dbg);
+                s_twr_corr_valid = 0;
+                s_twr_corr_dtu   = 0;
+                s_twr_corr_stale = 1;
+                anchor_clear_slot("TWR_CORR_STALE");
+            }
         }
 
         /* Grid reference: the Root's beacon instant, expressed in our clock,
