@@ -314,7 +314,7 @@
           </ArmAdsMisc>
           <Cads>
             <interw>1</interw>
-            <Optim>1</Optim>
+            <Optim>3</Optim>
             <oTime>0</oTime>
             <SplitLS>0</SplitLS>
             <OneElfS>1</OneElfS>
@@ -573,6 +573,16 @@
               <FileName>stm32l4xx_hal_uart.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\shared\Drivers\STM32L4xx_HAL_Driver\Src\stm32l4xx_hal_uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32l4xx_hal_rtc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\API\Drivers\STM32L4xx_HAL_Driver\Src\stm32l4xx_hal_rtc.c</FilePath>
+            </File>
+            <File>
+              <FileName>stm32l4xx_hal_rtc_ex.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\API\Drivers\STM32L4xx_HAL_Driver\Src\stm32l4xx_hal_rtc_ex.c</FilePath>
             </File>
           </Files>
         </Group>

@@ -37,7 +37,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;..\shared\gw_ota;.\Src</IncludePath>
+          <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;.\Src</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath></RegisterFilePath>
           <DBRegisterFilePath></DBRegisterFilePath>
@@ -49,7 +49,7 @@
             <InvalidFlash>1</InvalidFlash>
           </TargetStatus>
           <OutputDirectory>.\Output\</OutputDirectory>
-          <OutputName>tag_V0_1</OutputName>
+          <OutputName>DWS3000_Tag</OutputName>
           <CreateExecutable>1</CreateExecutable>
           <CreateLib>0</CreateLib>
           <CreateHexFile>1</CreateHexFile>
@@ -80,9 +80,9 @@
             <nStopB2X>0</nStopB2X>
           </BeforeMake>
           <AfterMake>
-            <RunUserProg1>1</RunUserProg1>
+            <RunUserProg1>0</RunUserProg1>
             <RunUserProg2>0</RunUserProg2>
-            <UserProg1Name>fromelf --bin -o ".\Output\..\Firmware\@L.bin" "#L"</UserProg1Name>
+            <UserProg1Name></UserProg1Name>
             <UserProg2Name></UserProg2Name>
             <UserProg1Dos16Mode>0</UserProg1Dos16Mode>
             <UserProg2Dos16Mode>0</UserProg2Dos16Mode>
@@ -314,7 +314,7 @@
           </ArmAdsMisc>
           <Cads>
             <interw>1</interw>
-            <Optim>1</Optim>
+            <Optim>2</Optim>
             <oTime>0</oTime>
             <SplitLS>0</SplitLS>
             <OneElfS>1</OneElfS>
@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER, STM32L412xx, TEST_FUSION_TAG</Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;..\shared\gw_ota;.\Src</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;.\Src</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -358,7 +358,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;..\shared\gw_ota;.\Src</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;.\Src</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -415,11 +415,6 @@
               <FilePath>..\shared\fusion_tag\fusion_tag.c</FilePath>
             </File>
             <File>
-              <FileName>tdoa_solver.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\shared\downlink\tdoa_solver.c</FilePath>
-            </File>
-            <File>
               <FileName>example_info.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\shared\examples_info\example_info.c</FilePath>
@@ -430,14 +425,19 @@
               <FilePath>..\shared\shared_data\shared_functions.c</FilePath>
             </File>
             <File>
-              <FileName>gw_ota.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\shared\gw_ota\gw_ota.c</FilePath>
-            </File>
-            <File>
               <FileName>clock_sync.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\shared\shared_data\clock_sync.c</FilePath>
+            </File>
+            <File>
+              <FileName>tdoa_solver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\shared\downlink\tdoa_solver.c</FilePath>
+            </File>
+            <File>
+              <FileName>gw_ota.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\shared\gw_ota\gw_ota.c</FilePath>
             </File>
           </Files>
         </Group>

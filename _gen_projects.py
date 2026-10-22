@@ -114,6 +114,8 @@ projects = {
             "mac_802_15_8.c":                "..\\shared\\MAC_802_15_8\\mac_802_15_8.c",
             "example_info.c":                "..\\shared\\examples_info\\example_info.c",
             "shared_functions.c":            "..\\shared\\shared_data\\shared_functions.c",
+            "clock_sync.c":                  "..\\shared\\shared_data\\clock_sync.c",
+            "tdoa_solver.c":                 "..\\shared\\downlink\\tdoa_solver.c",
             "startup_stm32l412xx.s":         "..\\shared\\startup\\startup_stm32l412xx.s",
             # HAL driver files
             "stm32l4xx_hal.c":              "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal.c",
@@ -147,7 +149,7 @@ projects = {
     "uwb_gateway": {
         "target_name": "DWS3000_Gateway",
         "output_name": "DWS3000_Gateway",
-        "defines":     "USE_HAL_DRIVER, STM32L412xx, TEST_FUSION_ANCHOR, ENABLE_GATEWAY",
+        "defines":     "USE_HAL_DRIVER, STM32L412xx, TEST_FUSION_GATEWAY, ENABLE_GATEWAY",
         "scatter":     ".\\DWS3000_Gateway.sct",
         "replace_source_paths": {
             "main.c":                        ".\\Src\\main.c",
