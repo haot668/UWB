@@ -58,14 +58,51 @@
 
 /* Rate window (number of beacons).  16 beacons = 16 x 80 ms = 1.28 s. */
 #define CS_RATE_WINDOW_SAMPLES   16u
-/* Minimum number of samples before the timestamp-pair rate is trusted. */
-#define CS_RATE_MIN_SAMPLES      4u
+/* Minimum number of samples before the timestamp-pair rate is trusted.
+ * 8 beacons = 0.64 s -> the rate is known to ~1.5 ppb, which already puts
+ * the slot placement error (80 ms x 1.5 ppb = 0.12 ns = 3.6 cm) well below
+ * the 20 cm target.  The CFO (a few ppm) covers the warm-up before that. */
+#define CS_RATE_MIN_SAMPLES      8u
 
 /* Outlier / clamp thresholds on the rate innovation (dimensionless factor
  * units; 1e-6 = 1 ppm). */
 #define CS_FACTOR_OUTLIER_CFO    5e-6    /* 5 ppm  */
 #define CS_FACTOR_OUTLIER_TS     1e-6    /* 1 ppm  */
-#define CS_FACTOR_CLAMP          20e-6   /* 20 ppm */
+/* Maximum rate correction per update once the filter has settled.  2 ppm is
+ * 0.16 ns over one 80 ms interval — small enough that even a mis-classified
+ * sample cannot move the grid, while a genuine 20 ppm crystal still needs
+ * only a few updates to be tracked. */
+#define CS_FACTOR_CLAMP          2e-6    /* 2 ppm  */
+/* While the filter is still settling (first CS_WARMUP_UPDATES updates) the
+ * clamp is loose, otherwise the factor could not reach its true value. */
+#define CS_FACTOR_CLAMP_WARMUP  50e-6    /* 50 ppm */
+#define CS_WARMUP_UPDATES        8u
+/* A factor correction larger than this re-anchors the absolute offset
+ * (1 ppb — the incremental offset update cannot follow a factor change). */
+#define CS_FACTOR_REANCHOR      1e-9
+
+/* Sample-level sanity gate (DTU).  For two static anchors the interval
+ * residual  d_rx - factor * d_tx  is the change of the path length, i.e.
+ * essentially zero.  A frame with a corrupt timestamp breaks it by
+ * microseconds — and because the rate window only uses its two ENDPOINTS,
+ * such a sample would poison the rate for a whole window.
+ *
+ * IMPORTANT: the gate must NOT compare against the filter's own factor —
+ * that is a circular dependency (the factor is learned from the window, the
+ * window is fed by the gate): with a far-off estimate the gate would reject
+ * every sample and the filter could never converge (the CFO was the only
+ * way out, and the CFO is noisy).  The gate therefore compares the
+ * candidate's INTERVAL RATE against the median of the interval rates
+ * already in the window — both come from the timestamps themselves, so the
+ * test is independent of the filter state. */
+#define CS_SAMPLE_MIN_DTU        20000u  /* 313 ns */
+/* Number of samples in the window before the gate can work (it needs two
+ * interval rates to form a median). */
+#define CS_GATE_MIN_INTERVALS    3u
+/* After this many consecutive gate rejections the window is considered
+ * stale (the link's rate has changed for good) and is dropped, so the
+ * filter re-acquires the rate from scratch. */
+#define CS_GATE_MAX_REJECT       8u
 
 /* DW3000 CIA clock offset register (CIA_DIAG_0[31:16] COE_PPM) is a 13-bit
  * signed value in s[-15:-26] fixed-point format, representing the ratio of
@@ -97,12 +134,33 @@ typedef struct {
     bool     initialized;
     uint16_t neighbor_rank;     /* rank of this neighbor (Anchor-specific) */
 
-    /* Rate estimation from timestamp pairs — the sliding window is kept as
-     * its two endpoints, which is all that is needed for the ratio. */
-    uint64_t rate_tx[2];         /* remote TX stamps of the window ends     */
-    uint64_t rate_rx[2];         /* local RX stamps of the window ends      */
-    uint8_t  rate_fill;          /* 0 = empty, 1 = one sample, 2 = two      */
-    uint32_t rate_samples;       /* samples in the current window           */
+    /* Rate estimation from timestamp pairs — a REAL sliding window over the
+     * last CS_RATE_WINDOW_SAMPLES beacons (16 x 80 ms = 1.28 s).  The old
+     * code kept only the two endpoints and slid them one step at a time,
+     * so once the window was "full" it degenerated to a two-sample
+     * difference (80 ms) — 16x worse than the intended 1 ppb, i.e. a slot
+     * placement error of ~30 cm. */
+    uint64_t rate_tx[CS_RATE_WINDOW_SAMPLES];  /* remote TX stamps         */
+    uint64_t rate_rx[CS_RATE_WINDOW_SAMPLES];  /* local RX stamps          */
+    uint8_t  rate_head;         /* index of the next write                 */
+    uint32_t rate_samples;      /* samples currently in the window         */
+
+    /* Robust scale of the rate innovation: an exponential average of the
+     * innovation magnitude.  Used to widen the outlier threshold when the
+     * link is noisy (and to narrow it when it is clean). */
+    double   innov_abs_avg;
+    /* Counter for a PERSISTENT large innovation: a step that repeats in the
+     * same direction is a genuine rate change, not an outlier. */
+    uint8_t  innov_step_count;
+    int8_t   innov_step_sign;
+    /* Consecutive accepted updates with a small innovation.  The sample
+     * gate (see CS_SAMPLE_MIN_DTU) is only trustworthy while the filter is
+     * actually tracking — with a far-off estimate it would reject every
+     * sample and the filter could never converge. */
+    uint8_t  stable_count;
+    /* Consecutive samples the sanity gate rejected — a safety valve so the
+     * filter can never be locked out completely. */
+    uint8_t  gate_reject_count;
 
     /* Outlier history: one bit per update, MSB = newest (32 updates)      */
     uint32_t outlier_hist;
