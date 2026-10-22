@@ -14,6 +14,10 @@ uint64_t get_sys_timestamp_u64(void);
 void     pack_40bit_ts(uint8_t *buf, uint64_t ts);
 uint64_t unpack_40bit_ts(const uint8_t *buf);
 
+/* 64-bit extended timestamp pack/unpack (for cross-anchor timestamp comparison) */
+void     pack_64bit_ts(uint8_t *buf, uint64_t ts);
+uint64_t unpack_64bit_ts(const uint8_t *buf);
+
 #ifdef __cplusplus
 }
 #endif
