@@ -25,13 +25,10 @@
 #include "gateway_cmd.h"
 #include <gateway_protocol.h>
 #include <downlink_protocol.h>
+#include <example_selection.h>
 #include <firmware_version.h>
 
-#ifdef FUSION_DOWNLINK_MODE
-extern void dl_set_beacon_interval(uint16_t ms);
-extern void dl_set_anchor_coord(uint8_t rank, int16_t x_cm, int16_t y_cm,
-                                int16_t z_cm);
-#endif
+/* Stub implementations live near fusion_gateway() below */
 
 extern void test_run_info(unsigned char *data);
 
@@ -237,7 +234,7 @@ static int hex_byte(char hi, char lo, uint8_t *out)
 /*============================================================================
  * Device tracking — maintained from slave reports and blink sequences
  *============================================================================*/
-#define GW_MAX_DEVICES        16
+#define GW_MAX_DEVICES        48
 #define GW_TIMEOUT_MS         15000  /* 15 s → offline */
 #define GW_HEARTBEAT_MS        8000  /*  8 s heartbeat */
 
@@ -246,17 +243,37 @@ typedef struct
 {
     char     uid[8];
     char     type;    /* 'A'=Anchor, 'T'=Tag, 'G'=Gateway */
-    uint8_t  rank;
+    uint16_t rank;    /* 16-bit anchor rank (short address) — may exceed 255 */
     uint8_t  online;
     uint8_t  seen_count; /* debounce: ≥2 sightings before reporting online */
     uint16_t fw_ver;  /* Packed firmware version (0x0001=V0.0.1) */
     uint32_t last_seen_ms;
     uint32_t last_heartbeat_ms;
+    /* P1-4: UID fingerprint of the device.  The rank is a CRC16 of the
+     * 96-bit UID, so two different anchors can share a rank — when the
+     * fingerprint changes for the same rank we report +RANKCOLL. */
+    uint64_t uid_fp;
+    uint8_t  uid_fp_valid;
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
 static int      gw_dev_count = 0;
 static char     master_uid[9] = "0001";
+
+/* Network formation roster (P1-1).
+ *
+ * The gateway sends the participant list inside NETWORK_START, so every
+ * anchor knows exactly how many members the network must have.  The Root
+ * publishes a presence bitmap over the SAME ordered list in its TimeSync
+ * beacon; the gateway keeps a copy of the list here so it can tell the host
+ * which anchors never joined the network (a Root that only learns its
+ * neighbours from what it happens to hear can never detect a one-way link).
+ */
+static uint16_t gw_net_roster[NET_MAX_PARTICIPANTS];
+static int      gw_net_roster_n = 0;
+static uint16_t gw_net_root = 0;
+static uint16_t gw_net_present = 0;
+static int      gw_net_present_valid = 0;
 
 void gateway_set_master_uid(const char *uid)
 {
@@ -265,7 +282,7 @@ void gateway_set_master_uid(const char *uid)
     master_uid[i] = '\0';
 }
 
-void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
+void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
 {
     uint32_t now = HAL_GetTick();
     int i;
@@ -274,6 +291,9 @@ void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
         if (strcmp(gw_devs[i].uid, uid) == 0)
         {
             int was_offline = !gw_devs[i].online;
+            /* Always refresh rank — it may have been truncated/stale on a
+             * previous sighting (e.g. device re-registered with a new rank). */
+            gw_devs[i].rank = rank;
             gw_devs[i].last_seen_ms = now;
             /* Increment debounce counter (saturating at 255) */
             if (gw_devs[i].seen_count < 255)
@@ -297,11 +317,54 @@ void gateway_device_seen(const char *uid, const char *type, uint8_t rank)
         d->uid[sizeof(d->uid) - 1] = '\0';
         d->type      = (type && type[0] == 'T') ? 'T' : (type && type[0] == 'G') ? 'G' : 'A';
         d->rank      = rank;
+        d->fw_ver    = 0;
         d->online    = 0;       /* stay offline until debounce satisfied */
         d->seen_count = 1;      /* first sighting */
         d->last_seen_ms = now;
         d->last_heartbeat_ms = now;
+        d->uid_fp = 0;
+        d->uid_fp_valid = 0;
         /* Do NOT send +ONLINE yet — wait for 2nd sighting */
+        return;
+    }
+
+    /* Table full and this is an unknown device → evict the LRU entry.
+     * Prefer the oldest OFFLINE device (a genuinely departed one); if every
+     * slot is still online, evict the oldest overall so a fresh device can
+     * still register (the evicted one will re-register on its next sighting). */
+    {
+        int victim = -1;
+        uint32_t oldest = 0xFFFFFFFFu;
+        for (i = 0; i < gw_dev_count; i++) {
+            if (!gw_devs[i].online && gw_devs[i].last_seen_ms < oldest) {
+                oldest = gw_devs[i].last_seen_ms; victim = i;
+            }
+        }
+        if (victim < 0) {
+            oldest = 0xFFFFFFFFu;
+            for (i = 0; i < gw_dev_count; i++) {
+                if (gw_devs[i].last_seen_ms < oldest) {
+                    oldest = gw_devs[i].last_seen_ms; victim = i;
+                }
+            }
+        }
+        if (victim < 0) return;   /* table empty — impossible */
+
+        {
+            gw_dev_t *d = &gw_devs[victim];
+            strncpy(d->uid, uid, sizeof(d->uid) - 1);
+            d->uid[sizeof(d->uid) - 1] = '\0';
+            d->type       = (type && type[0] == 'T') ? 'T' : (type && type[0] == 'G') ? 'G' : 'A';
+            d->rank       = rank;
+            d->fw_ver     = 0;
+            d->online     = 0;      /* stay offline until debounce satisfied */
+            d->seen_count = 1;      /* first sighting */
+            d->last_seen_ms = now;
+            d->last_heartbeat_ms = now;
+            d->uid_fp = 0;
+            d->uid_fp_valid = 0;
+        }
+        /* Like a fresh registration: no +ONLINE until the 2nd sighting. */
         return;
     }
 
@@ -331,6 +394,45 @@ send_online:
         else { pos += fmt_dec(&out[pos], dev_rank); }
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
+    }
+}
+
+/* P1-4: rank collision detection.
+ * The anchor rank is a CRC16 over the 96-bit STM32 UID, so two different
+ * anchors can end up with the SAME 16-bit short address.  Both would then
+ * be one and the same device in the host list (and one of them could steal
+ * the other's TDMA slot).  The discovery frame carries a 64-bit fingerprint
+ * of the UID; when it changes for a known rank we report the collision. */
+void gateway_device_uid_fp(const char *uid, uint64_t fp)
+{
+    int i;
+    for (i = 0; i < gw_dev_count; i++)
+    {
+        if (strcmp(gw_devs[i].uid, uid) != 0) continue;
+        if (!gw_devs[i].uid_fp_valid) {
+            gw_devs[i].uid_fp = fp;
+            gw_devs[i].uid_fp_valid = 1;
+            return;
+        }
+        if (gw_devs[i].uid_fp == fp) return;
+
+        /* Different anchor behind the same rank — report once per pair. */
+        {
+            char out[80]; int pos = 0;
+            out[pos++] = '+'; out[pos++] = 'R'; out[pos++] = 'A';
+            out[pos++] = 'N'; out[pos++] = 'K'; out[pos++] = 'C';
+            out[pos++] = 'O'; out[pos++] = 'L'; out[pos++] = 'L';
+            out[pos++] = ',';
+            pos += fmt_str(&out[pos], uid);
+            out[pos++] = ',';
+            pos += fmt_dec(&out[pos], (int)gw_devs[i].rank);
+            out[pos++] = ',';
+            out[pos++] = '1'; out[pos++] = '6';   /* 16-bit rank */
+            out[pos] = '\0';
+            test_run_info((unsigned char *)out);
+        }
+        /* Keep the newest fingerprint so the warning is not repeated. */
+        gw_devs[i].uid_fp = fp;
     }
 }
 
@@ -379,6 +481,19 @@ void gateway_check_timeout(void)
 {
     uint32_t now = HAL_GetTick();
     int i;
+
+    /* P1-5: gateway self-heartbeat.  The gateway used to report its own
+     * presence only inside AT+LIST, so the host had no way to tell "gateway
+     * is alive but nothing else is talking" from "gateway is dead".  Emit
+     * +ONLINE,GW01,GATEWAY,0 every 5 s from the main loop. */
+    {
+        static uint32_t last_gw_hb = 0;
+        if ((uint32_t)(now - last_gw_hb) >= 5000u) {
+            last_gw_hb = now;
+            test_run_info((unsigned char *)"+ONLINE,GW01,GATEWAY,0");
+        }
+    }
+
     for (i = 0; i < gw_dev_count; i++)
     {
         uint32_t age_seen, age_hb;
@@ -613,6 +728,14 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
     if (func == FUNC_FIND_ACK)
     {
         uint8_t state = frame[GW_HDR_LEN];
+        /* Register the device so it appears in the host device list. */
+        {
+            char uid[8];
+            uid[0] = gw_hex[(src_addr >> 12) & 0xF]; uid[1] = gw_hex[(src_addr >>  8) & 0xF];
+            uid[2] = gw_hex[(src_addr >>  4) & 0xF]; uid[3] = gw_hex[ src_addr        & 0xF];
+            uid[4] = '\0';
+            gateway_device_seen(uid, "ANCHOR", src_addr);
+        }
         /* +FIND,<UID_HEX4>,<STATE> */
         out[0] = '+'; out[1] = 'F'; out[2] = 'I'; out[3] = 'N'; out[4] = 'D'; out[5] = ',';
         pos = 6;
@@ -621,6 +744,49 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         out[pos++] = state ? '1' : '0';
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
+    }
+    else if (func == FUNC_ANCHOR_DISCOVERY)
+    {
+        /* Anchor discovery beacon (0xEC) — an anchor that is powered on but
+         * not yet in a network is announcing itself.  Register it so the
+         * operator can pick it (or another anchor) as Root.
+         * src_addr = anchor rank (16-bit short address). */
+        char uid[8];
+        uid[0] = gw_hex[(src_addr >> 12) & 0xF]; uid[1] = gw_hex[(src_addr >>  8) & 0xF];
+        uid[2] = gw_hex[(src_addr >>  4) & 0xF]; uid[3] = gw_hex[ src_addr        & 0xF];
+        uid[4] = '\0';
+        gateway_device_seen(uid, "ANCHOR", src_addr);
+        /* Firmware version carried in the discovery payload [12..13] */
+        if (len >= (uint16_t)(GW_HDR_LEN + 4)) {
+            uint16_t fw = (uint16_t)(frame[GW_HDR_LEN+2] | (frame[GW_HDR_LEN+3] << 8));
+            gateway_device_version(uid, fw);
+        }
+        /* P1-4: UID fingerprint — detect two different anchors that ended up
+         * behind the same 16-bit rank (they would collapse into one device
+         * in the host list and fight over one TDMA slot). */
+        if (len >= (uint16_t)(DL_TS_DISC_UID_IDX + 8)) {
+            uint64_t fp = 0;
+            int k;
+            for (k = 0; k < 8; k++)
+                fp |= ((uint64_t)frame[DL_TS_DISC_UID_IDX + k]) << (k * 8);
+            gateway_device_uid_fp(uid, fp);
+        }
+        /* P1-3: report the anchor's network state (0=idle, 1=starting,
+         * 2=wait_confirm, 3=running) so the host can verify — 2..3 s after
+         * NETSTART — that every roster member actually reached RUNNING.
+         * The state byte lives at payload offset 4 (frame index 14). */
+        if (len >= (uint16_t)(GW_HDR_LEN + 5) && frame[GW_HDR_LEN + 4] <= 3) {
+            char sout[24];
+            int sp = 0;
+            sout[sp++]='+'; sout[sp++]='N'; sout[sp++]='E'; sout[sp++]='T';
+            sout[sp++]='S'; sout[sp++]='T'; sout[sp++]='A'; sout[sp++]='T';
+            sout[sp++]='E'; sout[sp++]=',';
+            sp += fmt_hex4(&sout[sp], src_addr);
+            sout[sp++]=',';
+            sout[sp++] = (char)('0' + frame[GW_HDR_LEN + 4]);
+            sout[sp]='\0';
+            test_run_info((unsigned char *)sout);
+        }
     }
     else if (func == FUNC_DL_POS_REPORT)
     {
@@ -692,6 +858,56 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
                        : '2';
             out[pos] = '\0';
             test_run_info((unsigned char *)out);
+        }
+    }
+    else if (func == FUNC_DOWNLINK_BEACON)
+    {
+        // Anchor TimeSync beacon (0xEE) — mark anchor online
+        // src_addr = anchor's rank (short address from frame[7..8])
+        char uid[8];
+        uid[0] = gw_hex[(src_addr >> 12) & 0xF];
+        uid[1] = gw_hex[(src_addr >>  8) & 0xF];
+        uid[2] = gw_hex[(src_addr >>  4) & 0xF];
+        uid[3] = gw_hex[ src_addr        & 0xF];
+        uid[4] = '\0';
+        gateway_device_seen(uid, "ANCHOR", src_addr);
+
+        /* P1-1: the Root publishes a presence bitmap over the roster it was
+         * given in NETWORK_START.  Compare it with our copy of the roster and
+         * report the members that are still missing — that is the only way to
+         * detect an anchor that never joined (one-way link, out of range). */
+        if (gw_net_roster_n > 0 && src_addr == gw_net_root &&
+            len >= (uint16_t)(DL_TS_PRESENT_IDX + 2))
+        {
+            uint16_t mask = (uint16_t)(frame[DL_TS_PRESENT_IDX] |
+                        ((uint16_t)frame[DL_TS_PRESENT_IDX + 1] << 8));
+            if (!gw_net_present_valid || mask != gw_net_present)
+            {
+                uint16_t missing[NET_MAX_PARTICIPANTS];
+                int miss_n = 0, i2;
+                gw_net_present = mask;
+                gw_net_present_valid = 1;
+                for (i2 = 0; i2 < gw_net_roster_n; i2++) {
+                    if ((mask & (uint16_t)(1u << i2)) == 0)
+                        missing[miss_n++] = gw_net_roster[i2];
+                }
+                {
+                    char out[128];
+                    int pos = 0;
+                    out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
+                    out[pos++]='M'; out[pos++]='I'; out[pos++]='S'; out[pos++]='S';
+                    out[pos++]=',';
+                    pos += fmt_dec(&out[pos], (int)gw_net_root);
+                    out[pos++]=',';
+                    pos += fmt_dec(&out[pos], miss_n);
+                    for (i2 = 0; i2 < miss_n; i2++) {
+                        out[pos++]=',';
+                        pos += fmt_dec(&out[pos], (int)missing[i2]);
+                    }
+                    out[pos]='\0';
+                    test_run_info((unsigned char *)out);
+                }
+            }
         }
     }
 }
@@ -860,14 +1076,15 @@ static void gateway_find(const char *cmd)
     }
 }
 
-/* Build "+COORD,<UID4>,<X.XX>,<Y.YY>,<Z.ZZ>" and send on UART.
+/* Build "+COORDAck,<UID4>,<X.XX>,<Y.YY>,<Z.ZZ>" and send on UART.
  * x/y/z are in cm. */
 static void send_coord_ack(uint16_t uid, int x, int y, int z)
 {
     char ack[48];
     int pos;
-    ack[0] = '+'; ack[1] = 'C'; ack[2] = 'O'; ack[3] = 'O'; ack[4] = 'R'; ack[5] = 'D'; ack[6] = ',';
-    pos = 7;
+    ack[0] = '+'; ack[1] = 'C'; ack[2] = 'O'; ack[3] = 'O'; ack[4] = 'R'; ack[5] = 'D'; ack[6] = 'A';
+    ack[7] = 'c'; ack[8] = 'k'; ack[9] = ',';
+    pos = 10;
     pos += fmt_hex4(&ack[pos], uid);
     ack[pos++] = ',';
     pos += fmt_coord(&ack[pos], x);
@@ -1001,36 +1218,55 @@ static void gateway_coord_read(const char *cmd)
     }
 }
 
+/* Emit one device line: "<head>,<uid>,<TYPE>,<rank>"
+ * head is "+ONLINE" (confirmed device) or "+SEEN" (sighted once — the
+ * debounce in gateway_device_seen() has not been satisfied yet). */
+static void gateway_emit_dev_line(const char *head, gw_dev_t *d)
+{
+    char out[48];
+    int pos = 0, i;
+
+    for (i = 0; head[i]; i++) out[pos++] = head[i];
+    out[pos++] = ',';
+    pos += fmt_str(&out[pos], d->uid);
+    out[pos++] = ',';
+    if (d->type == 'T')
+    { out[pos++] = 'T'; out[pos++] = 'A'; out[pos++] = 'G'; }
+    else if (d->type == 'G')
+    { out[pos++] = 'G'; out[pos++] = 'A'; out[pos++] = 'T'; out[pos++] = 'E'; out[pos++] = 'W'; out[pos++] = 'A'; out[pos++] = 'Y'; }
+    else
+    { out[pos++] = 'A'; out[pos++] = 'N'; out[pos++] = 'C'; out[pos++] = 'H'; out[pos++] = 'O'; out[pos++] = 'R'; }
+    out[pos++] = ',';
+    /* Full 16-bit rank in DECIMAL — the host sends this value back in
+     * AT+NETSTART, so truncating it here breaks Root selection. */
+    pos += fmt_dec(&out[pos], (int)d->rank);
+    out[pos] = '\0';
+    test_run_info((unsigned char *)out);
+}
+
 /* AT+LIST — output +ONLINE for each known device.
  * Gateway sniffs continuously, so device list is always current.
  * Always include Gateway itself first — the host needs this to show it online
- * on reconnect (the startup +ONLINE was already consumed). */
+ * on reconnect (the startup +ONLINE was already consumed).
+ *
+ * P2-3: devices that have been sighted ONCE but have not yet satisfied the
+ * 2-sighting debounce are reported as "+SEEN".  Without this line a freshly
+ * powered anchor stays invisible to the host until the second sighting
+ * arrives, which is exactly the "上位机搜不到基站" symptom: the host polls
+ * AT+LIST faster than the debounce can complete. */
 static void gateway_send_list(void)
 {
-    char out[48];
-    int pos, i;
+    int i;
 
     /* Gateway self-registration — must appear in every AT+LIST response */
     test_run_info((unsigned char *)"+ONLINE,GW01,GATEWAY,0");
 
-    /* Only online devices — offline ones stay offline */
     for (i = 0; i < gw_dev_count; i++)
     {
-        if (!gw_devs[i].online) continue;
-        out[0] = '+'; out[1] = 'O'; out[2] = 'N'; out[3] = 'L'; out[4] = 'I'; out[5] = 'N'; out[6] = 'E'; out[7] = ',';
-        pos = 8;
-        pos += fmt_str(&out[pos], gw_devs[i].uid);
-        out[pos++] = ',';
-        if (gw_devs[i].type == 'T')
-        { out[pos++] = 'T'; out[pos++] = 'A'; out[pos++] = 'G'; }
-        else if (gw_devs[i].type == 'G')
-        { out[pos++] = 'G'; out[pos++] = 'A'; out[pos++] = 'T'; out[pos++] = 'E'; out[pos++] = 'W'; out[pos++] = 'A'; out[pos++] = 'Y'; }
-        else
-        { out[pos++] = 'A'; out[pos++] = 'N'; out[pos++] = 'C'; out[pos++] = 'H'; out[pos++] = 'O'; out[pos++] = 'R'; }
-        out[pos++] = ',';
-        out[pos++] = '0' + (gw_devs[i].rank % 10);
-        out[pos] = '\0';
-        test_run_info((unsigned char *)out);
+        if (gw_devs[i].online)
+            gateway_emit_dev_line("+ONLINE", &gw_devs[i]);
+        else if (gw_devs[i].seen_count >= 1)
+            gateway_emit_dev_line("+SEEN", &gw_devs[i]);
     }
 }
 
@@ -1049,7 +1285,14 @@ static void gateway_rx_flush(void)
 
     /* 2. Drain both RX buffers (DW3000 has double-buffered RX).
      *    During ACK polling, non-ACK frames may have been received
-     *    and left unread, corrupting the buffer state. */
+     *    and left unread, corrupting the buffer state.
+     *
+     *    P2-5: frames that arrived WHILE the command was running are real
+     *    traffic (anchor discovery beacons, TimeSync beacons) — dropping
+     *    them blind meant an anchor that announced itself exactly during the
+     *    command was lost for good ("上位机搜不到基站").  Parse them into the
+     *    device table first, then flush. */
+    port_DisableEXT_IRQ();
     for (buf_idx = 0; buf_idx < 2; buf_idx++)
     {
         uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
@@ -1060,10 +1303,14 @@ static void gateway_rx_flush(void)
             {
                 uint8_t dummy[128];
                 dwt_readrxdata(dummy, fl, 0);
+                if (fl >= GW_HDR_LEN && fl <= 127)
+                    gateway_handle_uwb_rx(dummy, (uint16_t)fl);
             }
             dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
         }
     }
+    EXTI->PR1 = (1u << 12);
+    port_EnableEXT_IRQ();
 
     /* 3. Clear all RX error / overflow flags accumulated during polling */
     dwt_write32bitreg(SYS_STATUS_ID,
@@ -2026,7 +2273,7 @@ void gateway_poll_uart(void)
                             if (fl >= GW_HDR_LEN && fl <= 32) {
                                 uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
                                 dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-                                if (rb[9] == FUNC_NETWORK_ACK) { ack_ok = 1; break; }
+                                if (rb[9] == FUNC_NETWORK_CFG_ACK) { ack_ok = 1; break; }
                             } else { dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK); }
                             dwt_rxenable(DWT_START_RX_IMMEDIATE);
                         }
@@ -2048,6 +2295,230 @@ void gateway_poll_uart(void)
                 }
                 gateway_rx_flush();  /* clean RX state after TX+ACK polling */
             }
+        }
+    }
+    else if (strncmp(cmd, "AT+NETSTART=", 12) == 0)
+    {
+        /* AT+NETSTART=<root_rank>[,<r1>,<r2>,...]
+         *
+         * Broadcasts FUNC_NETWORK_START to all anchors.  The root rank is a
+         * 16-bit value identifying the designated root anchor; anchors reply
+         * with FUNC_NETWORK_ACK (0xE9) unicast to the gateway.
+         *
+         * The optional comma-separated list is the PARTICIPANT ROSTER (P1-1).
+         * It is sent to every anchor inside the same frame, so all nodes
+         * agree on the network membership, and bit N of the Root's presence
+         * bitmap always refers to the same participant.  Without a roster a
+         * Root can only learn its neighbours from the frames it happens to
+         * hear, so a single one-way link makes network formation impossible
+         * and undetectable.  When the host sends no roster the gateway falls
+         * back to "every known anchor", which keeps the old command working.
+         */
+        const char *p = cmd + 12;
+        unsigned int root_rank = 0;
+        uint16_t roster[NET_MAX_PARTICIPANTS];
+        int roster_n = 0;
+
+        while (*p >= '0' && *p <= '9')
+            root_rank = root_rank * 10 + (unsigned int)(*p++ - '0');
+        if (root_rank > 0xFFFF) root_rank = 0xFFFF;
+
+        /* --- optional explicit roster --- */
+        if (*p == ',') {
+            p++;
+            while (*p && roster_n < (int)NET_MAX_PARTICIPANTS) {
+                unsigned int r = 0;
+                int got = 0;
+                while (*p >= '0' && *p <= '9') { r = r * 10 + (unsigned int)(*p++ - '0'); got = 1; }
+                if (got && r > 0 && r <= 0xFFFF) roster[roster_n++] = (uint16_t)r;
+                if (*p == ',') p++;
+                else break;
+            }
+        }
+
+        {
+            int i, j, dup;
+            /* --- fallback roster: root + every known anchor --- */
+            if (roster_n == 0) {
+                roster[roster_n++] = (uint16_t)root_rank;
+                for (i = 0; i < gw_dev_count && roster_n < (int)NET_MAX_PARTICIPANTS; i++) {
+                    uint16_t r;
+                    if (gw_devs[i].type != 'A') continue;
+                    if (!gw_devs[i].online) continue;
+                    r = gw_devs[i].rank;
+                    if (r == 0 || r == (uint16_t)root_rank) continue;
+                    dup = 0;
+                    for (j = 0; j < roster_n; j++) if (roster[j] == r) { dup = 1; break; }
+                    if (!dup) roster[roster_n++] = r;
+                }
+            }
+            /* Keep our own copy so the presence mask can be decoded later */
+            /* The Root is always a member of the network (it owns slot 0), so
+             * make sure it is part of the roster even when the host listed
+             * only the other participants.  The order must stay identical to
+             * the order inside the frame — bit N of the presence mask refers
+             * to roster[N] on every node. */
+            {
+                int has_root = 0;
+                for (i = 0; i < roster_n; i++)
+                    if (roster[i] == (uint16_t)root_rank) { has_root = 1; break; }
+                if (!has_root && roster_n < (int)NET_MAX_PARTICIPANTS) {
+                    for (i = roster_n; i > 0; i--) roster[i] = roster[i - 1];
+                    roster[0] = (uint16_t)root_rank;
+                    roster_n++;
+                }
+            }
+            for (i = 0; i < roster_n; i++) gw_net_roster[i] = roster[i];
+            gw_net_roster_n = roster_n;
+            gw_net_root = (uint16_t)root_rank;
+            gw_net_present_valid = 0;
+
+            /* Build NETWORK_START payload:
+             * [0-1] root_rank (uint16 LE)
+             * [2]   flags (bit[0]=1 force reset)
+             * [3]   n_participants
+             * [4-5] reserved
+             * [6..] participant ranks (n × uint16 LE) */
+            uint8_t payload[FUNC_NETWORK_START_MAX];
+            int plen = 0;
+            payload[plen++] = (uint8_t)(root_rank & 0xFF);
+            payload[plen++] = (uint8_t)((root_rank >> 8) & 0xFF);
+            payload[plen++] = NET_FLAG_FORCE_RESET;  /* force reset on anchors */
+            payload[plen++] = (uint8_t)roster_n;
+            payload[plen++] = 0; payload[plen++] = 0;   /* reserved */
+            for (i = 0; i < roster_n; i++) {
+                payload[plen++] = (uint8_t)(roster[i] & 0xFF);
+                payload[plen++] = (uint8_t)((roster[i] >> 8) & 0xFF);
+            }
+
+            /* Broadcast to all anchors (0xFFFF) via UWB.
+             * P1-3: the burst must outlast the anchor-side timing — the
+             * anchor de-bounces repeated NETWORK_START for 800 ms, answers
+             * with an ALOHA beacon every 500 ms and needs up to 3 s to
+             * confirm its slot.  A 300 ms burst therefore missed most
+             * anchors; 100 × 20 ms = 2 s covers all of it. */
+            int ack_count = 0;
+            uint16_t ack_ranks[GW_MAX_DEVICES];
+            int burst;
+            for (burst = 0; burst < 100; burst++) {
+                gateway_send_uwb_ack(0xFFFFu, FUNC_NETWORK_START, payload, (uint8_t)plen);
+                {
+                    uint32_t dl = HAL_GetTick() + 20u;
+                    port_DisableEXT_IRQ();
+                    while (HAL_GetTick() < dl) {
+                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                        if (st & SYS_STATUS_ALL_RX_ERR) {
+                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                            Sleep(1); continue;
+                        }
+                        if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                            uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                            if (fl >= GW_HDR_LEN && fl <= 32) {
+                                uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                                if (rb[9] == FUNC_NETWORK_ACK) {
+                                    /* Got NETWORK_ACK from an anchor.
+                                     * Parse: [10-11]=root_rank, [12]=cs_level,
+                                     *         [13]=slot_idx, [14]=n_neighbors */
+                                    uint16_t ack_root = (uint16_t)(rb[DL_TS_NETACK_ROOT_IDX] |
+                                                    ((uint16_t)rb[DL_TS_NETACK_ROOT_IDX+1] << 8));
+                                    uint8_t cs_level  = rb[DL_TS_NETACK_LEVEL_IDX];
+                                    uint8_t slot_idx  = rb[DL_TS_NETACK_SLOT_IDX];
+                                    uint8_t n_neigh   = rb[DL_TS_NETACK_NNEIGH_IDX];
+                                    uint16_t src_rank = (uint16_t)(rb[7] | ((uint16_t)rb[8] << 8));
+                                    (void)ack_root; (void)cs_level; (void)slot_idx; (void)n_neigh;
+                                    /* Register the anchor as online (P1-4) and count
+                                     * each anchor only once, even though it ACKs on
+                                     * every broadcast burst. */
+                                    {
+                                        char auid[8];
+                                        int dup = 0, k;
+                                        for (k = 0; k < ack_count; k++) {
+                                            if (ack_ranks[k] == src_rank) { dup = 1; break; }
+                                        }
+                                        if (!dup && ack_count < GW_MAX_DEVICES) {
+                                            ack_ranks[ack_count++] = src_rank;
+                                            auid[0] = gw_hex[(src_rank >> 12) & 0xF];
+                                            auid[1] = gw_hex[(src_rank >>  8) & 0xF];
+                                            auid[2] = gw_hex[(src_rank >>  4) & 0xF];
+                                            auid[3] = gw_hex[ src_rank        & 0xF];
+                                            auid[4] = '\0';
+                                            gateway_device_seen(auid, "ANCHOR", src_rank);
+                                            /* P1-1: report how many anchors this one
+                                             * hears.  The Root's neighbour count is
+                                             * its coverage — a Root that hears
+                                             * almost nobody cannot complete the
+                                             * network, so the host can suggest a
+                                             * better Root. */
+                                            {
+                                                char nout[32]; int np = 0;
+                                                nout[np++]='+'; nout[np++]='N'; nout[np++]='E';
+                                                nout[np++]='T'; nout[np++]='N'; nout[np++]='B';
+                                                nout[np++]='R'; nout[np++]=',';
+                                                np += fmt_dec(&nout[np], (int)src_rank);
+                                                nout[np++]=',';
+                                                np += fmt_dec(&nout[np], (int)n_neigh);
+                                                nout[np]='\0';
+                                                test_run_info((unsigned char *)nout);
+                                            }
+                                        }
+                                    }
+                                    /* Don't break — keep collecting ACKs from other anchors */
+                                }
+                            } else {
+                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                            }
+                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                        }
+                        Sleep(1);
+                    }
+                    EXTI->PR1 = (1u << 12);
+                    port_EnableEXT_IRQ();
+                }
+            }
+
+            /* Report result: +NETSTART_OK,<ack_count>,<root_rank>,<miss_cnt>,<r1>,...
+             * The missing list holds the roster members that never answered
+             * the NETWORK_START — the host must warn about them and keep them
+             * out of the TDOA solve set.  If nobody answered at all, emit
+             * +NETSTART_ERR so the host can tell "command sent but no anchor
+             * heard it" from "success". */
+            {
+                char out[128]; int pos = 0;
+                if (ack_count == 0) {
+                    out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
+                    out[pos++]='S'; out[pos++]='T'; out[pos++]='A'; out[pos++]='R';
+                    out[pos++]='T'; out[pos++]='_'; out[pos++]='E'; out[pos++]='R';
+                    out[pos++]='R';
+                    out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+                } else {
+                    uint16_t missing[NET_MAX_PARTICIPANTS];
+                    int miss_n = 0, i2, j2;
+                    for (i2 = 0; i2 < roster_n; i2++) {
+                        int acked = 0;
+                        for (j2 = 0; j2 < ack_count; j2++)
+                            if (ack_ranks[j2] == roster[i2]) { acked = 1; break; }
+                        if (!acked) missing[miss_n++] = roster[i2];
+                    }
+                    out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
+                    out[pos++]='S'; out[pos++]='T'; out[pos++]='A'; out[pos++]='R';
+                    out[pos++]='T'; out[pos++]='_'; out[pos++]='O'; out[pos++]='K';
+                    out[pos++]=',';
+                    pos += fmt_dec(&out[pos], ack_count);
+                    out[pos++]=',';
+                    pos += fmt_dec(&out[pos], (int)root_rank);
+                    out[pos++]=',';
+                    pos += fmt_dec(&out[pos], miss_n);
+                    for (i2 = 0; i2 < miss_n; i2++) {
+                        out[pos++]=',';
+                        pos += fmt_dec(&out[pos], (int)missing[i2]);
+                    }
+                    out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+                }
+                test_run_info((unsigned char *)out);
+            }
+            gateway_rx_flush();
         }
     }
     else if (strncmp(cmd, "AT+STOP", 7) == 0)
@@ -2132,6 +2603,115 @@ void gateway_poll_uart(void)
 }
 
 /*============================================================================
+ * Gateway main entry — pure sniffer + AT command bridge
+ *============================================================================*/
+extern void reset_DWIC(void);
+extern void Sleep(uint32_t ms);
+extern void port_DisableEXT_IRQ(void);
+extern void port_EnableEXT_IRQ(void);
+extern dwt_txconfig_t txconfig_options;
+#define RX_ANT_DLY 16385
+#define TX_ANT_DLY 16385
+
+/* DW3000 channel config — channel 9, 128 preamble, 6.8Mbps (matches Anchor/Tag) */
+static dwt_config_t gw_config = {
+    UWB_CHANNEL, DWT_PLEN_128, DWT_PAC8,
+    9, 9, 1, DWT_BR_6M8, DWT_PHRMODE_STD, DWT_PHRRATE_STD,
+    (129 + 8 - 8), DWT_STS_MODE_OFF, DWT_STS_LEN_64, DWT_PDOA_M0
+};
+
+/* Stub implementations for linkage — Gateway receives coords via AT commands */
+void dl_set_anchor_coord(uint16_t rank, int16_t x_cm, int16_t y_cm, int16_t z_cm)
+{
+    (void)rank; (void)x_cm; (void)y_cm; (void)z_cm;
+}
+void dl_set_beacon_interval(uint16_t ms)
+{
+    (void)ms;
+}
+
+int fusion_gateway(void)
+{
+    test_run_info((unsigned char *)"GATEWAY START\r\n");
+
+    reset_DWIC();
+    Sleep(50);
+
+    while (!dwt_checkidlerc()) { }
+    if (dwt_check_dev_id() != DWT_SUCCESS) {
+        test_run_info((unsigned char *)"DEV ERR\r\n");
+        return -1;
+    }
+    if (dwt_initialise(DWT_DW_INIT) == DWT_ERROR) {
+        test_run_info((unsigned char *)"INIT ERR\r\n");
+        return -1;
+    }
+
+    dwt_configure(&gw_config);
+    dwt_configuretxrf(&txconfig_options);
+    dwt_setrxantennadelay(RX_ANT_DLY);
+    dwt_settxantennadelay(TX_ANT_DLY);
+    dwt_setleds(DWT_LEDS_ENABLE);
+    port_rf_switch_init();  /* Set RF switch to RX mode: PA6=RX_EN, PA7=TX_EN */
+
+    test_run_info((unsigned char *)"CONFIG OK\r\n");
+
+    /* Heartbeat: toggle LED every second to confirm main loop is running */
+    int led_state = 0;
+    uint32_t loop_ctr = 0;
+
+    /* Disable EXTI around RX start */
+    port_DisableEXT_IRQ();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    EXTI->PR1 = (1u << 12);
+    port_EnableEXT_IRQ();
+
+    while (1) {
+        uint32_t status;
+
+        port_DisableEXT_IRQ();
+        status = dwt_read32bitreg(SYS_STATUS_ID);
+        if (status & SYS_STATUS_ALL_RX_ERR) {
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        }
+        if (status & SYS_STATUS_RXFCG_BIT_MASK) {
+            uint32_t frame_len = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+            if (frame_len >= GW_HDR_LEN && frame_len <= 127) {
+                uint8_t rx_buf[127];
+                dwt_readrxdata(rx_buf, frame_len, 0);
+                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                port_EnableEXT_IRQ();
+                gateway_handle_uwb_rx(rx_buf, frame_len);
+                port_DisableEXT_IRQ();
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                port_EnableEXT_IRQ();
+                continue;
+            } else {
+                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                dwt_rxenable(DWT_START_RX_IMMEDIATE);
+            }
+        }
+        port_EnableEXT_IRQ();
+
+        gateway_poll_uart();
+        gateway_ota_arq_poll();
+        gateway_bcast_ota_poll();
+        gateway_check_timeout();
+
+        /* Heartbeat: LED toggle every ~5s */
+        if (++loop_ctr >= 5000) {
+            loop_ctr = 0;
+            led_state = !led_state;
+            dwt_setleds(led_state ? 0x3 : 0x0);
+        }
+
+        Sleep(1);
+    }
+    return 0;
+}
+
+/*============================================================================
  * Flash config storage — STM32L412 last page (page 63 @ 0x0801F800, 2 KB)
  *============================================================================*/
 #define FLASH_CONFIG_ADDR  0x0801F800UL
@@ -2150,3 +2730,4 @@ int gateway_flash_load_coord(int16_t *x, int16_t *y, int16_t *z)
     (void)x; (void)y; (void)z;
     return -1;  /* never written */
 }
+

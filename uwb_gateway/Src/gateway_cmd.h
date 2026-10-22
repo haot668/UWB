@@ -28,10 +28,14 @@ void gateway_poll_uart(void);
 void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len);
 
 /* Register a device (called when an anchor/tag is discovered) */
-void gateway_device_seen(const char *uid, const char *type, uint8_t rank);
+void gateway_device_seen(const char *uid, const char *type, uint16_t rank);
 
 /* Set firmware version for a device */
 void gateway_device_version(const char *uid, uint16_t fw_ver);
+
+/* P1-4: UID fingerprint of a device — detects two different anchors that
+ * share the same 16-bit rank (reported as +RANKCOLL). */
+void gateway_device_uid_fp(const char *uid, uint64_t fp);
 
 /* Set master UID (called from fusion_anchor after discovery) */
 void gateway_set_master_uid(const char *uid);
