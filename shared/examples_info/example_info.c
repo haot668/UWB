@@ -378,6 +378,12 @@ void build_examples(void)
     example_pointer=fusion_anchor;
     test_cnt++;
 #endif
+#ifdef TEST_FUSION_GATEWAY
+    extern int fusion_gateway(void);
+
+    example_pointer=fusion_gateway;
+    test_cnt++;
+#endif
 #ifdef TEST_DOWNLINK_TAG
     extern int downlink_tag(void);
 

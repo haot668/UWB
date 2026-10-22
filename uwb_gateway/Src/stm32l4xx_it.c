@@ -40,11 +40,10 @@ void EXTI9_5_IRQHandler(void)
 }
 
 /* UWB RX interrupt — highest priority (0).
- * Abort any pending TX and clear stale EXTI on entry so the
- * frame processor runs with a clean DW3000 state. */
+ * Gateway uses polling loop for RX; this handler only clears the
+ * pending bit so EXTI doesn't re-trigger continuously. */
 void EXTI15_10_IRQHandler(void)
 {
-    dwt_forcetrxoff();
     EXTI->PR1 = (1u << 12);  /* clear EXTI12 pending */
 
     if (__HAL_GPIO_EXTI_GET_IT(DW_IRQn_Pin) != RESET)

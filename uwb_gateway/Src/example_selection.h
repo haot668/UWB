@@ -9,7 +9,8 @@
 extern "C" {
 #endif
 
-#define TEST_FUSION_ANCHOR
+/* Gateway uses gateway_sniffer as entry point — defined in gateway_cmd.c */
+#define TEST_FUSION_GATEWAY
 
 /* UWB Channel selection — 5 or 9 */
 #define UWB_CHANNEL 9

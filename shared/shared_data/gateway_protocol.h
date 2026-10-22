@@ -26,7 +26,7 @@ extern "C" {
 #define FUNC_NETWORK_CFG  0xF9u  /* GW→Master: 2B bitmask of active anchors */
 #define FUNC_STOP_TDOA    0xFAu  /* GW→Master: stop TDMA, re-enter config mode */
 #define FUNC_START_ACK    0xFBu  /* Master→GW: START received */
-#define FUNC_NETWORK_ACK  0xFCu  /* Master→GW: NETWORK received */
+#define FUNC_NETWORK_CFG_ACK 0xFCu  /* Master→GW: NETWORK_CFG received (legacy AT+NETWORK) */
 #define FUNC_LIST_REQ     0xFDu  /* GW→Master: request online device list */
 #define FUNC_STOP_ACK     0xFEu  /* Master→GW: STOP received */
 
