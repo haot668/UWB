@@ -102,6 +102,19 @@ def parse_anchor_line(line):
 def parse_tag_line(line):
     """Parse Tag debug lines for display."""
     line = line.strip()
+    # Parse TDOA position: P,SEQ,X=x.xx,Y=y.yy,Z=z.zz,Q=q.qq
+    if line.startswith('P,'):
+        try:
+            parts = line.split(',')
+            if len(parts) >= 5:
+                seq = int(parts[1], 16) if parts[1] else 0
+                x = float(parts[2].split('=')[1]) if '=' in parts[2] else 0.0
+                y = float(parts[3].split('=')[1]) if '=' in parts[3] else 0.0
+                z = float(parts[4].split('=')[1]) if '=' in parts[4] else 0.0
+                return ('POS', {'seq': seq, 'x': x, 'y': y, 'z': z, 'raw': line})
+        except (ValueError, IndexError):
+            pass
+        return ('DEBUG', line)
     if line.startswith('D='):
         # Parse distance: D=001B cm → extract hex value
         try:
@@ -168,6 +181,9 @@ def serial_reader(port_name):
                             with data_lock:
                                 history.append(val)
                             print(f"  [DIST] D={val.tof_dist_cm} cm (from Tag)")
+                        elif tag == 'POS':
+                            # val is dict with x, y, z position
+                            print(f"  [POS] X={val['x']:.2f}m Y={val['y']:.2f}m Z={val['z']:.2f}m SEQ={val['seq']:02X}")
                         else:
                             print(f"  [{tag}] {val}")
                     elif line:
