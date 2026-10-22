@@ -665,10 +665,16 @@ static AnchorClockSync *root_sync_mut(void)
  * Without a converged model we fall back to identity (assume identical
  * clocks) — the grid still works, only the absolute slot accuracy degrades.
  *
- * NOTE: this form is only used for DIAGNOSTICS.  It multiplies the factor
- * error with the absolute timestamp and is therefore far too coarse to
- * place a beacon on the grid — the grid origin is taken from our own RX
- * instant of the Root's beacon instead (see anchor_rx_timesync()). */
+ * The stamp MUST be the RAW 40-bit stamp of the remote clock: the sync
+ * model is anchored at a reference sample (P0-6), so only stamps of the
+ * same 40-bit domain can be converted.  Passing the 64-bit extended stamp
+ * would mix two domains and produce a meaningless number.
+ *
+ * NOTE: this form is only used for DIAGNOSTICS.  Its error is
+ * factor_error * (ts - ref_tx), i.e. it is only accurate for stamps close
+ * to the reference — far too coarse to place a beacon on the grid.  The
+ * grid origin is taken from our own RX instant of the Root's beacon
+ * instead (see anchor_rx_timesync()). */
 static uint64_t root_clock_to_local(uint64_t root_ts)
 {
     const AnchorClockSync *s = root_sync();
@@ -1776,7 +1782,10 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
             uint32_t now_ms = HAL_GetTick();
             if (now_ms - s_last_diag_ms > 2000u) {
                 s_last_diag_ms = now_ms;
-                int64_t err = (int64_t)(root_clock_to_local(root_ext)
+                /* The sync model lives in the RAW 40-bit domain of both
+                 * clocks — the 64-bit extended Root stamp must not be fed
+                 * into it (P1-5 domain mix-up). */
+                int64_t err = (int64_t)(root_clock_to_local(raw)
                                         - g_tdma_ref.base_origin);
                 char dbg[64];
                 sprintf(dbg, "GRID_REF err=%ld dtu (%.1f cm) corr=%lu\r\n",
