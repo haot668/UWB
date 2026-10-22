@@ -82,12 +82,50 @@ typedef struct {
     uint8_t            is_active;
     int16_t            cfo_raw_last;
     float              quality;
-    uint32_t           rx_cycle;         /* local fallback cycle counter (80 ms) */
     uint16_t           cycle_id;         /* TDMA cycle id carried in the beacon (P0-4) */
     uint8_t            slot;             /* TDMA slot index (255=unknown) */
     uint64_t           last_rx_ts;       /* Raw RX local timestamp for TDOA */
     uint32_t           clock_reject_count; /* clock updates refused as outliers */
+
+    /* ── P1-2: multi-cycle average of the TDOA against the Root ─────────
+     * The ABSOLUTE slot-compensated TOA cannot be averaged across cycles:
+     * it contains the cycle origin, which advances by one cycle (80 ms) in
+     * the tag's clock, so averaging it would smear the TDOA by the tag's
+     * clock error (50 ppm x 0.64 s = 32 ns = 1 m!).  The DIFFERENCE
+     * against the Root's beacon of the SAME cycle is comparable across
+     * cycles — the origin cancels — and that difference is exactly what
+     * the TDOA is.  So the average is taken on the difference. */
+    int64_t            tdoa_now;         /* this cycle's TDOA against the Root   */
+    uint8_t            tdoa_valid;       /* tdoa_now holds a value                */
+    int64_t            tdoa_avg;         /* multi-cycle average of tdoa_now       */
+    uint8_t            tdoa_n;           /* samples in that average               */
+
+    /* ── P1-1: grid self-check ─────────────────────────────────────────
+     * The beacon advertises the instant it was actually transmitted.  The
+     * tag must receive it shortly after — the DIFFERENCE between the
+     * arrival and the advertised instant must stay constant.  A change
+     * means the anchor left the grid (its beacon moved) or the clock
+     * model broke.  The absolute value of the difference is meaningless
+     * (it contains the unknown tag<->anchor clock offset), so the check
+     * is made against a baseline frame. */
+    uint64_t           sc_rx0;           /* baseline RX instant                  */
+    uint64_t           sc_tx0;           /* baseline advertised TX instant       */
+    uint8_t            sc_valid;
+    uint8_t            sc_n;             /* frames since the baseline            */
+    uint32_t           desync_count;     /* consecutive self-check failures      */
+    uint8_t            desynced;         /* the anchor left the grid             */
 } TagAnchorTracker;
+
+/* P1-1 self-check tuning -------------------------------------------------
+ * The check compares the arrival-vs-advertised difference against a
+ * baseline frame, so it measures how much the anchor's beacon MOVED.
+ * 2000 DTU = 94 cm: a real grid jump is far larger, a static deployment
+ * never comes close (the residual is the path change plus the factor
+ * error over the baseline span). */
+#define TAG_SELFCHECK_BASELINE   16u   /* frames between re-baselining (1.3 s) */
+#define TAG_DESYNC_DTU           2000LL
+#define TAG_DESYNC_LIMIT         3u    /* consecutive failures before exclusion */
+#define TAG_TOA_AVG_N            8u    /* cycles in the TDOA average (0.64 s)  */
 
 static TagAnchorTracker s_trackers[DL_MAX_TRACKED_ANCHORS];
 
@@ -101,6 +139,14 @@ static uint32_t s_n_cycle_mismatch = 0;   /* beacons dropped: wrong cycle id  */
 static uint16_t s_root_rank      = 0;
 static double   s_root_rate      = 1.0;    /* (our clock)/(Root's clock)       */
 static uint8_t  s_root_rate_valid = 0;
+
+/* P1-2: the Root's slot-compensated TOA of the cycle currently in flight.
+ * The Root transmits in slot 0, so its beacon of a cycle always arrives
+ * before the other anchors' beacons of the same cycle — which is what
+ * makes the per-anchor TDOA against the Root computable in the RX path. */
+static int64_t  s_root_toa_eq    = 0;
+static uint16_t s_root_toa_cycle = 0;
+static uint8_t  s_root_toa_valid = 0;
 
 /*============================================================================
  * Output and protocol helpers
@@ -131,15 +177,27 @@ static void tag_solve_and_report(void)
 
     /* Find fresh active trackers (within FRESH_MS_MAX ms) */
     int n_active = 0;
+    int n_desync = 0;
     int active_idx[DL_MAX_TRACKED_ANCHORS];
     for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
         if (!s_trackers[i].is_active) continue;
+        /* P1-1: an anchor that failed the grid self-check is EXCLUDED from
+         * the solve — its beacon no longer sits on the grid, so its slot
+         * compensation would shift the whole solution. */
+        if (s_trackers[i].desynced) { n_desync++; continue; }
         uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
                           : (now_ms - s_trackers[i].last_seen_ms);
         if (age_ms > 500) continue;  /* measurement too stale */
         active_idx[n_active++] = i;
     }
-    if (n_active < 3) return;
+    if (n_active < 3) {
+        { char dbg[72]; int pos = 0;
+          pos += sprintf(dbg + pos, "TSUM n_act=%d SKIP need 3 anchors", n_active);
+          if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
+          pos += sprintf(dbg + pos, "\r\n");
+          test_run_info((unsigned char *)dbg); }
+        return;
+    }
 
     /* Choose ref = highest quality + newest
      * Score = quality * 1000 - age_ms (higher is better) */
@@ -251,6 +309,8 @@ static void tag_solve_and_report(void)
     int ref_idx;
     int n_valid;
     bool use_slot_compensation = (n_sel >= 3);
+    /* P1-2: were the TDOA values taken from the multi-cycle average? */
+    bool use_avg = false;
 
     if (use_slot_compensation) {
         /* ── Slot-compensated TDOA ────────────────────────────────────────
@@ -266,28 +326,73 @@ static void tag_solve_and_report(void)
         }
 
         uint8_t ref_slot = s_trackers[ref_idx].slot;
-        toa_dtu[0] = (uint64_t)((int64_t)s_trackers[ref_idx].last_rx_ts
-                                - (int64_t)ref_slot * slot_dtu_eff);
-        anchors[0] = s_trackers[ref_idx].pos;
-        valid_idx[0] = ref_idx;
 
-        n_valid = 1;
-        for (i = 0; i < n_sel; i++) {
-            int idx = sel_idx[i];
-            if (idx == ref_idx) continue;
+        /* P1-2: the multi-cycle average can only be used when the values
+         * are DIFFERENCES against the reference anchor of the same cycle
+         * (the absolute TOA contains the cycle origin, which drifts).
+         * When the reference is the Root, the per-anchor values computed
+         * in the RX path are already such differences — so the average
+         * can be used directly. */
+        bool ref_is_root = (s_trackers[ref_idx].rank == s_root_rank);
+        use_avg = false;
+        if (ref_is_root) {
+            use_avg = true;
+            for (i = 0; i < n_sel; i++) {
+                int idx = sel_idx[i];
+                if (idx == ref_idx) continue;
+                if (s_trackers[idx].tdoa_n == 0) { use_avg = false; break; }
+            }
+        }
 
-            uint8_t k_slot = s_trackers[idx].slot;
-            uint64_t rx_k = s_trackers[idx].last_rx_ts;
-            int64_t toa_equiv = (int64_t)rx_k - (int64_t)k_slot * slot_dtu_eff;
-            int64_t tdoa_dtu = toa_equiv - (int64_t)toa_dtu[0];
+        if (ref_is_root) {
+            /* Every value is a difference against the Root, so the Root is
+             * the origin and the solver sees the same TDOAs as before. */
+            toa_dtu[0] = 0;
+            anchors[0] = s_trackers[ref_idx].pos;
+            valid_idx[0] = ref_idx;
 
-            if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
-            s_n_pair++;
+            n_valid = 1;
+            for (i = 0; i < n_sel; i++) {
+                int idx = sel_idx[i];
+                if (idx == ref_idx) continue;
+                if (!s_trackers[idx].tdoa_valid) continue;
 
-            toa_dtu[n_valid] = (uint64_t)toa_equiv;
-            anchors[n_valid] = s_trackers[idx].pos;
-            valid_idx[n_valid] = idx;
-            n_valid++;
+                int64_t tdoa_dtu = use_avg ? s_trackers[idx].tdoa_avg
+                                           : s_trackers[idx].tdoa_now;
+                if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
+                s_n_pair++;
+
+                toa_dtu[n_valid] = (uint64_t)(int64_t)tdoa_dtu;
+                anchors[n_valid] = s_trackers[idx].pos;
+                valid_idx[n_valid] = idx;
+                n_valid++;
+            }
+        } else {
+            /* The reference is not the Root: the absolute TOAs have to be
+             * used (no averaging possible). */
+            toa_dtu[0] = (uint64_t)((int64_t)s_trackers[ref_idx].last_rx_ts
+                                    - (int64_t)ref_slot * slot_dtu_eff);
+            anchors[0] = s_trackers[ref_idx].pos;
+            valid_idx[0] = ref_idx;
+
+            n_valid = 1;
+            for (i = 0; i < n_sel; i++) {
+                int idx = sel_idx[i];
+                if (idx == ref_idx) continue;
+
+                uint8_t k_slot = s_trackers[idx].slot;
+                uint64_t rx_k = s_trackers[idx].last_rx_ts;
+                int64_t toa_equiv = (int64_t)rx_k - (int64_t)k_slot * slot_dtu_eff;
+                int64_t tdoa_dtu = toa_equiv - (int64_t)toa_dtu[0];
+
+                if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
+                s_n_pair++;
+
+                toa_dtu[n_valid] = (uint64_t)toa_equiv;
+                anchors[n_valid] = s_trackers[idx].pos;
+                valid_idx[n_valid] = idx;
+                n_valid++;
+            }
         }
     } else {
         /* ── Fallback: raw RX TDOA (no slot compensation) ─────────────────
@@ -366,10 +471,26 @@ static void tag_solve_and_report(void)
     /* P0-4 summary: how many pairs were formed and how many beacons had to
      * be dropped because they belonged to a different TDMA cycle.  A rising
      * mismatch counter means the anchors are not on one common grid. */
-    { char dbg[96]; int pos = 0;
-      pos += sprintf(dbg + pos, "TSUM n=%d pair=%u mism=%u cyc=%u\r\n",
-          n_valid, (unsigned)s_n_pair, (unsigned)s_n_cycle_mismatch,
-          (unsigned)s_trackers[ref_idx].cycle_id);
+    { char dbg[128]; int pos = 0;
+      pos += sprintf(dbg + pos, "TSUM n_act=%d n_sel=%d n=%d pair=%u mism=%u cyc=%u ref=R%d",
+          n_active, n_sel, n_valid, (unsigned)s_n_pair,
+          (unsigned)s_n_cycle_mismatch,
+          (unsigned)s_trackers[ref_idx].cycle_id,
+          s_trackers[ref_idx].rank);
+      if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
+      pos += sprintf(dbg + pos, " avg=%d\r\n", use_avg ? 1 : 0);
+      test_run_info((unsigned char *)dbg); }
+
+    /* Per-anchor cycle id of the selected set — the fastest way to see
+     * which anchor is one cycle behind. */
+    { char dbg[128]; int pos = 0;
+      pos += sprintf(dbg + pos, "TSUM_CYC");
+      for (i = 0; i < n_sel && pos < 100; i++) {
+          int idx = sel_idx[i];
+          pos += sprintf(dbg + pos, " R%u:c%u",
+              s_trackers[idx].rank, (unsigned)s_trackers[idx].cycle_id);
+      }
+      pos += sprintf(dbg + pos, "\r\n");
       test_run_info((unsigned char *)dbg); }
 
     if (n_valid < 3) {
@@ -455,7 +576,6 @@ static int alloc_tracker_slot(uint16_t rank)
             s_trackers[i].rank = rank;
             s_trackers[i].slot = 255;      /* unknown until beacon received */
             s_trackers[i].last_rx_ts = 0;
-            s_trackers[i].rx_cycle = 0;
             s_trackers[i].cycle_id = 0;    /* P0-4: TDMA cycle id (0 = unknown) */
             clock_sync_init(&s_trackers[i].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
             return i;
@@ -473,8 +593,15 @@ static int alloc_tracker_slot(uint16_t rank)
     s_trackers[worst].rank = rank;
     s_trackers[worst].slot = 255;
     s_trackers[worst].last_rx_ts = 0;
-    s_trackers[worst].rx_cycle = 0;
     s_trackers[worst].cycle_id = 0;      /* P0-4 */
+    s_trackers[worst].tdoa_now   = 0;
+    s_trackers[worst].tdoa_valid = 0;
+    s_trackers[worst].tdoa_avg   = 0;
+    s_trackers[worst].tdoa_n     = 0;
+    s_trackers[worst].sc_valid   = 0;
+    s_trackers[worst].sc_n       = 0;
+    s_trackers[worst].desync_count = 0;
+    s_trackers[worst].desynced   = 0;
     clock_sync_init(&s_trackers[worst].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
     return worst;
 }
@@ -526,9 +653,9 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     /* Track which TDMA cycle this RX belongs to.  The authoritative value is
      * the cycle id carried in the beacon (P0-4) — every anchor of the same
      * grid cycle stamps the same id, so the Tag can pair beacons that truly
-     * belong to the same cycle.  The millisecond counter is only a fallback
-     * for beacons that do not carry an id. */
-    s_trackers[tracker_slot].rx_cycle = HAL_GetTick() / DL_TIMESYNC_PERIOD_MS;
+     * belong to the same cycle.  It is always present in a valid frame
+     * (DL_TS_CYCLE_IDX + 2 <= DL_TIMESYNC_LEN), so no local fallback
+     * counter is needed (P1-11). */
     /* Record raw RX timestamp for TDOA */
     s_trackers[tracker_slot].last_rx_ts = rx_local;
     /* Parse TDMA slot index from beacon */
@@ -634,6 +761,91 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         s_root_rate = s_trackers[tracker_slot].sync.factor;
         s_root_rate_valid = (s_trackers[tracker_slot].sync.update_count >= 8)
                             ? 1 : 0;
+    }
+
+    /* ── P1-2: TDOA against the Root, averaged over several cycles ───────
+     * toa_equiv = rx_local - slot x 5 ms removes the TDMA slot from the
+     * arrival instant.  Against the Root's beacon of the SAME cycle the
+     * cycle origin cancels as well, so the difference is the pure TDOA —
+     * and, unlike the absolute TOA, it is comparable across cycles and
+     * can therefore be averaged (which removes the RX timestamp jitter
+     * and the per-frame grid jitter, the dominant error terms).
+     *
+     * The Root's own beacon is stored separately; the other anchors pair
+     * with it as long as the cycle id matches. */
+    {
+        TagAnchorTracker *t = &s_trackers[tracker_slot];
+        bool is_root = (frame_len >= DL_TS_LEVEL_IDX + 1
+                        && rx_buf[DL_TS_LEVEL_IDX] == 0);
+        if (t->slot != 255 && s_root_rate_valid) {
+            int64_t slot_eff = (int64_t)((double)DTU_PER_SLOT * s_root_rate);
+            int64_t toa_eq   = (int64_t)rx_local - (int64_t)t->slot * slot_eff;
+            if (is_root) {
+                s_root_toa_eq    = toa_eq;
+                s_root_toa_cycle = t->cycle_id;
+                s_root_toa_valid = 1;
+            } else if (s_root_toa_valid && s_root_toa_cycle == t->cycle_id) {
+                t->tdoa_now   = toa_eq - s_root_toa_eq;
+                t->tdoa_valid = 1;
+                if (t->tdoa_n == 0) {
+                    t->tdoa_avg = t->tdoa_now;
+                    t->tdoa_n   = 1;
+                } else {
+                    uint32_t w = (t->tdoa_n < TAG_TOA_AVG_N) ? t->tdoa_n
+                                                             : TAG_TOA_AVG_N;
+                    t->tdoa_avg += (t->tdoa_now - t->tdoa_avg) / (int64_t)w;
+                    t->tdoa_n++;
+                }
+            }
+        }
+    }
+
+    /* ── P1-1: grid self-check ───────────────────────────────────────────
+     * The beacon advertises the instant it actually left the antenna.  The
+     * tag receives it a fraction of a microsecond later — the DIFFERENCE
+     * between the arrival and the advertised instant must stay constant.
+     * Its absolute value contains the unknown tag<->anchor clock offset
+     * and is therefore meaningless, but a CHANGE of it means the anchor's
+     * beacon moved (the anchor left the grid) or the clock model broke.
+     *
+     * The baseline is re-taken every TAG_SELFCHECK_BASELINE frames, so
+     * the factor error (which multiplies the baseline span) stays small.
+     * The check only runs once the clock model has settled. */
+    {
+        TagAnchorTracker *t = &s_trackers[tracker_slot];
+        if (t->sync.update_count >= 8 && t->sync.quality > 0.5f) {
+            if (!t->sc_valid || t->sc_n >= TAG_SELFCHECK_BASELINE) {
+                t->sc_rx0 = rx_local;
+                t->sc_tx0 = tx_remote;
+                t->sc_valid = 1;
+                t->sc_n = 0;
+            } else {
+                t->sc_n++;
+                double f = t->sync.factor;
+                uint64_t d_tx = (tx_remote - t->sc_tx0) & 0xFFFFFFFFFFULL;
+                int64_t  d_res = (int64_t)((double)(rx_local - t->sc_rx0)
+                               - f * (double)d_tx);
+                if (d_res > TAG_DESYNC_DTU || d_res < -TAG_DESYNC_DTU) {
+                    if (t->desync_count < TAG_DESYNC_LIMIT) t->desync_count++;
+                    if (t->desync_count >= TAG_DESYNC_LIMIT && !t->desynced) {
+                        t->desynced = 1;
+                        { char dbg[72];
+                          sprintf(dbg, "TAG_DESYNC R=%u d=%lld dtu (%.1f cm) EXCLUDED\r\n",
+                                  t->rank, (long long)d_res,
+                                  (double)d_res * CM_PER_DTU_F);
+                          test_run_info((unsigned char *)dbg); }
+                    }
+                } else {
+                    if (t->desynced) {
+                        t->desynced = 0;
+                        { char dbg[56];
+                          sprintf(dbg, "TAG_DESYNC R=%u RECOVERED\r\n", t->rank);
+                          test_run_info((unsigned char *)dbg); }
+                    }
+                    t->desync_count = 0;
+                }
+            }
+        }
     }
 }
 
