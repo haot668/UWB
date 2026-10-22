@@ -154,7 +154,7 @@ extern "C" {
 #define DL_SCAN_TIMEOUT_MS          5000u  /* 5-second scan period on boot          */
 
 /*============================================================================
- * TimeSync frame layout (72 bytes payload)
+ * TimeSync frame layout (79 bytes total, including the 10-byte header)
  *   [0-1]   frame_ctrl       (0x41, 0x88)
  *   [2]     seq8
  *   [3-4]   pan_id           (0xCA, 0xDE)
