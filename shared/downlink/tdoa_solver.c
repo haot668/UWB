@@ -17,7 +17,6 @@
 #include "downlink_protocol.h"
 
 extern void test_run_info(unsigned char *data);
-static const char hex[] = "0123456789ABCDEF";
 
 /* DWT time unit in seconds: 1/(499.2e6 * 128) */
 #define DWT_TIME_S   (1.0f / (499.2e6f * 128.0f))
@@ -26,10 +25,14 @@ static const char hex[] = "0123456789ABCDEF";
 #define CM_PER_DTU   ((float)SPEED_OF_LIGHT * 100.0f * DWT_TIME_S)
 /* ≈ 0.4691 */
 
-#define MAX_ITER      6
-#define CONV_THRESH   0.05f    /* convergence: 0.05 cm */
-#define SING_THRESH   1e-6f    /* singular matrix threshold */
-#define DAMP_FACTOR   0.5f     /* damping when residual increases */
+#define MAX_ITER         12
+#define CONV_THRESH      0.10f    /* convergence: step length < 0.10 cm */
+#define CONV_DIFF_THRESH 0.02f    /* early exit: RMS improvement < 0.02 cm */
+#define SING_THRESH      1e-6f    /* singular matrix threshold */
+#define DAMP_FACTOR      0.3f     /* damping when residual increases */
+#define DAMP_DIVERGING   0.15f   /* stronger damping when diverging */
+#define OUTLIER_THRESH   3.0f     /* outlier = |residual| > OUTLIER_THRESH * rms */
+#define MIN_WEIGHT_KEEP  0.1f     /* minimum weight to keep anchor in solve */
 
 /*============================================================================
  * solve_3x3 — Cramer's rule for H * x = g  (H is 3x3, g and x are 3x1)
@@ -91,13 +94,16 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
                float *x_cm_out, float *y_cm_out, float *z_cm_out,
                float *rms_out)
 {
-    float tdoa_cm[DL_MAX_ANCHORS];  /* TDOA in cm, index 0 unused */
+    float tdoa_cm[DL_MAX_ANCHORS];
     float r[DL_MAX_ANCHORS];
     float x, y, z;
-    float prev_rms;
     int iter, k;
     uint8_t n;
     int use_2d = 0;
+
+    /* Outlier tracking: each measurement's weight (0 = rejected) */
+    float weight[DL_MAX_ANCHORS];
+    for (k = 0; k < DL_MAX_ANCHORS; k++) weight[k] = 1.0f;
 
     n = num_anchors;
     if (n < 2)
@@ -107,10 +113,7 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
     if (n < 4)
         use_2d = 1;
 
-    /* 1. Convert TDOA to cm.
-     *    Caller pre-compensates toa_dtu using embedded TX timestamps:
-     *      effective_toa[k] = toa_dtu[k] - tx_ts_dtu[k]
-     *    Then toa_dtu[k] - toa_dtu[0] = (d_k - d_0)/c directly. */
+    /* 1. Convert TDOA to cm */
     {
         uint64_t ref = toa_dtu[0];
         for (k = 1; k < (int)n; k++)
@@ -134,14 +137,16 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
         z = sz / (float)n;
     }
 
-    prev_rms = 1e9f;
+    float prev_rms = 1e9f;
+    int diverge_count = 0;
 
-    /* 3. Gauss-Newton iteration */
+    /* 3. Gauss-Newton iteration with outlier rejection */
     for (iter = 0; iter < MAX_ITER; iter++)
     {
         float H[3][3], g[3];
         float res[DL_MAX_ANCHORS];
-        float rms;
+        float rms = 0, weighted_rms = 0;
+        uint8_t used_count = 0;
 
         /* Init accumulators */
         H[0][0] = H[0][1] = H[0][2] = 0;
@@ -159,13 +164,17 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
             if (r[k] < 1.0f) r[k] = 1.0f;
         }
 
-        /* 3b/3c. Compute residuals + accumulate Jacobian */
-        rms = 0;
+        /* 3b/3c. Compute residuals + accumulate Jacobian (skip weight=0) */
         for (k = 1; k < (int)n; k++)
         {
+            if (weight[k] < 0.5f) continue;
+
             float pred = r[k] - r[0];
             res[k] = pred - tdoa_cm[k];
+            float w = weight[k];
             rms += res[k] * res[k];
+            weighted_rms += (res[k] * res[k]) * w;
+            used_count++;
 
             /* Jacobian row for anchor k relative to anchor 0 */
             float dx0 = (x - (float)anchors[0].x_cm) / r[0];
@@ -179,18 +188,15 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
             float J1 = dyk - dy0;
             float J2 = dzk - dz0;
 
-            /* H = J^T * J (symmetric, upper triangle) */
-            H[0][0] += J0 * J0;
-            H[0][1] += J0 * J1;
-            H[0][2] += J0 * J2;
-            H[1][1] += J1 * J1;
-            H[1][2] += J1 * J2;
-            H[2][2] += J2 * J2;
-
-            /* g = -J^T * res */
-            g[0] -= J0 * res[k];
-            g[1] -= J1 * res[k];
-            g[2] -= J2 * res[k];
+            H[0][0] += J0 * J0 * w;
+            H[0][1] += J0 * J1 * w;
+            H[0][2] += J0 * J2 * w;
+            H[1][1] += J1 * J1 * w;
+            H[1][2] += J1 * J2 * w;
+            H[2][2] += J2 * J2 * w;
+            g[0] -= J0 * res[k] * w;
+            g[1] -= J1 * res[k] * w;
+            g[2] -= J2 * res[k] * w;
         }
 
         /* Fill lower triangle */
@@ -198,25 +204,74 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
         H[2][0] = H[0][2];
         H[2][1] = H[1][2];
 
-        rms = sqrtf(rms / (float)(n - 1));
+        float denom = (float)(used_count > 0 ? used_count - 1 : 1);
+        rms = sqrtf(rms / denom);
+        float w_rms = sqrtf(weighted_rms / denom);
 
-        /* 3g. Check singularity */
+        /* 3d. Outlier rejection: update weights based on residuals */
+        if (iter > 0 && used_count >= 3)
+        {
+            for (k = 1; k < (int)n; k++)
+            {
+                if (weight[k] < 0.5f) continue;
+                float thresh = OUTLIER_THRESH * w_rms;
+                if (thresh < 1.0f) thresh = 1.0f;
+                if (fabsf(res[k]) > thresh)
+                {
+                    weight[k] *= 0.5f;
+                    if (weight[k] < MIN_WEIGHT_KEEP) weight[k] = 0.0f;
+                }
+            }
+        }
+
+        /* 3e. Adaptive damping: track diverging iterations */
+        float damp = DAMP_FACTOR;
+        if (rms > prev_rms && iter > 0)
+        {
+            diverge_count++;
+            if (diverge_count >= 2) damp = DAMP_DIVERGING;
+        }
+        else
+        {
+            diverge_count = 0;
+        }
+
+        /* 3f. Early exit: RMS improvement below threshold */
+        if (iter > 0 && fabsf(prev_rms - w_rms) < CONV_DIFF_THRESH)
+            break;
+
+        /* 3g. Solve */
         {
             float H2[3][3], g2[3];
             float det;
             uint8_t r1, c1;
 
-            /* For 2D: extract 2x2 submatrix, z component = 0 */
             if (use_2d)
             {
                 for (r1 = 0; r1 < 2; r1++)
                     for (c1 = 0; c1 < 2; c1++)
                         H2[r1][c1] = H[r1][c1];
-                g2[0] = g[0];
-                g2[1] = g[1];
-                H2[2][2] = 0;  /* unused */
+                g2[0] = g[0]; g2[1] = g[1];
 
                 det = H2[0][0] * H2[1][1] - H2[0][1] * H2[1][0];
+                if (fabsf(det) < SING_THRESH)
+                {
+                    H2[0][0] += 1e-3f; H2[1][1] += 1e-3f;
+                    det = H2[0][0] * H2[1][1] - H2[0][1] * H2[1][0];
+                }
+
+                float inv = 1.0f / det;
+                float dx = (g2[0] * H2[1][1] - H2[0][1] * g2[1]) * inv;
+                float dy = (H2[0][0] * g2[1] - g2[0] * H2[1][0]) * inv;
+
+                dx *= damp;
+                dy *= damp;
+
+                x += dx;
+                y += dy;
+
+                if (sqrtf(dx * dx + dy * dy) < CONV_THRESH)
+                    break;
             }
             else
             {
@@ -224,69 +279,25 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
                     for (c1 = 0; c1 < 3; c1++)
                         H2[r1][c1] = H[r1][c1];
                 g2[0] = g[0]; g2[1] = g[1]; g2[2] = g[2];
-                det = 0;  /* solve_3x3 computes it */
-            }
 
-            /* DEBUG: print det as raw float hex (IEEE 754) */
-            if (iter == 0)
-            {
-                char _s[30]; int _p = 0;
-                _s[_p++]='S'; _s[_p++]=',';
-                { union { float f; uint32_t u; } _fu; _fu.f = det;
-                  int _j; for(_j=28;_j>=0;_j-=4) _s[_p++]=hex[(_fu.u>>_j)&0xF]; }
-                _s[_p++]='\r';_s[_p++]='\n';_s[_p]='\0';
-                test_run_info((unsigned char *)_s);
-            }
-
-            /* 3f. Solve for delta */
-            if (use_2d)
-            {
-                float inv = 1.0f / det;
-                float dx = (g2[0] * H2[1][1] - H2[0][1] * g2[1]) * inv;
-                float dy = (H2[0][0] * g2[1] - g2[0] * H2[1][0]) * inv;
-
-                /* Damping if residual increased */
-                if (rms > prev_rms && iter > 0)
-                {
-                    dx *= DAMP_FACTOR;
-                    dy *= DAMP_FACTOR;
-                }
-
-                x += dx;
-                y += dy;
-
-                if (sqrtf(dx * dx + dy * dy) < CONV_THRESH)
-                {
-                    prev_rms = rms;
-                    break;
-                }
-            }
-            else
-            {
                 float delta[3];
                 if (solve_3x3(H2, g2, delta) != 0)
                     return -1;
 
-                if (rms > prev_rms && iter > 0)
-                {
-                    delta[0] *= DAMP_FACTOR;
-                    delta[1] *= DAMP_FACTOR;
-                    delta[2] *= DAMP_FACTOR;
-                }
+                delta[0] *= damp;
+                delta[1] *= damp;
+                delta[2] *= damp;
 
                 x += delta[0];
                 y += delta[1];
                 z += delta[2];
 
-                if (sqrtf(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]) < CONV_THRESH)
-                {
-                    prev_rms = rms;
+                if (sqrtf(delta[0]*delta[0] + delta[1]*delta[1] + delta[2]*delta[2]) < CONV_THRESH)
                     break;
-                }
             }
         }
 
-        prev_rms = rms;
+        prev_rms = w_rms;
     }
 
     *x_cm_out = x;
