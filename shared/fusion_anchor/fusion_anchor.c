@@ -222,7 +222,7 @@ typedef struct {
     uint64_t child_rx_ref;  /* the RX instant the child reported (its clock)   */
     uint16_t ref_cycle;     /* the Root cycle id that RX instant refers to    */
     uint8_t  have;          /* a usable measurement was received              */
-    uint32_t corr_dtu;      /* smoothed propagation delay (DTU, Root's clock) */
+    uint32_t corr_dtu;      /* smoothed propagation delay (DTU, CHILD's clock) */
     uint8_t  corr_valid;    /* corr_dtu holds a measurement                   */
     uint32_t corr_count;    /* number of round trips folded into corr_dtu      */
 } TwrLinkState;
@@ -230,6 +230,76 @@ typedef struct {
 static TwrLinkState s_twr_link[ANCHOR_MAX_NEIGHBORS];
 static uint8_t      s_twr_tx_cursor = 0;   /* rotating child for corrections */
 static uint32_t     s_twr_last_tx_ms = 0;  /* when the last correction went out */
+
+/*============================================================================
+ * Device TX delay calibration (K_dev)
+ *
+ * The DW3000 does not put the preamble on the air at the programmed DX_TIME:
+ * there is a fixed pipeline delay (digital TX start + PA ramp) between the
+ * programmed instant and the antenna.  Call it δ_dev.  It is measured here as
+ *     δ = (actual TX timestamp) − (programmed instant)
+ * and averaged over the last frames.
+ *
+ * Why it matters (P0-5):
+ *   - In the DS-TWR round trip, using the nominal TX instants biases the
+ *     solved propagation delay by (δ_root + f·δ_child)/2.  That term is
+ *     PER CHILD, so it does not cancel in the Tag's TDOA — it stays in.
+ *   - In the Tag's time-of-arrival,  toa = δ_anchor + path,  so every
+ *     anchor contributes its own δ as a constant TDOA bias (≈ 30 cm per ns).
+ *
+ * Both disappear once the TX instant is corrected with the calibrated δ.
+ * Note that the programmed instant is truncated to the DX_TIME granularity
+ * of 256 DTU (4 ns); because the TDMA period (80 ms = 5,111,840,000 DTU) is
+ * an exact multiple of 256 DTU, every grid target shares the same truncation
+ * offset — so it is a constant and is absorbed by the calibration.
+ *==========================================================================*/
+#define TX_DELAY_SAMPLES  16u
+#define TX_DELAY_MIN      4u      /* frames needed before the average is used */
+static uint64_t s_tx_delay_buf[TX_DELAY_SAMPLES];
+static uint8_t  s_tx_delay_idx   = 0;
+static uint8_t  s_tx_delay_n     = 0;
+static uint32_t s_tx_delay_dtu   = 0;     /* averaged δ in DTU                */
+static uint8_t  s_tx_delay_valid = 0;
+
+/* Record one (actual − programmed) TX delay sample and refresh the average. */
+static void tx_delay_note(uint64_t delta_dtu)
+{
+    s_tx_delay_buf[s_tx_delay_idx] = delta_dtu;
+    s_tx_delay_idx = (uint8_t)((s_tx_delay_idx + 1u) % TX_DELAY_SAMPLES);
+    if (s_tx_delay_n < TX_DELAY_SAMPLES) s_tx_delay_n++;
+
+    uint64_t sum = 0;
+    uint8_t i;
+    for (i = 0; i < s_tx_delay_n; i++) sum += s_tx_delay_buf[i];
+    s_tx_delay_dtu = (uint32_t)(sum / s_tx_delay_n);
+    if (s_tx_delay_n >= TX_DELAY_MIN) s_tx_delay_valid = 1;
+}
+
+/*============================================================================
+ * Root side: the ACTUAL TX instant of the last few cycles, keyed by cycle id.
+ *
+ * The DS-TWR round trip needs the Root's real TX instant (T1).  Using the
+ * nominal grid instant instead leaks the grid placement error and δ_root
+ * straight into the solved propagation delay (both of them ~ the whole
+ * TDOA budget).  The history is short because the reference frame is at most
+ * a couple of cycles old.
+ *==========================================================================*/
+#define ROOT_TX_HIST 8u
+static uint64_t s_root_tx_ts[ROOT_TX_HIST];
+static uint16_t s_root_tx_cycle[ROOT_TX_HIST];
+static uint8_t  s_root_tx_idx = 0;
+
+/* Look up the Root's ACTUAL TX instant for a cycle id (0 = not in history). */
+static uint64_t root_tx_ts_for_cycle(uint16_t cycle)
+{
+    int i;
+    for (i = 0; i < ROOT_TX_HIST; i++) {
+        /* newest first */
+        uint8_t k = (uint8_t)((s_root_tx_idx + 1u + i) % ROOT_TX_HIST);
+        if (s_root_tx_ts[k] != 0 && s_root_tx_cycle[k] == cycle) return s_root_tx_ts[k];
+    }
+    return 0;
+}
 
 /* Manual network state: controlled by Gateway's NETWORK_START command */
 static NetworkState s_net_state = NET_IDLE;
@@ -748,9 +818,21 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * estimate, off by the SPI write + starttx latency ≈ 30 µs) and CLEAR the
      * PRECISE flag: receivers must not use imprecise timestamps for the
      * clock model or for the grid origin. */
-    if (scheduled_tx != 0) {
-        pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], scheduled_tx);
+    if (scheduled_tx != 0 && s_tx_delay_valid) {
+        /* The advertised TX instant is the programmed instant PLUS the
+         * calibrated device TX delay — that is the instant the preamble
+         * actually reaches the antenna, which is the only instant every
+         * receiver can compare against (clock model, DS-TWR round trip,
+         * Tag's TDOA).  Without the +δ the anchor's own TX latency shows up
+         * as a constant TDOA bias of δ (≈ 30 cm per ns). */
+        pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX],
+                      scheduled_tx + (uint64_t)s_tx_delay_dtu);
         pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_TS_PRECISE;
+    } else if (scheduled_tx != 0) {
+        /* Calibration not yet available (first frames after boot): advertise
+         * the programmed instant but do NOT claim it is precise — a δ-biased
+         * stamp must not enter the clock model. */
+        pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], scheduled_tx);
     } else {
         pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], now_sys_ext());
     }
@@ -864,8 +946,16 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         jitter_imm_cnt++;
         if (jitter_dtu > jitter_imm_max) jitter_imm_max = jitter_dtu;
     } else {
-        /* Delayed TX at the exact grid instant */
-        dwt_setdelayedtrxtime((uint32_t)(scheduled_tx >> 8));
+        /* Delayed TX at the exact grid instant.
+         *
+         * P0-2: dwt_setdelayedtrxtime() takes the 32-bit DX_TIME register,
+         * which holds device time bits [39:8].  scheduled_tx is a 64-bit
+         * extended timestamp, so shifting it down by 8 and truncating to
+         * 32 bits silently threw away the upper 8 bits — after one 40-bit
+         * wrap (17.2 s) the programmed instant was off by 2^32 DTU = 67 ms,
+         * which is larger than the whole TDMA slot.  Mask to 40 bits first
+         * (the device time counter is 40 bit), then shift. */
+        dwt_setdelayedtrxtime((uint32_t)((scheduled_tx & 0xFFFFFFFFFFULL) >> 8));
         ts_before = dwt_readsystimestamphi32();
         int ret = dwt_starttx(DWT_START_TX_DELAYED);
         ts_after = dwt_readsystimestamphi32();
@@ -912,6 +1002,24 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     }
     g_anchor.prev_tx_ts_ext = ts_raw;
 
+    /* ── K_dev: measure the device TX delay ───────────────────────────────
+     * ts_raw is the instant the preamble actually left the antenna,
+     * scheduled_tx the instant we programmed.  Both are on the same 64-bit
+     * extended timeline ✓.  The difference is the fixed pipeline delay
+     * (plus the constant DX_TIME truncation offset, see the note above). */
+    if (scheduled_tx != 0 && ts_raw > scheduled_tx) {
+        tx_delay_note(ts_raw - scheduled_tx);
+    }
+
+    /* Root side: remember the ACTUAL TX instant of this cycle — the DS-TWR
+     * round trip uses it as T1 (the nominal grid instant would leak the
+     * grid placement error into the solved propagation delay). */
+    if (g_anchor.cs_level == 0) {
+        s_root_tx_ts[s_root_tx_idx]    = ts_raw;
+        s_root_tx_cycle[s_root_tx_idx] = cycle_id;
+        s_root_tx_idx = (uint8_t)((s_root_tx_idx + 1u) % ROOT_TX_HIST);
+    }
+
     /* Grid accuracy check: how far did the ACTUAL TX instant land from the
      * programmed grid instant?  A CONSTANT offset is common-mode — every
      * anchor has it, so it cancels in the TDOA difference.  A varying one is
@@ -926,7 +1034,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         if ((s_tx_n % 25) == 0) {
             char dbg[72];
             sprintf(dbg, "TX_GRID err=%ld dtu (%.2f cm) spread=%ld dtu\r\n",
-                    (long)d, (double)d / 2131.4, (long)(s_tx_max - s_tx_min));
+                    (long)d, (double)d * CM_PER_DTU_F, (long)(s_tx_max - s_tx_min));
             DBG_PRINT(dbg);
         }
     }
@@ -988,7 +1096,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
  * delay late.  Without this every anchor contributes a systematic, distance
  * dependent bias to the Tag's TDOA solution.
  *
- * Frame (15 B):
+ * Frame (17 B):
  *   [0..1]  frame type 0x41 0x88
  *   [2]     sequence
  *   [3..4]  source EUI64 tag 0xCA 0xDE
@@ -996,10 +1104,10 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
  *   [7..8]  source rank (Root)
  *   [9]     FUNC_TWR_CORR
  *   [10..11]target rank (uint16 LE, redundant with dst, for validation)
- *   [12..13]propagation delay, cm (uint16 LE)
- *   [14]    quality / status
+ *   [12..15]propagation delay, DTU (uint32 LE, in the CHILD's clock)
+ *   [16]    quality / status
  *============================================================================*/
-static void anchor_tx_twr_corr(uint16_t dst_rank, uint16_t prop_cm, uint8_t quality)
+static void anchor_tx_twr_corr(uint16_t dst_rank, uint32_t corr_dtu, uint8_t quality)
 {
     uint8_t pkt[DL_TWR_CORR_LEN];
     memset(pkt, 0, sizeof(pkt));
@@ -1014,8 +1122,10 @@ static void anchor_tx_twr_corr(uint16_t dst_rank, uint16_t prop_cm, uint8_t qual
     pkt[9] = FUNC_TWR_CORR;
     pkt[DL_TWR_CORR_RANK_IDX]     = (uint8_t)(dst_rank & 0xFF);
     pkt[DL_TWR_CORR_RANK_IDX + 1] = (uint8_t)(dst_rank >> 8);
-    pkt[DL_TWR_CORR_PROP_IDX]     = (uint8_t)(prop_cm & 0xFF);
-    pkt[DL_TWR_CORR_PROP_IDX + 1] = (uint8_t)(prop_cm >> 8);
+    pkt[DL_TWR_CORR_PROP_IDX]     = (uint8_t)(corr_dtu & 0xFF);
+    pkt[DL_TWR_CORR_PROP_IDX + 1] = (uint8_t)((corr_dtu >> 8) & 0xFF);
+    pkt[DL_TWR_CORR_PROP_IDX + 2] = (uint8_t)((corr_dtu >> 16) & 0xFF);
+    pkt[DL_TWR_CORR_PROP_IDX + 3] = (uint8_t)((corr_dtu >> 24) & 0xFF);
     pkt[DL_TWR_CORR_QUAL_IDX] = quality;
 
     port_DisableEXT_IRQ();
@@ -1053,13 +1163,14 @@ static void anchor_twr_corr_poll(void)
         if (!g_anchor.neighbors[j].initialized) continue;
 
         anchor_tx_twr_corr(g_anchor.neighbors[j].neighbor_rank,
-                           (uint16_t)((L->corr_dtu + 1065u) / 2131u), 0x01);
+                           L->corr_dtu, 0x01);
         s_twr_tx_cursor = (uint8_t)((j + 1) % ANCHOR_MAX_NEIGHBORS);
         s_twr_last_tx_ms = now_ms;
-        { char dbg[48];
-          sprintf(dbg, "TWR_CORR TX R=%u %ucm\r\n",
+        { char dbg[56];
+          sprintf(dbg, "TWR_CORR TX R=%u %lu dtu (%.1f cm)\r\n",
                   (unsigned)g_anchor.neighbors[j].neighbor_rank,
-                  (unsigned)((L->corr_dtu + 1065u) / 2131u));
+                  (unsigned long)L->corr_dtu,
+                  (double)L->corr_dtu * CM_PER_DTU_F);
           DBG_PRINT(dbg); }
         return;
     }
@@ -1079,19 +1190,22 @@ static void anchor_handle_twr_corr(const uint8_t *rx_buf, uint32_t frame_len)
                    | ((uint16_t)rx_buf[DL_TWR_CORR_RANK_IDX + 1] << 8));
     if (tgt != g_anchor.rank) return;                     /* stale/other child */
 
-    uint16_t prop_cm = (uint16_t)(rx_buf[DL_TWR_CORR_PROP_IDX]
-                    | ((uint16_t)rx_buf[DL_TWR_CORR_PROP_IDX + 1] << 8));
+    uint32_t corr = (uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX]
+                  | ((uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX + 1] << 8)
+                  | ((uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX + 2] << 16)
+                  | ((uint32_t)rx_buf[DL_TWR_CORR_PROP_IDX + 3] << 24);
 
-    /* Sanity: 20 cm .. 10000 cm (100 m) */
-    if (prop_cm < 20u || prop_cm > 10000u) {
-        char dbg[40];
-        sprintf(dbg, "TWR_CORR bad prop=%ucm\r\n", (unsigned)prop_cm);
+    /* Sanity: 0.2 m .. 100 m, in DTU (1 m = 213.20 DTU) */
+    if (corr < DL_TWR_CORR_MIN_DTU || corr > DL_TWR_CORR_MAX_DTU) {
+        char dbg[48];
+        sprintf(dbg, "TWR_CORR bad prop=%lu dtu\r\n", (unsigned long)corr);
         DBG_PRINT(dbg);
         return;
     }
 
-    /* cm → DTU: 1 cm = 2131.4 DTU */
-    uint32_t prop = (uint32_t)prop_cm * 2131u;
+    /* The delay is already expressed in OUR clock units — the Root divides
+     * the solved path by f_root before sending it. */
+    uint32_t prop = corr;
 
     if (!s_twr_corr_valid) {
         s_twr_corr_dtu = prop;
@@ -1100,8 +1214,9 @@ static void anchor_handle_twr_corr(const uint8_t *rx_buf, uint32_t frame_len)
         /* IIR smoothing, same filter the Root uses on its own measurement. */
         s_twr_corr_dtu = (s_twr_corr_dtu * 3u + prop) / 4u;
     }
-    { char dbg[48];
-      sprintf(dbg, "TWR_CORR RX prop=%ucm\r\n", (unsigned)prop_cm);
+    { char dbg[56];
+      sprintf(dbg, "TWR_CORR RX prop=%lu dtu (%.1f cm)\r\n",
+              (unsigned long)prop, (double)prop * CM_PER_DTU_F);
       DBG_PRINT(dbg); }
 }
 
@@ -1509,6 +1624,19 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
         if (s_twr_corr_valid) {
             g_tdma_ref.base_origin -= (uint64_t)s_twr_corr_dtu;
         }
+        /* Subtract our OWN device TX delay as well.
+         *
+         * The grid instant is the instant the Root's beacon left the
+         * antenna; our own beacon has to leave the antenna at the SAME
+         * instant, otherwise every anchor is late by its own δ (≈ 30 cm per
+         * ns) and that bias lands straight in the Tag's TDOA.  Our
+         * programmed instant is δ_child earlier than the antenna instant,
+         * so the programmed instant has to be pulled back by δ_child —
+         * the advertised TX stamp then adds δ̂_child back and lands on the
+         * Root's antenna instant (up to the calibration residual). */
+        if (s_tx_delay_valid) {
+            g_tdma_ref.base_origin -= (uint64_t)s_tx_delay_dtu;
+        }
         g_tdma_ref.base_local_time = now_local;
 
         /* DS-TWR: remember the instant we received this frame and the cycle
@@ -1530,7 +1658,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                                         - g_tdma_ref.base_origin);
                 char dbg[64];
                 sprintf(dbg, "GRID_REF err=%ld dtu (%.1f cm) corr=%lu\r\n",
-                        (long)err, (double)err / 2131.4,
+                        (long)err, (double)err * CM_PER_DTU_F,
                         (unsigned long)(s_twr_corr_valid ? s_twr_corr_dtu : 0));
                 DBG_PRINT(dbg);
             }
@@ -1628,17 +1756,27 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      *   refc    = the cycle id of that Root frame (rx_ref_cycle)
      * and we know
      *   r2      = our own RX instant (rx_local)
-     *   T1      = our TX instant of the frame with cycle id refc
-     *             (the grid instant: base + refc × period)
+     *   T1      = our ACTUAL TX instant of the frame with cycle id refc
+     *             (recorded right after that transmission — the nominal
+     *              grid instant would leak the grid error into the path)
      *
      *   (r2 - T1) = prop_R->X + f_root * (T2 - r1) + prop_X->R
      *   => 2 * prop = (r2 - T1) - f_root * (T2 - r1)
      *
      * f_root is our model of the child's clock rate relative to ours
-     * (the clock_sync factor of this neighbour).  The child's own grid
-     * error cancels out of the equation, so the result is the propagation
-     * delay alone — which is exactly the bias we have to remove from the
-     * child's beacon placement.
+     * (the clock_sync factor of this neighbour).
+     *
+     * Which errors enter this equation:
+     *   - The CHILD's grid placement error does NOT enter: T2 is the TX
+     *     instant the child actually advertised (programmed + its calibrated
+     *     TX delay), so the round trip measures the physical round trip, not
+     *     the child's idea of the grid.  (What does enter is the residual of
+     *     the child's TX-delay calibration — see K_dev above.)
+     *   - The ROOT's grid placement error DOES enter through T1, so T1 must
+     *     be the Root's ACTUAL TX instant, not the nominal grid instant —
+     *     otherwise the grid error (and δ_root) leaks straight into the
+     *     solved propagation delay.  That is what root_tx_ts_for_cycle()
+     *     provides.
      *
      * All four timestamps are 40-bit on the wire; the differences are small
      * compared to 2^40, so a plain subtraction with wrap handling is exact. */
@@ -1658,9 +1796,16 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
         uint32_t delta = (uint32_t)((cur_k - (uint64_t)refc) & 0xFFFFu);
         if (delta <= 3) {
             uint64_t k_ref = cur_k - delta;
-            uint64_t t1 = s_root_grid_base + k_ref * period;   /* root clock */
 
-            if (r1 != 0 && t1 != 0) {
+            /* T1 = the Root's ACTUAL TX instant of that cycle (P0-5).  The
+             * nominal grid instant is only a fallback; a measurement that
+             * needs it is dropped, because the grid error would end up in
+             * the propagation delay. */
+            uint64_t t1 = root_tx_ts_for_cycle(refc);
+            bool t1_exact = (t1 != 0);
+            if (!t1_exact) t1 = s_root_grid_base + k_ref * period;
+
+            if (r1 != 0 && t1 != 0 && t1_exact) {
                 /* The child's turnaround, in the child's clock.  Both stamps
                  * are 40 bit, so the difference is modular: the 40-bit wrap
                  * (every ~17 s) is handled by the mask.  The turnaround is
@@ -1672,8 +1817,10 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                     && rx_local > t1) {
                     double rt = (double)(rx_local - t1) - f_root * (double)turn;
                     double p_root = rt * 0.5;      /* one-way delay, root clock */
-                    /* Plausible path: 0.2 m .. 100 m  (1 m = 213,140 DTU) */
-                    if (p_root > 42628.0 && p_root < 21314000.0) {
+                    /* Plausible path: 0.2 m .. 100 m
+                     * (1 m = 213.20 DTU -> 0.2 m = 42.6 DTU, 100 m = 21,320 DTU) */
+                    if (p_root > (double)DL_TWR_CORR_MIN_DTU
+                        && p_root < (double)DL_TWR_CORR_MAX_DTU) {
                         /* Convert to the child's clock units: a duration D_root
                          * corresponds to D_root / f_root in the child's clock. */
                         double p_child = p_root / f_root;
@@ -1696,7 +1843,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                         { char dbg[64];
                           sprintf(dbg, "TWR R=%u prop=%ucm\r\n",
                                   (unsigned)src_rank,
-                                  (unsigned)((uint32_t)p_root / 2131u));
+                                  (unsigned)((uint32_t)(p_root * CM_PER_DTU_F + 0.5)));
                           DBG_PRINT(dbg); }
                     }
                 }
