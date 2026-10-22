@@ -146,9 +146,10 @@ void reset_DWIC(void)
     /* Drive the RSTn pin low */
     HAL_GPIO_WritePin(DW_RESET_GPIO_Port, DW_RESET_Pin, GPIO_PIN_RESET);
 
-    usleep(1);
+    /* 10ms low pulse — visible on oscilloscope, satisfies DW3210 reset requirement */
+    usleep(10000);
 
-    /* Put the pin back to output open-drain (not active) */
+    /* Put the pin back to output push-pull and drive HIGH to release reset */
     setup_DWICRSTnIRQ(0);
     Sleep(2);
 }
@@ -313,6 +314,24 @@ void port_rf_switch_rx(void)
 {
     HAL_GPIO_WritePin(RF_SW_TX_EN_GPIO_Port, RF_SW_TX_EN_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(RF_SW_RX_EN_GPIO_Port, RF_SW_RX_EN_Pin, GPIO_PIN_SET);
+}
+
+/* @fn      port_rf_switch_disable
+ * @brief   Release PA6/PA7 (ENT/ENR) to Hi-Z so DW3210 has exclusive RF switch control.
+ *          Call this instead of port_rf_switch_init() when DW3210 will drive
+ *          RF_SWITCH_CTRL (0x70014) in auto mode.
+ *          PA6/PA7 become inputs with pull-down to avoid floating.
+ * */
+void port_rf_switch_disable(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct;
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = RF_SW_TX_EN_Pin | RF_SW_RX_EN_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+    HAL_GPIO_Init(RF_SW_TX_EN_GPIO_Port, &GPIO_InitStruct);
 }
 
 /****************************************************************************//**

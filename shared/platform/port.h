@@ -156,6 +156,7 @@ void uart_tx_data(uint8_t *data, uint16_t len);
 void port_rf_switch_init(void);
 void port_rf_switch_tx(void);
 void port_rf_switch_rx(void);
+void port_rf_switch_disable(void);
 
 /* Measurement / Wakeup pin toggles */
 #define SET_MEAS_PIN_IO_LOW     HAL_GPIO_WritePin(DW_MEAS_TIME_GPIO_Port, DW_MEAS_TIME_Pin, GPIO_PIN_RESET)
