@@ -32,6 +32,7 @@
 #include <shared_functions.h>
 #include <example_selection.h>
 #include "auto_anchor.h"
+#include "downlink_protocol.h"
 #include "gateway_cmd.h"
 
 #if defined(AUTO_ANCHOR_ENABLE)
@@ -111,8 +112,8 @@ static uint8_t match_sync[]   = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, 0xAA};
 /*============================================================================
  * TX frame buffers
  *============================================================================*/
-static uint8_t tx_sync[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0x01, 0x00, 0xAA, 0, 0, 0, 0, 0, 0, 0};
-#define SYNC_LEN 17u
+static uint8_t tx_sync[35] = {0x41, 0x88, 0, 0xCA, 0xDE, 0x01, 0x00, 0x01, 0x00, 0xAA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+#define SYNC_LEN 35u
 /* SYNC frame: [0-9]=IEEE hdr+FUNC, [10]=group, [11]=node, [12-16]=master_blink_rx_ts(40bit) */
 
 static uint8_t tx_resp[] = {
@@ -799,6 +800,17 @@ static void main_anchor_loop(void)
                 sync_rx_ts = (((uint64_t)(sync_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
                 tx_sync[SN_IDX] = last_blink_seq;
                 pack_40bit_ts(&tx_sync[12], blink_rx_ts);
+                /* Append anchor coordinates for Tag TDOA solve (DL_TS_COORD_IDX=29) */
+                {
+                    dl_anchor_entry_t my_coord;
+                    dl_get_anchor_coord((uint8_t)my_rank, &my_coord);
+                    tx_sync[17] = (uint8_t)( my_coord.x_cm        & 0xFF);
+                    tx_sync[18] = (uint8_t)((my_coord.x_cm >> 8)  & 0xFF);
+                    tx_sync[19] = (uint8_t)( my_coord.y_cm        & 0xFF);
+                    tx_sync[20] = (uint8_t)((my_coord.y_cm >> 8)  & 0xFF);
+                    tx_sync[21] = (uint8_t)( my_coord.z_cm        & 0xFF);
+                    tx_sync[22] = (uint8_t)((my_coord.z_cm >> 8)  & 0xFF);
+                }
                 if (do_delayed_tx(tx_sync, SYNC_LEN, 0) == DWT_SUCCESS)
                     test_run_info((unsigned char *)"SYNC TX");
                 else

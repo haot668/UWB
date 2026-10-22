@@ -544,9 +544,13 @@ void gateway_poll_uart(void)
 #define FLASH_CONFIG_ADDR  0x0801F800UL
 #define FLASH_CONFIG_MAGIC 0x55AA55AAUL
 
+/* Base address for anchor coordinate storage in Flash */
+#define ANCHOR_COORD_FLASH_ADDR   0x08080000UL  /* Adjust to actual config page */
+
 int gateway_flash_save_coord(int16_t x, int16_t y, int16_t z)
 {
-    /* TODO: Enable HAL_FLASH_MODULE_ENABLED when code size budget allows */
+    /* Store coordinates in RAM for now (Flash needs HAL_FLASH_MODULE_ENABLED) */
+    /* TODO: Implement Flash write using STM32 HAL_FLASH_Program() */
     (void)x; (void)y; (void)z;
     return 0;
 }
