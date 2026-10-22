@@ -229,22 +229,36 @@ extern "C" {
 #define DL_TS_FLAG_TX_TS_PRECISE  0x01u  /* tx_timestamp40 is exact (delayed TX)    */
 
 /*============================================================================
- * TWR correction frame (Root → Child unicast, 15 bytes)
+ * TWR correction frame (Root → Child unicast, 17 bytes)
  *   The Root solved the Root↔Child propagation delay from the round trip
  *   and tells the child how far its own beacon was off the grid.  The child
  *   shifts its next slot instant accordingly, which removes the systematic
  *   (root->child propagation delay) bias from the Tag's slot-compensated
  *   TDOA.
+ *
+ *   The delay is carried in DEVICE TIME UNITS, not centimetres: the DS-TWR
+ *   solver works entirely in DTU and a cm round-trip would throw away the
+ *   sub-cm resolution (1 cm = 2.132 DTU) — and it keeps the clock-domain
+ *   question out of the wire format.  The child's clock differs from the
+ *   Root's by f_root, so the value sent is the delay expressed in the
+ *   CHILD's clock (p_root / f_root), which is the unit the child needs to
+ *   shift its own grid origin.
+ *
  *   [0-9]   header (10 B, dst = child rank)
  *   [10-11] target_rank     (uint16 LE, the child this correction is for)
- *   [12-13] prop_cm         (uint16 LE, measured Root→Child path in cm)
- *   [14]    quality         (0..255, 255 = good)
+ *   [12-15] corr_dtu        (uint32 LE, Root→Child path delay in DTU)
+ *   [16]    quality         (0..255, 255 = good)
  *============================================================================*/
 #define FUNC_TWR_CORR           0xE7u   /* Root → Child unicast: path correction  */
-#define DL_TWR_CORR_LEN          15u
+#define DL_TWR_CORR_LEN          17u
 #define DL_TWR_CORR_RANK_IDX    10u
-#define DL_TWR_CORR_PROP_IDX    12u
-#define DL_TWR_CORR_QUAL_IDX    14u
+#define DL_TWR_CORR_PROP_IDX    12u    /* uint32 LE, delay in DTU (child clock)   */
+#define DL_TWR_CORR_QUAL_IDX    16u
+
+/* Plausible Root→Child path delay, in DTU (child clock):
+ *   0.2 m = 42.6 DTU .. 100 m = 21,320 DTU. */
+#define DL_TWR_CORR_MIN_DTU     40u
+#define DL_TWR_CORR_MAX_DTU     22000u
 
 /* Backwards-compatible alias — the cs_level byte moved to 27 (P0-1). */
 #define DL_TS_CS_LEVEL_IDX        DL_TS_LEVEL_IDX

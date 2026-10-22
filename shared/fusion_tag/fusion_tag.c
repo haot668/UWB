@@ -86,6 +86,7 @@ typedef struct {
     uint16_t           cycle_id;         /* TDMA cycle id carried in the beacon (P0-4) */
     uint8_t            slot;             /* TDMA slot index (255=unknown) */
     uint64_t           last_rx_ts;       /* Raw RX local timestamp for TDOA */
+    uint32_t           clock_reject_count; /* clock updates refused as outliers */
 } TagAnchorTracker;
 
 static TagAnchorTracker s_trackers[DL_MAX_TRACKED_ANCHORS];
@@ -169,12 +170,14 @@ static void tag_solve_and_report(void)
     #define DTU_PER_SLOT  ((int64_t)DL_SLOT_DTU_US * (int64_t)UUS_TO_DWT_TIME)
 
     /* Acceptance window for a TDOA difference.  Light covers 1 m in 3.3356 ns
-     * = 213,140 DTU, so ±100 m of path difference covers any indoor
-     * deployment.  The dominant error source (a beacon from a different TDMA
-     * cycle, 80 ms = 5.1 M DTU) is removed by the cycle-id pairing below,
-     * not by this window. */
-    #define TDOA_DTU_PER_METER  213140LL
-    #define TDOA_MAX_DTU        (100LL * TDOA_DTU_PER_METER)   /* 21,314,000 */
+     * = 213.20 DTU (1 DTU = 15.65 ps), so ±100 m of path difference covers
+     * any indoor deployment.  The dominant error source (a beacon from a
+     * different TDMA cycle, 80 ms = 5.1 M DTU) is removed by the cycle-id
+     * pairing below — and by this window as a second line of defence: with
+     * the old (1000x too large) constant the window was ±100 km and let
+     * cross-cycle frames through. */
+    #define TDOA_DTU_PER_METER  213LL
+    #define TDOA_MAX_DTU        (100LL * TDOA_DTU_PER_METER)   /* 21,300 */
 
     /* ── Slot spacing is defined in the ROOT's clock, not in ours ──────────
      * The anchors place their beacons on the Root's grid: anchor k transmits
@@ -343,8 +346,10 @@ static void tag_solve_and_report(void)
         }
     }
 
-    if (n_valid < 3) return;
-
+    /* P1-7: the diagnostics are printed BEFORE the "not enough anchors"
+     * early exit — a solve that is silently dropped looks exactly like a
+     * solve that never ran, and there is no way to tell the two apart on
+     * the bench. */
     /* Debug: print raw TDOA values */
     { char dbg[128]; int pos = 0;
       pos += sprintf(dbg + pos, "TDOA_DBG REF=R%d TOA=%llu",
@@ -366,6 +371,13 @@ static void tag_solve_and_report(void)
           n_valid, (unsigned)s_n_pair, (unsigned)s_n_cycle_mismatch,
           (unsigned)s_trackers[ref_idx].cycle_id);
       test_run_info((unsigned char *)dbg); }
+
+    if (n_valid < 3) {
+        { char dbg[64];
+          sprintf(dbg, "TSUM n=%d SKIP need 3 anchors\r\n", n_valid);
+          test_run_info((unsigned char *)dbg); }
+        return;
+    }
 
     float x_cm = 0, y_cm = 0, z_cm = 0, rms = 0;
     int ret = tdoa_solve(anchors, toa_dtu, (uint8_t)n_valid,
@@ -547,7 +559,16 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
 
     bool ok = clock_sync_update(&s_trackers[tracker_slot].sync, cfo_raw,
                                 rx_local, tx_remote, HAL_GetTick());
-    if (!ok && !force_accept) return;
+    /* P0-4: a refused clock update (outlier) does NOT invalidate the
+     * beacon — only the clock model.  Returning here used to make a live
+     * anchor disappear from the solve for one bad frame: no position
+     * update, no last_seen, no is_active → the TDOA solver lost an anchor
+     * and the whole position estimate collapsed onto the remaining ones.
+     * The update is simply not applied; the anchor keeps its place and is
+     * de-weighted through the quality instead. */
+    if (!ok && !force_accept) {
+        s_trackers[tracker_slot].clock_reject_count++;
+    }
 
     /* Debug: print raw RX data + Kalman state for first 10 frames per tracker */
     {
@@ -596,6 +617,13 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     s_trackers[tracker_slot].quality           = s_trackers[tracker_slot].sync.quality;
     s_trackers[tracker_slot].last_seen_ms      = HAL_GetTick();
     s_trackers[tracker_slot].is_active         = 1;
+
+    /* P0-4: de-weight an anchor whose clock update was refused, instead of
+     * dropping it.  The quality feeds the reference-anchor selection, so a
+     * single outlier lowers the anchor's influence without removing it. */
+    if (!ok && !force_accept) {
+        s_trackers[tracker_slot].quality *= 0.5f;
+    }
 
     /* The Root (cs_level = 0) owns the grid the other anchors are placed on,
      * so its clock is the reference for the slot spacing.  Our clock_sync
