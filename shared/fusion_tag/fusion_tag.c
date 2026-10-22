@@ -140,6 +140,31 @@ static uint16_t s_root_rank      = 0;
 static double   s_root_rate      = 1.0;    /* (our clock)/(Root's clock)       */
 static uint8_t  s_root_rate_valid = 0;
 
+/* P1-4: independent Root-rate estimator.
+ *
+ * The Root's clock rate is needed to express a slot duration in OUR clock
+ * (the slot compensation).  Taking it from the clock-sync filter's factor
+ * ties it to the outlier gate: a Root frame that the filter rejects does
+ * not update the factor, so the rate freezes — and a frozen rate is
+ * exactly what the slot compensation must not use.
+ *
+ * The rate is therefore measured here, on its own channel, straight from
+ * the interval between two successive Root beacons:
+ *
+ *     rate = (rx_local[n] - rx_local[n-1]) / (tx_remote[n] - tx_remote[n-1])
+ *
+ * Both intervals are exact (the two frames' own TX and RX instants), so a
+ * single cycle already yields the ratio; the median over the last few
+ * cycles removes the jitter of a single frame.  This channel is updated on
+ * EVERY Root frame — accepted or rejected by the clock filter. */
+#define TAG_RATE_SAMPLES 5
+static double   s_rate_buf[TAG_RATE_SAMPLES];
+static uint8_t  s_rate_n    = 0;   /* valid entries in the ring           */
+static uint8_t  s_rate_idx  = 0;   /* next slot to write                    */
+static uint64_t s_rate_rx_prev = 0;
+static uint64_t s_rate_tx_prev = 0;
+static uint8_t  s_rate_have_prev = 0;
+
 /* P1-2: the Root's slot-compensated TOA of the cycle currently in flight.
  * The Root transmits in slot 0, so its beacon of a cycle always arrives
  * before the other anchors' beacons of the same cycle — which is what
@@ -758,9 +783,49 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * that the slot compensation needs (see the TDOA block). */
     if (frame_len >= DL_TS_LEVEL_IDX + 1 && rx_buf[DL_TS_LEVEL_IDX] == 0) {
         s_root_rank = src_rank;
-        s_root_rate = s_trackers[tracker_slot].sync.factor;
-        s_root_rate_valid = (s_trackers[tracker_slot].sync.update_count >= 8)
-                            ? 1 : 0;
+
+        /* P1-4: the Root's clock rate on its own channel (see
+         * s_rate_buf).  Updated on every Root frame, outlier or not. */
+        {
+            uint64_t d_rx = rx_local - s_rate_rx_prev;
+            uint64_t d_tx = (tx_remote - s_rate_tx_prev) & 0xFFFFFFFFFFULL;
+            if (s_rate_have_prev && d_tx > 0u && d_rx > 0u
+                && d_tx < (1ULL << 30) && d_rx < (1ULL << 30)) {
+                double r = (double)d_rx / (double)d_tx;
+                /* A cycle is 80 ms; anything outside 1 % is not a clock
+                 * ratio but a lost or duplicated frame. */
+                if (r > 0.99 && r < 1.01) {
+                    s_rate_buf[s_rate_idx] = r;
+                    s_rate_idx = (uint8_t)((s_rate_idx + 1u) % TAG_RATE_SAMPLES);
+                    if (s_rate_n < TAG_RATE_SAMPLES) s_rate_n++;
+                }
+            }
+            s_rate_rx_prev = rx_local;
+            s_rate_tx_prev = tx_remote;
+            s_rate_have_prev = 1;
+        }
+        if (s_rate_n >= 3u) {
+            /* Median of the last cycles (insertion sort, n <= 5). */
+            double tmp[TAG_RATE_SAMPLES];
+            uint8_t i, j;
+            for (i = 0; i < s_rate_n; i++) tmp[i] = s_rate_buf[i];
+            for (i = 1; i < s_rate_n; i++) {
+                double v = tmp[i];
+                for (j = i; j > 0u && tmp[j - 1u] > v; j--) tmp[j] = tmp[j - 1u];
+                tmp[j] = v;
+            }
+            s_root_rate = tmp[s_rate_n / 2u];
+            s_root_rate_valid = 1;
+        } else if (s_rate_n > 0u) {
+            s_root_rate = s_rate_buf[0];
+            s_root_rate_valid = 1;
+        } else {
+            /* Nothing measured yet — fall back to the clock filter's factor
+             * (which needs a few updates before it is trustworthy). */
+            s_root_rate = s_trackers[tracker_slot].sync.factor;
+            s_root_rate_valid = (s_trackers[tracker_slot].sync.update_count >= 8)
+                                ? 1 : 0;
+        }
     }
 
     /* ── P1-2: TDOA against the Root, averaged over several cycles ───────
