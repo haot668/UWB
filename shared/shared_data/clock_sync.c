@@ -43,6 +43,9 @@ void clock_sync_init(AnchorClockSync *s,
     s->freeze_count     = 0;
     s->dly_fail_count   = 0;
 
+    s->ref_tx = 0;
+    s->ref_rx = 0;
+
     s->rate_head    = 0;
     s->rate_samples = 0;
     s->innov_abs_avg = 0.0;
@@ -329,30 +332,45 @@ bool clock_sync_update(AnchorClockSync *s,
         s->stable_count = 0;
     }
 
-    /* ── 5) Offset (RC), maintained on DIFFERENCES ────────────────────────
-     * offset_dtu represents local_dt - remote_dt.  Updating it with the
-     * inter-sample differences keeps the factor error from being multiplied
-     * by the absolute timestamp (see the header for the numbers).
+    /* ── 5) Offset (RC), maintained RELATIVE to a reference sample ───────
+     * The model is
      *
-     * The incremental form cannot follow a CHANGE of the factor: the
-     * absolute offset shifts by Δfactor × tx_absolute (1 ppb at 3e11 DTU is
-     * already 300 DTU = 14 cm), and while the factor is still wrong the
-     * incremental form even runs away (it accumulates the mismatch instead
-     * of correcting it).  Whenever the factor moves noticeably the offset
-     * is therefore re-anchored with the absolute form, which is accurate as
-     * soon as the factor itself is trustworthy. */
-    bool reanchor = (fabs(K * applied) > CS_FACTOR_REANCHOR);
-    if (s->update_count == 0 || reanchor) {
-        s->offset_dtu = (double)rx_local - s->factor * (double)tx_remote;
-    } else {
-        double d_rx = (double)(rx_local - s->last_local_rx_ts);
-        double d_tx = (double)(int64_t)((tx_remote - s->last_remote_tx_ts)
-                                        & 0xFFFFFFFFFFULL);
-        /* P1-6: the old "if (d_tx > 8.0e12) d_tx -= 1.099511627776e12" was
-         * dead code — the 40-bit mask above already handles the wrap
-         * (2^40 = 1.0995e12), the mask is exact for any window. */
-        s->offset_dtu += s->rc_alpha * (d_rx - s->factor * d_tx);
+     *      local(remote) = ref_rx + factor * (remote - ref_tx)
+     *
+     * and offset_dtu is that model written absolutely
+     * (offset_dtu = ref_rx - factor * ref_tx), so that the consumers'
+     * formula  local = factor * ts + offset_dtu  stays valid.
+     *
+     * P0-6: with the ABSOLUTE form (offset = rx_local - factor * tx_remote)
+     * the model error is  factor_error * tx_absolute  — the remote
+     * timestamp grows without bound, so a link that has been up for
+     * 10 minutes carries metres of offset error (0.2 ppb x 3.8e13 DTU =
+     * 7.6 m), and the incremental update cannot repair it either (a
+     * constant offset error is invisible in the differences).
+     * With the reference form the factor error is only multiplied by the
+     * ELAPSED time since the reference, which CS_REF_MAX_AGE_DTU bounds
+     * (0.47 s -> 6 DTU at 0.2 ppb).
+     *
+     * The reference is moved forward - WITH continuity, so that the model
+     * does not jump - whenever it has grown too old. */
+    if (s->update_count == 0) {
+        s->ref_tx = tx_remote;
+        s->ref_rx = rx_local;
     }
+    /* Δ to the reference: modular (40 bit), and always far below the wrap
+     * period because the reference is refreshed every CS_REF_MAX_AGE_DTU. */
+    double d_tx_ref = (double)((tx_remote - s->ref_tx) & 0xFFFFFFFFFFULL);
+    double pred = (double)s->ref_rx + s->factor * d_tx_ref;
+    /* P1-6: the old "if (d_tx > 8.0e12) d_tx -= 1.099511627776e12" was
+     * dead code — the 40-bit mask above already handles the wrap
+     * (2^40 = 1.0995e12), the mask is exact for any window. */
+    s->ref_rx += s->rc_alpha * ((double)rx_local - pred);
+    if (d_tx_ref > CS_REF_MAX_AGE_DTU) {
+        /* Move the reference forward, keeping the model continuous. */
+        s->ref_rx += s->factor * d_tx_ref;
+        s->ref_tx  = tx_remote;
+    }
+    s->offset_dtu = (double)s->ref_rx - s->factor * (double)s->ref_tx;
 
     /* ── 6) Bookkeeping ──────────────────────────────────────────────────── */
     s->last_remote_tx_ts = tx_remote;

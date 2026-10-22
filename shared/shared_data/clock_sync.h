@@ -81,6 +81,24 @@
  * (1 ppb — the incremental offset update cannot follow a factor change). */
 #define CS_FACTOR_REANCHOR      1e-9
 
+/* Age limit of the offset reference point (P0-6).
+ *
+ * The clock model is kept RELATIVE to a reference sample:
+ *
+ *      local(remote) = ref_rx + factor * (remote - ref_tx)
+ *
+ * With the absolute form (offset = rx_local - factor * tx_remote) the
+ * model error is  factor_error * tx_absolute: the remote timestamp grows
+ * without bound, so the offset of a link that has been up for 10 minutes
+ * would already carry metres of error (0.2 ppb x 3.8e13 DTU = 7.6 m).
+ * With the reference form the factor error is only multiplied by the
+ * ELAPSED time since the reference - which is what this limit bounds.
+ *
+ * 3e10 DTU = 0.47 s at 80 ms frames: the factor error (0.2 ppb) then
+ * contributes 6 DTU (2.8 cm), and the reference is moved forward with
+ * continuity, so the refresh itself costs nothing. */
+#define CS_REF_MAX_AGE_DTU      3.0e10
+
 /* Sample-level sanity gate (DTU).  For two static anchors the interval
  * residual  d_rx - factor * d_tx  is the change of the path length, i.e.
  * essentially zero.  A frame with a corrupt timestamp breaks it by
@@ -140,6 +158,14 @@ typedef struct {
      * so once the window was "full" it degenerated to a two-sample
      * difference (80 ms) — 16x worse than the intended 1 ppb, i.e. a slot
      * placement error of ~30 cm. */
+    /* Offset reference point (P0-6): the model is
+     *      local(remote) = ref_rx + factor * (remote - ref_tx)
+     * and offset_dtu is that model expressed absolutely:
+     *      offset_dtu = ref_rx - factor * ref_tx
+     * so the consumers' formula (factor * ts + offset_dtu) stays valid. */
+    uint64_t ref_tx;             /* remote stamp of the reference sample     */
+    uint64_t ref_rx;             /* local stamp of the reference sample      */
+
     uint64_t rate_tx[CS_RATE_WINDOW_SAMPLES];  /* remote TX stamps         */
     uint64_t rate_rx[CS_RATE_WINDOW_SAMPLES];  /* local RX stamps          */
     uint8_t  rate_head;         /* index of the next write                 */
