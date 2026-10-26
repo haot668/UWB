@@ -387,6 +387,80 @@ def _geom_warnings(items):
     return warns
 
 
+# P2-2: the order of the roster IS the order of the slots.
+#
+# The slot compensation multiplies the slot index by the slot period, so the
+# residual of a pair of anchors grows with their slot-index distance:
+#   (slot_k - slot_j) * 6.25 ms * 20 ppm = 3.75 cm per slot,
+# i.e. up to 26 cm over the full 7-slot span.  Which anchor sits in which
+# slot is decided by the order of the roster, and the operator used to get
+# that order by ticking the checkboxes — pure accident.  Anchors that stand
+# next to each other should be given neighbouring slots, so that the pair
+# that dominates the local accuracy of the solve keeps a small index
+# distance.  These are the rules the netstart dialog offers.
+SLOT_ORDER_MODES = (
+    "按到 Root 距离",
+    "按极角(绕 Root)",
+    "按 X 坐标",
+    "按 Y 坐标",
+    "按 Rank",
+)
+
+
+def _anchor_coord_map():
+    """rank -> (x_m, y_m) for every anchor that has a coordinate."""
+    out = {}
+    for _uid, d in S.devices.items():
+        if d.get("type") != "ANCHOR":
+            continue
+        r = int(d.get("rank") or 0)
+        if r <= 0:
+            continue
+        if d.get("coord_ok") and d.get("ax") is not None:
+            out[r] = (float(d["ax"]), float(d["ay"]))
+    return out
+
+
+def _sort_roster_members(members, mode, coords, root_rank):
+    """Order the roster members — the order becomes the slot order.
+
+    members : list of ranks (the Root is NOT in the list)
+    mode    : one of SLOT_ORDER_MODES
+    coords  : rank -> (x_m, y_m)
+    root_rank : the rank of the Root
+    """
+    members = list(members)
+    if not members:
+        return members
+    rx, ry = coords.get(root_rank, (0.0, 0.0))
+
+    def k_dist(r):
+        x, y = coords.get(r, (rx, ry))
+        return ((x - rx) ** 2 + (y - ry) ** 2, r)
+
+    def k_angle(r):
+        x, y = coords.get(r, (rx, ry))
+        return (math.atan2(y - ry, x - rx), r)
+
+    def k_x(r):
+        return (coords.get(r, (0.0, 0.0))[0], r)
+
+    def k_y(r):
+        return (coords.get(r, (0.0, 0.0))[1], r)
+
+    if mode == "按到 Root 距离":
+        members.sort(key=k_dist)
+    elif mode == "按极角(绕 Root)":
+        members.sort(key=k_angle)
+    elif mode == "按 X 坐标":
+        members.sort(key=k_x)
+    elif mode == "按 Y 坐标":
+        members.sort(key=k_y)
+    else:
+        members.sort()
+    return members
+
+
 def anchor_net_state(d):
     """The network state of an anchor, for the map and the device card.
 
@@ -1929,6 +2003,44 @@ def build_settings():
                            state="normal" if has_coord else "disabled",
                            disabledforeground=C["muted"]).pack(side=tk.LEFT, padx=8)
 
+        # --- P2-2: the slot order -------------------------------------
+        # The order of the roster is the order of the slots on the grid, so
+        # the operator picks it explicitly instead of getting it by
+        # accident from the order the checkboxes were ticked in.
+        order_row = tk.Frame(body, bg=C["surface"], highlightthickness=1,
+                             highlightbackground=C["border"])
+        order_row.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(order_row, text="  槽位顺序", bg=C["surface"], fg=C["accent"],
+                 font=("Consolas", 11, "bold")).pack(side=tk.LEFT, padx=12, pady=9)
+        order_mode = tk.StringVar(value=SLOT_ORDER_MODES[0])
+        ttk.Combobox(order_row, textvariable=order_mode, values=SLOT_ORDER_MODES,
+                     state="readonly", width=14, font=("Segoe UI", 10)
+                     ).pack(side=tk.LEFT, padx=6)
+        order_preview = tk.StringVar(value="")
+        tk.Label(order_row, textvariable=order_preview, bg=C["surface"],
+                 fg=C["text"], font=("Consolas", 10)).pack(side=tk.LEFT, padx=10)
+
+        def _current_order():
+            """The roster in slot order: the Root first, then the members
+            sorted by the selected rule."""
+            root_r = int(selected_root.get() or 0)
+            members = [r for r, var in sorted(participate.items())
+                       if var.get() and r != root_r]
+            return [root_r] + _sort_roster_members(members, order_mode.get(),
+                                                    _anchor_coord_map(), root_r)
+
+        def _update_order_preview():
+            try:
+                order_preview.set(" → ".join(f"R{r}" for r in _current_order() if r))
+            except Exception:
+                order_preview.set("")
+
+        order_mode.trace_add("write", lambda *a: _update_order_preview())
+        selected_root.trace_add("write", lambda *a: _update_order_preview())
+        for _var in participate.values():
+            _var.trace_add("write", lambda *a: _update_order_preview())
+        _update_order_preview()
+
         # --- Manual rank entry (fallback when no anchor was discovered) ---
         manual = tk.Frame(body, bg=C["surface"], highlightthickness=1,
                           highlightbackground=C["border"])
@@ -1971,10 +2083,14 @@ def build_settings():
             # the operator ticked.  The gateway broadcasts it with the
             # NETWORK_START frame so that all anchors know the full network
             # and the Root can report who is missing.
-            roster = [root_rank]
-            for rank, var in sorted(participate.items()):
-                if var.get() and rank != root_rank and rank not in roster:
-                    roster.append(rank)
+            # P2-2: the roster order IS the slot order on the grid, so the
+            # members are sorted by the rule the operator chose in the
+            # dialog — spatially close anchors get neighbouring slots.
+            coords_all = _anchor_coord_map()
+            members = [r for r, var in sorted(participate.items())
+                       if var.get() and r != root_rank]
+            roster = [root_rank] + _sort_roster_members(
+                members, order_mode.get(), coords_all, root_rank)
             if len(roster) < NET_MIN_PARTICIPANTS:
                 if not messagebox.askyesno("开始组网",
                         f"当前名单只有 {len(roster)} 个基站。\n\n"
@@ -1995,17 +2111,14 @@ def build_settings():
             # Every member of the roster must have a coordinate.  This is an
             # ERROR, not a warning: without it the TDOA solve would use
             # (0,0) for that anchor and pull the answer towards the origin.
-            coords = {}
+            coords = coords_all
             known_ranks = set()
             for uid, d in S.devices.items():
                 if d.get("type") != "ANCHOR":
                     continue
                 r = int(d.get("rank") or 0)
-                if r <= 0:
-                    continue
-                known_ranks.add(r)
-                if d.get("coord_ok") and d.get("ax") is not None:
-                    coords[r] = (float(d["ax"]), float(d["ay"]))
+                if r > 0:
+                    known_ranks.add(r)
             missing = [r for r in roster if r in known_ranks and r not in coords]
             if missing:
                 messagebox.showerror("开始组网",
@@ -2040,7 +2153,8 @@ def build_settings():
             S.net_root_rank = root_rank
             S.net_missing_ranks = set()
             send_cmd("AT+NETSTART=" + str(root_rank) + "," + ",".join(str(r) for r in roster[1:]))
-            set_status(f"正在组网 — Root=R{root_rank}，参与基站 {len(roster)} 个...", "info")
+            set_status(f"正在组网 — Root=R{root_rank}，参与基站 {len(roster)} 个"
+                       f"（槽位顺序 {'→'.join(f'R{r}' for r in roster)}）...", "info")
         tk.Button(bf, text="✓ 开始组网", bg=C["green"], fg="#ffffff",
                   font=("Segoe UI", 11, "bold"), bd=0, relief="flat",
                   padx=22, pady=7, cursor="hand2",
