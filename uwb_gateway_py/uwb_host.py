@@ -191,6 +191,9 @@ def parse_line(line: str):
     elif head == "+COORD" and len(parts) >= 5:
         # AT+COORD? read response — metres, like +COORDAck (P1-3)
         handle_coord(parts)
+    elif head == "+COORDERR" and len(parts) >= 2:
+        # P1-2: the anchor did not answer a coordinate query
+        handle_coord_err(parts)
     elif head == "+COORD_ERR" and len(parts) >= 2:
         uid = parts[1].strip()
         label = get_label(uid)
@@ -776,6 +779,133 @@ def handle_pos(parts):
     if len(d["trail"]) > 300:
         d["trail"].pop(0)
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  P1-2: the coordinate read-back
+#
+#  The coordinate is the ONE thing the TDOA solve depends on, and it lives
+#  on the anchor — the host's copy is only what it *believes* the anchor
+#  holds.  Before a network is started the host therefore asks every anchor
+#  what it actually has (AT+COORD? → the gateway queries the anchor over
+#  UWB) and compares the two.  A mismatch is not cosmetic: the anchors
+#  would solve against a coordinate that nobody has verified.
+#
+#  The coordinate of an anchor is lost on reboot (it lives in the anchor's
+#  RAM only), so this check is what makes that visible instead of letting
+#  the network silently solve against (0,0).
+# ═══════════════════════════════════════════════════════════════════════════
+def coord_check_begin(expected, timeout_ms=15000):
+    """Ask every anchor for its coordinate.
+
+    expected : {uid: (x_m, y_m, z_m)} — the host's own values
+    The result is delivered to S._coord_check_cb as a list of
+    (uid, expected, got); got is None when the anchor did not answer.
+    """
+    S._coord_check = {
+        "expect": dict(expected),
+        "got": {},
+        "pending": set(expected.keys()),
+        "queue": list(expected.keys()),
+        "timer": None,
+    }
+    S._coord_check["timer"] = root.after(timeout_ms, coord_check_finish)
+    _coord_check_next()
+
+
+def _coord_check_next():
+    """Ask the next anchor.
+
+    One query at a time: the gateway blocks for a few hundred milliseconds
+    while it waits for an anchor to answer, and asking the whole roster in
+    one go would pile every command into the gateway's UART ring at once.
+    """
+    chk = getattr(S, "_coord_check", None)
+    if chk is None or not chk["queue"]:
+        return
+    uid = chk["queue"].pop(0)
+    send_cmd(f"AT+COORD?={uid}")
+
+
+def coord_check_finish():
+    """The read-back is complete (all the answers are in, or it timed out)."""
+    chk = getattr(S, "_coord_check", None)
+    if chk is None:
+        return
+    S._coord_check = None
+    if chk["timer"]:
+        try:
+            root.after_cancel(chk["timer"])
+        except Exception:
+            pass
+    diffs = []
+    for uid, exp in chk["expect"].items():
+        got = chk["got"].get(uid)
+        if got is None:
+            diffs.append((uid, exp, None))
+        elif (abs(got[0] - exp[0]) > 0.02
+              or abs(got[1] - exp[1]) > 0.02
+              or abs(got[2] - exp[2]) > 0.02):
+            diffs.append((uid, exp, got))
+    cb = getattr(S, "_coord_check_cb", None)
+    S._coord_check_cb = None
+    if cb:
+        cb(diffs)
+
+
+def handle_coord_err(parts):
+    """The anchor did not answer a coordinate query."""
+    uid = parts[1].strip()
+    chk = getattr(S, "_coord_check", None)
+    if chk and uid in chk["pending"]:
+        chk["got"][uid] = None
+        chk["pending"].discard(uid)
+        if not chk["pending"]:
+            root.after(0, coord_check_finish)
+        else:
+            _coord_check_next()
+        return
+    set_status(f"基站 {uid} 没有回答坐标查询", "warning")
+
+
+def coord_batch_write(pairs, timeout_ms=20000):
+    """Write coordinates to the anchors and wait for the acknowledgements.
+
+    pairs : {uid: (x_m, y_m, z_m)}
+    The result is delivered to S._coord_batch_cb as the set of uids that
+    acknowledged.
+    """
+    S._coord_batch = {"want": dict(pairs), "ok": {}, "timer": None}
+    S._coord_batch["timer"] = root.after(timeout_ms, coord_batch_finish)
+    _coord_batch_next()
+
+
+def _coord_batch_next():
+    """Write to the next anchor — one at a time, so that the gateway's UART
+    ring never holds more than one command."""
+    bat = getattr(S, "_coord_batch", None)
+    if bat is None or not bat["want"]:
+        return
+    uid = next(iter(bat["want"]))
+    x, y, z = bat["want"][uid]
+    send_cmd(f"AT+COORD={uid},{x:.2f},{y:.2f},{z:.2f}")
+
+
+def coord_batch_finish():
+    bat = getattr(S, "_coord_batch", None)
+    if bat is None:
+        return
+    S._coord_batch = None
+    if bat["timer"]:
+        try:
+            root.after_cancel(bat["timer"])
+        except Exception:
+            pass
+    acked = set(bat["ok"].keys())
+    cb = getattr(S, "_coord_batch_cb", None)
+    S._coord_batch_cb = None
+    if cb:
+        cb(acked)
+
+
 def handle_coord(parts):
     """Handle a coordinate line from the gateway.
 
@@ -786,6 +916,30 @@ def handle_coord(parts):
     """
     uid = parts[1].strip()
     x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+
+    # P1-2: a read-back is in progress — record the answer and do NOT touch
+    # the local model.  The whole point of the check is to COMPARE the two.
+    chk = getattr(S, "_coord_check", None)
+    if chk and uid in chk["pending"]:
+        chk["got"][uid] = (x, y, z)
+        chk["pending"].discard(uid)
+        if not chk["pending"]:
+            root.after(0, coord_check_finish)
+        else:
+            _coord_check_next()
+        return
+
+    # A batch write is in progress — collect the acknowledgements.
+    bat = getattr(S, "_coord_batch", None)
+    if bat and uid in bat["want"]:
+        bat["ok"][uid] = (x, y, z)
+        bat["want"].pop(uid, None)
+        if not bat["want"]:
+            root.after(0, coord_batch_finish)
+        else:
+            _coord_batch_next()
+        return
+
     old = S.devices.get(uid, {})
     old_x, old_y, old_z = old.get("ax"), old.get("ay"), old.get("az")
     if uid in S.devices:
@@ -2064,6 +2218,105 @@ def build_settings():
                   padx=20, pady=5, cursor="hand2",
                   activebackground=C["card"],
                   command=dlg.destroy).pack(side=tk.RIGHT, padx=3)
+        def _expected_coords(roster):
+            """{uid: (x, y, z)} — the host's own value for every roster member
+            the host knows and that has a coordinate."""
+            by_rank = {}
+            for uid, d in S.devices.items():
+                if d.get("type") != "ANCHOR":
+                    continue
+                r = int(d.get("rank") or 0)
+                if r > 0:
+                    by_rank[r] = uid
+            exp = {}
+            for r in roster:
+                uid = by_rank.get(r)
+                if not uid:
+                    continue
+                d = S.devices[uid]
+                if d.get("coord_ok") and d.get("ax") is not None:
+                    exp[uid] = (float(d["ax"]), float(d["ay"]),
+                                float(d.get("az") or 0.0))
+            return exp
+
+        def _dlg_alive():
+            """The operator may close the dialog while the read-back runs."""
+            try:
+                return bool(dlg.winfo_exists())
+            except Exception:
+                return False
+
+        def _send_netstart(roster, root_rank):
+            """Actually start the network."""
+            if _dlg_alive():
+                dlg.destroy()
+            S._netstart_btn = netstart_btn
+            netstart_btn.config(text="⏳ 组网中...", state="disabled", bg="#e6a800", fg="#1f2328")
+            S.net_roster = list(roster)
+            S.net_root_rank = root_rank
+            S.net_missing_ranks = set()
+            send_cmd("AT+NETSTART=" + str(root_rank) + "," + ",".join(str(r) for r in roster[1:]))
+            set_status(f"正在组网 — Root=R{root_rank}，参与基站 {len(roster)} 个"
+                       f"（槽位顺序 {'→'.join(f'R{r}' for r in roster)}）...", "info")
+
+        def _after_coord_write(acked, diffs, roster, root_rank):
+            """The re-write of the mismatched coordinates is done."""
+            if not _dlg_alive():
+                return
+            failed = [uid for uid, _exp, _got in diffs if uid not in acked]
+            if failed:
+                try:
+                    messagebox.showwarning("坐标写入未全部成功",
+                        "以下基站没有确认坐标写入：\n\n" +
+                        "\n".join(f"  {get_label(u)} ({u})" for u in failed) +
+                        "\n\n组网继续，但这些基站可能没有坐标。", parent=dlg)
+                except Exception:
+                    pass
+            elif acked:
+                set_status(f"坐标已重新写入 {len(acked)} 个基站", "success")
+            _send_netstart(roster, root_rank)
+
+        def _after_coord_check(diffs, roster, root_rank):
+            """The read-back is done: compare, then decide."""
+            if not _dlg_alive():
+                return          # the operator closed the dialog — stop here
+            if not diffs:
+                _send_netstart(roster, root_rank)
+                return
+            lines = []
+            for uid, exp, got in diffs:
+                name = get_label(uid)
+                if got is None:
+                    lines.append(f"  {name} ({uid})：基站没有回答")
+                else:
+                    lines.append(
+                        f"  {name} ({uid})：上位机 ({exp[0]:.2f}, {exp[1]:.2f}, {exp[2]:.2f}) m"
+                        f"  /  基站 ({got[0]:.2f}, {got[1]:.2f}, {got[2]:.2f}) m")
+            body = ("组网前从基站读回的坐标与上位机记录的不一致：\n\n" +
+                    "\n".join(lines) +
+                    "\n\nTDOA 解算用的是基站上保存的坐标，不一致时解算结果不可信。\n\n"
+                    "用上位机的坐标重新写入这些基站并继续组网吗？")
+            try:
+                rewrite = messagebox.askyesno("坐标核对不一致", body, parent=dlg)
+            except Exception:
+                rewrite = False
+            if rewrite:
+                pairs = {uid: exp for uid, exp, got in diffs}
+                S._coord_batch_cb = lambda acked: _after_coord_write(acked, diffs, roster, root_rank)
+                set_status(f"正在重新写入 {len(pairs)} 个基站的坐标…", "info")
+                coord_batch_write(pairs)
+                return
+            # The operator does not want to rewrite — ask once more, because
+            # this is the difference between a working network and a network
+            # that solves against the wrong coordinates.
+            try:
+                if not messagebox.askyesno("仍然组网？",
+                        "坐标不一致时解算结果不可信。仍然继续组网吗？", parent=dlg):
+                    return
+            except Exception:
+                return
+            _send_netstart(roster, root_rank)
+
         def _do_netstart():
             manual_txt = manual_rank_var.get().strip()
             if manual_txt:
@@ -2146,20 +2399,25 @@ def build_settings():
                         "\n".join("  • " + w for w in warns) +
                         "\n\n仍然继续组网吗？", parent=dlg):
                     return
-            dlg.destroy()
-            S._netstart_btn = netstart_btn
-            netstart_btn.config(text="⏳ 组网中...", state="disabled", bg="#e6a800", fg="#1f2328")
-            S.net_roster = list(roster)
-            S.net_root_rank = root_rank
-            S.net_missing_ranks = set()
-            send_cmd("AT+NETSTART=" + str(root_rank) + "," + ",".join(str(r) for r in roster[1:]))
-            set_status(f"正在组网 — Root=R{root_rank}，参与基站 {len(roster)} 个"
-                       f"（槽位顺序 {'→'.join(f'R{r}' for r in roster)}）...", "info")
-        tk.Button(bf, text="✓ 开始组网", bg=C["green"], fg="#ffffff",
-                  font=("Segoe UI", 11, "bold"), bd=0, relief="flat",
-                  padx=22, pady=7, cursor="hand2",
-                  activebackground="#218b21",
-                  command=_do_netstart).pack(side=tk.RIGHT, padx=6)
+            # ── P1-2: read the coordinates back FROM THE ANCHORS ────────
+            # The coordinate lives on the anchor — and only in its RAM, so
+            # it is gone after a reboot.  The host's own copy may therefore
+            # be stale, and the solve would quietly use the wrong (or zero)
+            # coordinate.  Ask the anchors themselves before starting.
+            expected = _expected_coords(roster)
+            if not expected:
+                _send_netstart(roster, root_rank)
+                return
+            ok_btn.config(state="disabled", text="核对坐标中...")
+            S._coord_check_cb = lambda diffs: _after_coord_check(diffs, roster, root_rank)
+            set_status("正在从基站读回坐标并核对…", "info")
+            coord_check_begin(expected)
+        ok_btn = tk.Button(bf, text="✓ 开始组网", bg=C["green"], fg="#ffffff",
+                           font=("Segoe UI", 11, "bold"), bd=0, relief="flat",
+                           padx=22, pady=7, cursor="hand2",
+                           activebackground="#218b21",
+                           command=_do_netstart)
+        ok_btn.pack(side=tk.RIGHT, padx=6)
 
     netstart_btn = tk.Button(net_row, text="开始组网", bg=C["card"], fg=C["text"],
                              font=("Segoe UI", 10), bd=1, relief="solid",
