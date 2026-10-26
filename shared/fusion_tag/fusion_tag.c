@@ -66,7 +66,35 @@ extern UART_HandleTypeDef huart2;
  *
  * The per-frame diagnostics are therefore sampled.  The per-solve summary
  * (TSUM) and the product line (P,SEQ,...) stay at full rate: they
- * describe the solution and are what the bench actually needs. */
+ * describe the solution and are what the bench actually needs.
+ *
+ * P2-5: sampling is not enough — a bench that wants ONE number does not
+ * want the other forty lines either, and every one of them is a blocking
+ * transmit that steals RX time from the beacon path.  So the diagnostics
+ * are behind a level:
+ *
+ *   0  the product line only (P,SEQ,...) — the default
+ *   1  + the per-solve state (TSUM, WAIT NET, TS_IMPRECISE, DESYNC, ...)
+ *   2  + the per-frame detail (RX_TS, CFO, TDOA_DBG, TSUM_CYC, RX_RAW)
+ *
+ * The gate is around the TRANSMIT, not around the formatting: the sprintf
+ * costs a couple of microseconds, the blocking transmit costs a
+ * millisecond — and the counters keep running either way, so switching the
+ * level does not change the sampling.
+ */
+#define TAG_DIAG_LEVEL  0
+
+#if TAG_DIAG_LEVEL >= 1
+#define TAG_DIAG_SOLVE(buf)  test_run_info((unsigned char *)(buf))
+#else
+#define TAG_DIAG_SOLVE(buf)  do { (void)(buf); } while (0)
+#endif
+
+#if TAG_DIAG_LEVEL >= 2
+#define TAG_DIAG_FRAME(buf)  test_run_info((unsigned char *)(buf))
+#else
+#define TAG_DIAG_FRAME(buf)  do { (void)(buf); } while (0)
+#endif
 #define TAG_DIAG_RX_EVERY      8u   /* RX_TS / CFO: 1 beacon in 8       */
 #define TAG_DIAG_DETAIL_EVERY  4u   /* TDOA_DBG / TSUM_CYC: 1 solve in 4 */
 
@@ -320,7 +348,7 @@ static void tag_solve_and_report(void)
           pos += sprintf(dbg + pos, "TSUM n_act=%d SKIP need 3 anchors", n_active);
           if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
           pos += sprintf(dbg + pos, "\r\n");
-          test_run_info((unsigned char *)dbg); }
+          TAG_DIAG_SOLVE(dbg); }
         return;
     }
 
@@ -560,7 +588,7 @@ static void tag_solve_and_report(void)
              * cycle instead of mixing cycles. */
             { char dbg[48];
               sprintf(dbg, "TDOA_CYCLE_WAIT n=%d\r\n", best_cnt_all);
-              test_run_info((unsigned char *)dbg); }
+              TAG_DIAG_SOLVE(dbg); }
             return;
         }
 
@@ -578,7 +606,7 @@ static void tag_solve_and_report(void)
              * would mix a slot-compensated anchor into the difference. */
             { char dbg[48];
               sprintf(dbg, "TDOA_CYCLE_WAIT n=%d\r\n", best_cnt_all);
-              test_run_info((unsigned char *)dbg); }
+              TAG_DIAG_SOLVE(dbg); }
             return;
         }
         toa_dtu[0] = s_trackers[ref_idx].last_rx_ts;
@@ -624,7 +652,7 @@ static void tag_solve_and_report(void)
               (long long)((int64_t)toa_dtu[i] - (int64_t)toa_dtu[0]));
       }
       pos += sprintf(dbg + pos, "\r\n");
-      test_run_info((unsigned char *)dbg); }
+      TAG_DIAG_FRAME(dbg); }
 
     /* P0-4 summary: how many pairs were formed and how many beacons had to
      * be dropped because they belonged to a different TDMA cycle.  A rising
@@ -637,7 +665,7 @@ static void tag_solve_and_report(void)
           s_trackers[ref_idx].rank);
       if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
       pos += sprintf(dbg + pos, " avg=%d\r\n", use_avg ? 1 : 0);
-      test_run_info((unsigned char *)dbg); }
+      TAG_DIAG_SOLVE(dbg); }
 
     /* Per-anchor cycle id of the selected set — the fastest way to see
      * which anchor is one round behind.  Sampled 1 solve in 4. */
@@ -650,12 +678,12 @@ static void tag_solve_and_report(void)
               s_trackers[idx].rank, (unsigned)s_trackers[idx].cycle_id);
       }
       pos += sprintf(dbg + pos, "\r\n");
-      test_run_info((unsigned char *)dbg); }
+      TAG_DIAG_FRAME(dbg); }
 
     if (n_valid < 3) {
         { char dbg[64];
           sprintf(dbg, "TSUM n=%d SKIP need 3 anchors\r\n", n_valid);
-          test_run_info((unsigned char *)dbg); }
+          TAG_DIAG_SOLVE(dbg); }
         return;
     }
 
@@ -676,7 +704,7 @@ static void tag_solve_and_report(void)
         }
         { char dbg[64];
           sprintf(dbg, "WAIT NET n=%d slot=%d\r\n", n_sel, wait_slot);
-          test_run_info((unsigned char *)dbg); }
+          TAG_DIAG_SOLVE(dbg); }
         return;
     }
 
@@ -884,7 +912,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         if ((s_n_imprecise++ % 20) == 0) {
             char dbg[48];
             sprintf(dbg, "TS_IMPRECISE R=%u dropped\r\n", src_rank);
-            test_run_info((unsigned char *)dbg);
+            TAG_DIAG_SOLVE(dbg);
         }
         return;
     }
@@ -906,7 +934,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
                 (unsigned long long)tx_remote,
                 (unsigned long long)rx_local,
                 (long long)(rx_local - s_last_rx));
-            test_run_info((unsigned char *)dbg);
+            TAG_DIAG_FRAME(dbg);
         }
         s_last_rx = rx_local;
     }
@@ -942,7 +970,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
             sprintf(dbg2, "CFO cfo_raw=%d factor_meas=%.9f\r\n",
                 cfo_raw, 1.0 + (double)cfo_raw / 67108864.0);
             if (cfo_raw != s_last_cfo || s_last_cfo == 0) {
-                test_run_info((unsigned char *)dbg2);
+                TAG_DIAG_FRAME(dbg2);
                 s_last_cfo = cfo_raw;
             }
         }
@@ -979,7 +1007,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
                 (double)(s->factor - 1.0) * 1e6,
                 s->offset_dtu,
                 s->quality);
-            test_run_info((unsigned char *)dbg);
+            TAG_DIAG_FRAME(dbg);
         }
     }
 
@@ -1001,7 +1029,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
             if ((now - s_last_coord_print[tracker_slot]) > 5000) {
                 s_last_coord_print[tracker_slot] = now;
                 char dbg[64]; sprintf(dbg, "ANCHOR_COORD R=%u X=%d Y=%d Z=%d\r\n", src_rank, x, y, z);
-                test_run_info((unsigned char *)dbg);
+                TAG_DIAG_SOLVE(dbg);
             }
         }
     }
@@ -1140,14 +1168,14 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
                           sprintf(dbg, "TAG_DESYNC R=%u d=%lld dtu (%.1f cm) EXCLUDED\r\n",
                                   t->rank, (long long)d_res,
                                   (double)d_res * CM_PER_DTU_F);
-                          test_run_info((unsigned char *)dbg); }
+                          TAG_DIAG_SOLVE(dbg); }
                     }
                 } else {
                     if (t->desynced) {
                         t->desynced = 0;
                         { char dbg[56];
                           sprintf(dbg, "TAG_DESYNC R=%u RECOVERED\r\n", t->rank);
-                          test_run_info((unsigned char *)dbg); }
+                          TAG_DIAG_SOLVE(dbg); }
                     }
                     t->desync_count = 0;
                 }
@@ -1430,7 +1458,7 @@ int fusion_tag(void)
                 (unsigned)s_n_report_skip,
                 (unsigned)s_tag_id);
             pos += sprintf(out + pos, "\r\n");
-            test_run_info((unsigned char *)out);
+            TAG_DIAG_SOLVE(out);
         }
     }
     return 0;
