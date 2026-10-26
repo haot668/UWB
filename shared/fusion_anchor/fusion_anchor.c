@@ -572,10 +572,73 @@ static uint8_t find_my_slot(uint16_t my_rank)
     return 255;
 }
 
-/* Root only: collect all discovered anchor ranks (from neighbors[]) and fill
+/*============================================================================
+ * Slot table from the participant roster (P2-7)
+ *
+ * The roster is the participant list the gateway sent together with
+ * NETWORK_START.  Every anchor holds the SAME list, so a rank's slot index
+ * is identical on every node and for the whole life of the network.
+ *
+ * WHY THIS MATTERS: the Tag compensates every beacon with
+ *     toa_equiv = rx_local - slot x 6.25 ms
+ * The slot is what tells the Tag HOW LATE the beacon was sent.  If the Root
+ * rebuilt the table from the neighbours it happened to hear, then ONE
+ * evicted or newly heard anchor shifts the slot of every anchor behind it
+ * — and the Tag compensates those beacons against the wrong slot instant,
+ * i.e. off by a multiple of 6.25 ms (a multiple of ~2 km of path).
+ *
+ * The table is therefore built from the roster: slot 0 = the Root, then the
+ * roster members in the roster's order.  Anchors that are heard but are NOT
+ * in the roster are APPENDED at the end, so an anchor that joined without
+ * being listed still gets a slot — appended, so it never shifts the slots
+ * of the roster members.
+ *
+ * Returns false when the roster cannot be used (empty) — the caller then
+ * keeps the neighbour-based table.
+ *==========================================================================*/
+static bool tdma_build_table_from_roster(void)
+{
+    uint16_t ranks[ANCHOR_MAX_SLOTS];
+    int count = 0;
+    int i, j;
+
+    if (s_roster_n == 0) return false;
+
+    /* Slot 0 belongs to the Root of the network. */
+    uint16_t root = s_net_root_rank;
+    if (root == 0) root = g_anchor.rank;
+    ranks[count++] = root;
+
+    /* The remaining roster members, in the roster's order. */
+    for (i = 0; i < (int)s_roster_n && count < ANCHOR_MAX_SLOTS; i++) {
+        uint16_t r = s_roster[i];
+        if (r == 0 || r == root) continue;
+        bool dup = false;
+        for (j = 0; j < count; j++) { if (ranks[j] == r) { dup = true; break; } }
+        if (!dup) ranks[count++] = r;
+    }
+
+    /* Anchors we hear that are not in the roster — appended, never inserted,
+     * so the slots of the roster members stay where they are. */
+    for (i = 0; i < ANCHOR_MAX_NEIGHBORS && count < ANCHOR_MAX_SLOTS; i++) {
+        if (!g_anchor.neighbors[i].initialized) continue;
+        uint16_t r = g_anchor.neighbors[i].neighbor_rank;
+        if (r == 0 || r == root) continue;
+        bool dup = false;
+        for (j = 0; j < count; j++) { if (ranks[j] == r) { dup = true; break; } }
+        if (!dup) ranks[count++] = r;
+    }
+
+    for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
+        g_anchor.slot_owners[i] = (i < count) ? ranks[i] : 0;
+    }
+    return true;
+}
+
+/* Fallback: collect all discovered anchor ranks (from neighbors[]) and fill
  * slot_owners[] in ascending rank order. Self (root rank) goes in slot 0.
- * Call this whenever a new neighbor is discovered or the topology changes. */
-static void tdma_build_table(void)
+ * Only used for a network that was started without a roster. */
+static void tdma_build_table_from_neighbors(void)
 {
     /* Collect up to ANCHOR_MAX_SLOTS unique ranks */
     uint16_t ranks[ANCHOR_MAX_SLOTS];
@@ -614,7 +677,19 @@ static void tdma_build_table(void)
     for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
         g_anchor.slot_owners[i] = (i < count) ? ranks[i] : 0;
     }
+}
 
+/* Root only: fill slot_owners[] — from the participant roster when there is
+ * one (stable slots, P2-7), otherwise from the discovered neighbours.
+ * Call this whenever a new neighbor is discovered or the topology changes. */
+static void tdma_build_table(void)
+{
+    /* P2-7: the Root takes its slots from the roster — they do not move
+     * while the network runs.  The neighbour-based table is only the
+     * fallback for a network that was started without a roster. */
+    if (g_anchor.cs_level == 0 && tdma_build_table_from_roster()) return;
+
+    tdma_build_table_from_neighbors();
     /* Update our own slot index — but only if Root has confirmed us.
      * During NET_WAIT_CONFIRM the Child is NOT yet in Root's slot_owners,
      * so find_my_slot() returns 255.
