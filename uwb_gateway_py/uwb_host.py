@@ -91,6 +91,10 @@ class State:
         self.net_roster: list[int] = []       # ranks taking part in the network
         self.net_missing_ranks: set[int] = set()  # roster members that never joined
         self.net_root_rank: int = 0
+        # rank -> how many anchors it hears.  The Root has to be heard by
+        # everybody, so this is its coverage — and therefore the measure the
+        # netstart dialog uses to pick a sensible default Root.
+        self.net_nbr_count: dict[int, int] = {}
 
         self.grid_w: float = 100.0
         self.grid_h: float = 100.0
@@ -337,6 +341,52 @@ def parse_line(line: str):
            and not line.startswith("L,") and not line.startswith("R,"):
             set_status(f"[GW] {line.strip()}", "info")
 
+# ── TDOA geometry self-check ────────────────────────────────────────────
+# The solve needs a non-degenerate geometry: at least NET_MIN_PARTICIPANTS
+# anchors, no two of them practically on top of each other, and not all of
+# them on one straight line — a pair a few centimetres apart contributes no
+# direction information, and a collinear layout leaves the TDOA unconstrained
+# in the direction perpendicular to the line.
+MIN_ANCHOR_SEP_M   = 0.50   # two anchors closer than this are "the same place"
+MIN_TRI_AREA_M2    = 0.05   # the best-conditioned triangle must have some area
+
+
+def _geom_warnings(items):
+    """items: list of (rank, x_m, y_m).  Returns a list of warning strings."""
+    warns = []
+    pts = [(int(r), float(x), float(y)) for r, x, y in items]
+    n = len(pts)
+    if n < 2:
+        return warns
+
+    # ── closest pair ──
+    min_d = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = math.hypot(pts[i][1] - pts[j][1], pts[i][2] - pts[j][2])
+            if min_d is None or d < min_d[0]:
+                min_d = (d, pts[i][0], pts[j][0])
+    if min_d and min_d[0] < MIN_ANCHOR_SEP_M:
+        warns.append(f"R{min_d[1]} 与 R{min_d[2]} 相距只有 {min_d[0]:.2f} m"
+                     f"（< {MIN_ANCHOR_SEP_M:.2f} m），距离过近的基站几乎不提供方向信息")
+
+    # ── collinearity: the best-conditioned triangle of all triples ──
+    best = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                ax = pts[j][1] - pts[i][1]; ay = pts[j][2] - pts[i][2]
+                bx = pts[k][1] - pts[i][1]; by = pts[k][2] - pts[i][2]
+                area = abs(ax * by - ay * bx) / 2.0
+                if area > best:
+                    best = area
+    if n >= 3 and best < MIN_TRI_AREA_M2:
+        warns.append(f"所有基站近似共线（最大三角形面积 {best:.3f} m² < "
+                     f"{MIN_TRI_AREA_M2:.3f} m²），"
+                     "垂直于该直线的方向上没有约束，解算精度会明显变差")
+    return warns
+
+
 def get_label(uid: str) -> str:
     """Return display label for a device."""
     dtype = S.devices.get(uid, {}).get("type", "")
@@ -513,6 +563,7 @@ def handle_netnbr(parts):
         n = int(parts[2].strip())
     except (ValueError, IndexError):
         return
+    S.net_nbr_count[rank] = n
     uid = f"{rank:04X}"
     if uid not in S.devices:
         S.devices[uid] = {"trail": [], "type": "ANCHOR", "rank": rank}
@@ -1704,24 +1755,41 @@ def build_settings():
         """
         if not (S.ser and S.ser.is_open):
             set_status("未连接", "warning"); return
-        # Collect online anchors as candidates for Root
+        # Collect online anchors as candidates for Root.
+        #
+        # P0-2: an anchor WITHOUT a coordinate cannot take part.  The TDOA
+        # solve needs the anchor positions; an anchor without one would be
+        # used as (0,0) and silently drag the solution towards the origin.
+        # Such an anchor is listed greyed out, cannot be ticked and cannot
+        # be chosen as Root.
         anchors = []
         for uid, d in S.devices.items():
             if d.get("type") == "ANCHOR" and d.get("online"):
                 label = get_label(uid)
-                coord = ""
-                if d.get("ax") is not None:
+                has_coord = bool(d.get("coord_ok")) and d.get("ax") is not None
+                if has_coord:
                     coord = f"({d['ax']:.2f}, {d['ay']:.2f}, {d['az']:.2f})m"
-                anchors.append((uid, label, coord, int(d.get("rank") or 0)))
+                else:
+                    coord = "未设坐标"
+                anchors.append((uid, label, coord, int(d.get("rank") or 0), has_coord))
         # Rank 0 is reserved for the gateway — an anchor without a valid rank
         # cannot be designated Root.
         anchors = [a for a in anchors if a[3] > 0]
         anchors.sort(key=lambda x: (x[3], x[0]))
+        # Only the anchors that have a coordinate are allowed to take part.
+        candidates = [a for a in anchors if a[4]]
+        if anchors and not candidates:
+            messagebox.showwarning("开始组网",
+                "所有在线基站都没有坐标，无法组网。\n\n"
+                "TDOA 解算必须知道每个基站的安装坐标，\n"
+                "请先在基站列表里为它们设置坐标。",
+                parent=root)
+            return
 
         dlg = tk.Toplevel(root)
         dlg.title("开始组网 — 选择 Root 基站")
-        dlg.geometry("550x520")
-        dlg.minsize(500, 440)
+        dlg.geometry("640x560")
+        dlg.minsize(590, 460)
         dlg.configure(bg=C["bg"])
         dlg.transient(root); dlg.grab_set()
 
@@ -1730,7 +1798,8 @@ def build_settings():
         hdr.grid_propagate(False)
         tk.Label(hdr, text="  ⚡  开始组网", bg=C["accent"], fg="#ffffff",
                  font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=18, pady=13)
-        tk.Label(hdr, text=f"{len(anchors)} 在线  ", bg=C["accent"], fg="#a5d6ff",
+        tk.Label(hdr, text=f"{len(candidates)}/{len(anchors)} 可参与  ",
+                 bg=C["accent"], fg="#a5d6ff",
                  font=("Segoe UI", 11)).pack(side=tk.RIGHT, padx=18, pady=13)
 
         body = tk.Frame(dlg, bg=C["bg"])
@@ -1742,19 +1811,37 @@ def build_settings():
         tk.Label(hint, text="  选择作为 Root（时钟源）的基站，组网后将由该基站统一广播时钟同步。",
                  bg=C["surface"], fg=C["text"], font=("Segoe UI", 10)).pack(
                      anchor="w", padx=12, pady=10)
+        tk.Label(hint, text="  没有坐标的基站不能参与组网（灰色行），请先设置坐标。",
+                 bg=C["surface"], fg=C["orange"], font=("Segoe UI", 10)).pack(
+                     anchor="w", padx=12, pady=(0, 10))
 
         card = tk.Frame(body, bg=C["surface"], highlightthickness=1,
                         highlightbackground=C["border"])
         card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         thdr = tk.Frame(card, bg=C["surface"])
         thdr.pack(fill=tk.X, padx=10, pady=(10, 4))
-        for txt, w in [("基站", 8), ("UID", 8), ("Rank", 7), ("坐标", 16), ("参与", 5), ("Root", 5)]:
+        for txt, w in [("基站", 8), ("UID", 8), ("Rank", 7), ("坐标", 16),
+                       ("覆盖", 5), ("参与", 5), ("Root", 5)]:
             tk.Label(thdr, text=txt, bg=C["surface"], fg=C["muted"],
                      font=("Segoe UI", 9, "bold"), width=w, anchor="w").pack(side=tk.LEFT, padx=2)
         tk.Frame(card, bg=C["border"], height=1).pack(fill=tk.X, padx=8)
 
         # Radio value IS the decimal rank — that is what goes on the air.
-        selected_root = tk.StringVar(value=str(anchors[0][3]) if anchors else "")
+        #
+        # P1-7: the default Root is the anchor with the best COVERAGE among
+        # the ones that have a coordinate.  The Root has to be heard by
+        # everybody, and the neighbour count the gateway reports (+NETNBR)
+        # is the only coverage measure available.  It is filled in during
+        # the network formation, so after the first attempt the dialog
+        # already pre-selects the better Root.
+        def _coverage(item):
+            return S.net_nbr_count.get(item[3], 0)
+
+        if candidates:
+            default_root = max(candidates, key=lambda a: (_coverage(a), -a[3]))
+            selected_root = tk.StringVar(value=str(default_root[3]))
+        else:
+            selected_root = tk.StringVar(value=str(anchors[0][3]) if anchors else "")
         # P1-1: the participant roster.  Every anchor must know the full list,
         # otherwise a Root that only hears half of the network can never
         # complete it — and nobody can tell which member is missing.
@@ -1764,26 +1851,38 @@ def build_settings():
             tk.Label(card, text="  未发现在线基站 — 请在下方手动输入 Root 的 Rank",
                      bg=C["surface"], fg=C["muted"],
                      font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=14)
-        for uid, label, coord, rank in anchors:
+        for uid, label, coord, rank, has_coord in anchors:
             row = tk.Frame(card, bg=C["surface"])
             row.pack(fill=tk.X, padx=10, pady=2)
-            tk.Label(row, text=label, bg=C["surface"], fg=C["text"],
+            tk.Label(row, text=label, bg=C["surface"],
+                     fg=C["text"] if has_coord else C["muted"],
                      font=("Consolas", 11, "bold"), width=8, anchor="w").pack(side=tk.LEFT, padx=2)
             tk.Label(row, text=uid, bg=C["surface"], fg=C["text"],
                      font=("Consolas", 10), width=8, anchor="w").pack(side=tk.LEFT, padx=2)
             tk.Label(row, text=str(rank), bg=C["surface"], fg=C["accent"],
                      font=("Consolas", 10, "bold"), width=7, anchor="w").pack(side=tk.LEFT, padx=2)
-            tk.Label(row, text=coord, bg=C["surface"], fg=C["muted"],
+            tk.Label(row, text=coord, bg=C["surface"],
+                     fg=C["text"] if has_coord else C["orange"],
                      font=("Consolas", 10), width=16, anchor="w").pack(side=tk.LEFT, padx=2)
-            pvar = tk.BooleanVar(value=True)
+            # Coverage = how many anchors this one hears (+NETNBR).
+            cov = S.net_nbr_count.get(rank)
+            tk.Label(row, text="—" if cov is None else str(cov), bg=C["surface"],
+                     fg=C["text"] if cov else C["muted"],
+                     font=("Consolas", 10), width=5, anchor="w").pack(side=tk.LEFT, padx=2)
+            # P0-2: an anchor without a coordinate cannot be ticked.
+            pvar = tk.BooleanVar(value=has_coord)
             participate[rank] = pvar
             tk.Checkbutton(row, variable=pvar, bg=C["surface"], fg=C["accent"],
                            selectcolor=C["surface"], activebackground=C["surface"],
-                           activeforeground=C["accent"]).pack(side=tk.LEFT, padx=2)
+                           activeforeground=C["accent"],
+                           state="normal" if has_coord else "disabled",
+                           disabledforeground=C["muted"]).pack(side=tk.LEFT, padx=2)
             tk.Radiobutton(row, variable=selected_root, value=str(rank),
                            bg=C["surface"], fg=C["accent"], selectcolor=C["surface"],
                            activebackground=C["surface"], activeforeground=C["accent"],
-                           font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=8)
+                           font=("Segoe UI", 10, "bold"),
+                           state="normal" if has_coord else "disabled",
+                           disabledforeground=C["muted"]).pack(side=tk.LEFT, padx=8)
 
         # --- Manual rank entry (fallback when no anchor was discovered) ---
         manual = tk.Frame(body, bg=C["surface"], highlightthickness=1,
@@ -1845,6 +1944,49 @@ def build_settings():
                         f"（1 个 Root + {NET_MAX_PARTICIPANTS - 1} 个子站），"
                         "超出的成员会被固件丢弃。\n"
                         "仍然继续组网吗？", parent=dlg):
+                    return
+
+            # ── P0-2: hard validation ────────────────────────────────────
+            # Every member of the roster must have a coordinate.  This is an
+            # ERROR, not a warning: without it the TDOA solve would use
+            # (0,0) for that anchor and pull the answer towards the origin.
+            coords = {}
+            known_ranks = set()
+            for uid, d in S.devices.items():
+                if d.get("type") != "ANCHOR":
+                    continue
+                r = int(d.get("rank") or 0)
+                if r <= 0:
+                    continue
+                known_ranks.add(r)
+                if d.get("coord_ok") and d.get("ax") is not None:
+                    coords[r] = (float(d["ax"]), float(d["ay"]))
+            missing = [r for r in roster if r in known_ranks and r not in coords]
+            if missing:
+                messagebox.showerror("开始组网",
+                    "以下参与基站没有坐标，无法组网：\n\n" +
+                    "\n".join(f"  R{r}" for r in missing) +
+                    "\n\nTDOA 解算必须知道每个基站的安装坐标。\n"
+                    "请先在基站列表里为它们设置坐标，或取消勾选。", parent=dlg)
+                return
+            # Members the host has never seen (e.g. a manually entered rank):
+            # their coordinates are unknown, so the geometry cannot be
+            # checked for them — say so instead of silently proceeding.
+            unknown = [r for r in roster if r not in known_ranks]
+            if unknown:
+                if not messagebox.askyesno("开始组网",
+                        "以下成员上位机没有发现，坐标未知：\n\n" +
+                        "\n".join(f"  R{r}" for r in unknown) +
+                        "\n\n无法校验它们的几何布局，仍然继续组网吗？", parent=dlg):
+                    return
+            # ── geometry self-check ──────────────────────────────────────
+            warns = _geom_warnings([(r, coords[r][0], coords[r][1])
+                                    for r in roster if r in coords])
+            if warns:
+                if not messagebox.askyesno("组网几何检查",
+                        "组网名单的几何布局有问题：\n\n" +
+                        "\n".join("  • " + w for w in warns) +
+                        "\n\n仍然继续组网吗？", parent=dlg):
                     return
             dlg.destroy()
             S._netstart_btn = netstart_btn
