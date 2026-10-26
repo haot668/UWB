@@ -232,6 +232,13 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
 /*============================================================================
  * Pairwise TDOA computation and solve trigger
  *============================================================================*/
+/* P1-4: how many anchors with a KNOWN slot make the network "ready" for a
+ * position.  Three is the geometric minimum — two TDOAs for two unknowns,
+ * exactly determined and without any redundancy, so a single noisy
+ * measurement moves the answer.  Four is what a usable network has.  Lower
+ * it to 3 for a deliberately small deployment. */
+#define TAG_NET_READY_ANCHORS 4
+
 static void tag_solve_and_report(void)
 {
     int i;
@@ -598,6 +605,27 @@ static void tag_solve_and_report(void)
     if (n_valid < 3) {
         { char dbg[64];
           sprintf(dbg, "TSUM n=%d SKIP need 3 anchors\r\n", n_valid);
+          test_run_info((unsigned char *)dbg); }
+        return;
+    }
+
+    /* P1-4: the network is only "ready" when enough anchors are on the
+     * grid with a KNOWN slot.  Until then the solve would collapse onto
+     * the centroid of the anchors — that looks like a position on the map
+     * but is not one, and it hides the real problem (the network is not
+     * formed).  So say what is missing instead of publishing a number.
+     *
+     * The UWB report is NOT stopped: the tag keeps sending its 0xE3 frame
+     * with the "no quality" marker (65535), so it stays visible on the
+     * host as an online device that has no position yet. */
+    if (n_sel < TAG_NET_READY_ANCHORS) {
+        int wait_slot = 255;
+        for (i2 = 0; i2 < n_sel; i2++) {
+            int sl = s_trackers[sel_idx[i2]].slot;
+            if (sl < wait_slot) wait_slot = sl;   /* the lowest slot = the Root */
+        }
+        { char dbg[64];
+          sprintf(dbg, "WAIT NET n=%d slot=%d\r\n", n_sel, wait_slot);
           test_run_info((unsigned char *)dbg); }
         return;
     }
