@@ -2259,6 +2259,46 @@ static void anchor_handle_coord_write(uint16_t src_uid, const uint8_t *payload, 
     DBG_PRINT("+COORD_OK\r\n");
 }
 
+/* P1-2: answer a coordinate read from the gateway.
+ *
+ * The coordinate is the ONE thing the tag's TDOA solve depends on, and it
+ * lives on the anchor — not on the gateway and not on the host.  So the
+ * only honest way to check it is to ask the anchor itself.  (The gateway's
+ * own flash was never written — the stub always failed — so the old
+ * AT+COORD? answered every query with 0,0,0 and the host could not tell a
+ * real (0,0,0) from a lost coordinate.) */
+static void anchor_handle_coord_read(uint16_t src_uid)
+{
+    uint8_t rep[19];
+    uint16_t x = (uint16_t)g_anchor.my_pos.x_cm;
+    uint16_t y = (uint16_t)g_anchor.my_pos.y_cm;
+    uint16_t z = (uint16_t)g_anchor.my_pos.z_cm;
+
+    rep[0] = 0x41; rep[1] = 0x88; rep[2] = 0;
+    rep[3] = 0xCA; rep[4] = 0xDE;
+    rep[5] = (uint8_t)(src_uid & 0xFF); rep[6] = (uint8_t)(src_uid >> 8);
+    rep[7] = (uint8_t)(g_anchor.rank & 0xFF);
+    rep[8] = (uint8_t)(g_anchor.rank >> 8);
+    rep[9] = FUNC_COORD_REPORT;
+    rep[10] = (uint8_t)(x & 0xFF); rep[11] = (uint8_t)(x >> 8);
+    rep[12] = (uint8_t)(y & 0xFF); rep[13] = (uint8_t)(y >> 8);
+    rep[14] = (uint8_t)(z & 0xFF); rep[15] = (uint8_t)(z >> 8);
+    rep[16] = 0xCC; rep[17] = 0xDD; rep[18] = 0xEE;
+
+    port_DisableEXT_IRQ();
+    dwt_forcetrxoff();
+    dwt_writetxdata(sizeof(rep), rep, 0);
+    dwt_writetxfctrl(sizeof(rep), 0, 0);
+    dwt_starttx(DWT_START_TX_IMMEDIATE);
+    { uint32_t dl = HAL_GetTick() + 10u;
+      while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK))
+        { if (HAL_GetTick() > dl) break; } }
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
+    port_EnableEXT_IRQ();
+
+    DBG_PRINT("+COORD_REPORT\r\n");
+}
+
 /*============================================================================
  * Frame dispatch (RX → handlers)
  *============================================================================*/
@@ -2349,6 +2389,14 @@ static void anchor_process_rx(uint8_t *rx_buf, uint32_t frame_len)
         anchor_handle_coord_write(src,
                                   &rx_buf[GW_HDR_LEN],
                                   frame_len - GW_HDR_LEN);
+        return;
+    }
+
+    /* P1-2: read the coordinate back from the anchor. */
+    if (func == FUNC_COORD_READ) {
+        uint16_t dst = (uint16_t)rx_buf[5] | ((uint16_t)rx_buf[6] << 8);
+        if (dst != 0xFFFF && dst != g_anchor.rank) return;
+        anchor_handle_coord_read(src);
         return;
     }
 

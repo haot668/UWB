@@ -1226,12 +1226,25 @@ static void gateway_coord_write(const char *cmd)
     }
 }
 
-/* AT+COORD?=<UID> — read coordinates (stub, returns zeros until Step 5) */
+/* AT+COORD?=<UID> — read the coordinate back FROM THE ANCHOR (P1-2).
+ *
+ * The coordinate is the one thing the TDOA solve depends on, and it lives
+ * on the anchor.  The old implementation read the GATEWAY's flash — which
+ * is never written (the stub always fails) — so every query answered
+ * 0,0,0 and the host could not tell a real (0,0,0) from a coordinate the
+ * anchor had lost.  Now the gateway asks the anchor over UWB and reports
+ * what the anchor says; when the anchor does not answer it says so with
+ * "+COORDERR,<uid>" instead of pretending the coordinate is zero. */
 static void gateway_coord_read(const char *cmd)
 {
     const char *p = cmd;
     char uid_str[8];
     int i;
+    uint16_t dst;
+    uint8_t payload[4];
+    uint8_t resp[8];
+    int ok = 0;
+    int r;
 
     if (*p != '=') return;
     p++;
@@ -1239,44 +1252,78 @@ static void gateway_coord_read(const char *cmd)
     while (*p && *p != ',' && i < (int)sizeof(uid_str) - 1)
         uid_str[i++] = *p++;
     uid_str[i] = '\0';
+    dst = parse_uid(uid_str);
 
-    /* Read coordinates from flash */
-    {
-        char ack[40];
-        int16_t fx, fy, fz;
-        int pos;
+    payload[0] = 0; payload[1] = 0; payload[2] = 0; payload[3] = 0;
 
-        if (gateway_flash_load_coord(&fx, &fy, &fz) == 0)
+    /* Ask the anchor and wait for its answer — the same shape as the write
+     * path (a few tries, a short window each). */
+    for (r = 0; r < 3 && !ok; r++) {
+        gateway_send_uwb_ack(dst, FUNC_COORD_READ, payload, 4);
         {
-            ack[0] = '+'; ack[1] = 'C'; ack[2] = 'O'; ack[3] = 'O'; ack[4] = 'R'; ack[5] = 'D'; ack[6] = ',';
-            pos = 7;
-            pos += fmt_str(&ack[pos], uid_str);
-            ack[pos++] = ',';
-            /* P1-3: the read response speaks METRES, exactly like the
-             * +COORDAck of a write (fmt_coord).  It used to emit the raw
-             * centimetres ("150" for 1.50 m), so the host had to know
-             * which of the two lines it was looking at and convert
-             * accordingly — and any third consumer had to guess.  One
-             * unit for both lines, always metres. */
-            pos += fmt_coord(&ack[pos], fx);
-            ack[pos++] = ',';
-            pos += fmt_coord(&ack[pos], fy);
-            ack[pos++] = ',';
-            pos += fmt_coord(&ack[pos], fz);
-            ack[pos] = '\0';
+            uint32_t dl = HAL_GetTick() + 200u;
+            port_DisableEXT_IRQ();
+            while (HAL_GetTick() < dl) {
+                uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
+                if (st & SYS_STATUS_ALL_RX_ERR) {
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                    Sleep(1); continue;
+                }
+                if (st & SYS_STATUS_RXFCG_BIT_MASK) {
+                    uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
+                    if (fl >= GW_HDR_LEN && fl <= 32) {
+                        uint8_t rb[32];
+                        dwt_readrxdata(rb, fl, 0);
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                        if (rb[9] == FUNC_COORD_REPORT) {
+                            uint16_t src_rank = (uint16_t)(rb[7] | ((uint16_t)rb[8] << 8));
+                            if (src_rank == dst) {
+                                resp[0] = rb[10]; resp[1] = rb[11];
+                                resp[2] = rb[12]; resp[3] = rb[13];
+                                resp[4] = rb[14]; resp[5] = rb[15];
+                                ok = 1; break;
+                            }
+                        }
+                    } else {
+                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+                    }
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+                }
+                Sleep(1);
+            }
+            EXTI->PR1 = (1u << 12);
+            port_EnableEXT_IRQ();
         }
-        else
-        {
-            /* Flash not written yet — return zeros */
-            ack[0] = '+'; ack[1] = 'C'; ack[2] = 'O'; ack[3] = 'O'; ack[4] = 'R'; ack[5] = 'D'; ack[6] = ',';
-            pos = 7;
-            pos += fmt_str(&ack[pos], uid_str);
-            ack[pos++] = ','; ack[pos++] = '0';
-            ack[pos++] = ','; ack[pos++] = '0';
-            ack[pos++] = ','; ack[pos++] = '0';
-            ack[pos] = '\0';
-        }
+    }
+    gateway_rx_flush();
+
+    if (ok) {
+        int16_t fx = (int16_t)((uint16_t)resp[0] | ((uint16_t)resp[1] << 8));
+        int16_t fy = (int16_t)((uint16_t)resp[2] | ((uint16_t)resp[3] << 8));
+        int16_t fz = (int16_t)((uint16_t)resp[4] | ((uint16_t)resp[5] << 8));
+        char ack[48];
+        int pos = 0;
+        ack[pos++] = '+'; ack[pos++] = 'C'; ack[pos++] = 'O'; ack[pos++] = 'O';
+        ack[pos++] = 'R'; ack[pos++] = 'D'; ack[pos++] = ',';
+        pos += fmt_str(&ack[pos], uid_str);
+        ack[pos++] = ',';
+        pos += fmt_coord(&ack[pos], fx);
+        ack[pos++] = ',';
+        pos += fmt_coord(&ack[pos], fy);
+        ack[pos++] = ',';
+        pos += fmt_coord(&ack[pos], fz);
+        ack[pos] = '\0';
         test_run_info((unsigned char *)ack);
+    } else {
+        char err[32];
+        int pos = 0;
+        err[pos++] = '+'; err[pos++] = 'C'; err[pos++] = 'O'; err[pos++] = 'O';
+        err[pos++] = 'R'; err[pos++] = 'D'; err[pos++] = 'E'; err[pos++] = 'R';
+        err[pos++] = 'R'; err[pos++] = ',';
+        pos += fmt_str(&err[pos], uid_str);
+        err[pos] = '\0';
+        test_run_info((unsigned char *)err);
     }
 }
 

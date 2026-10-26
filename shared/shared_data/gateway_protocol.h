@@ -16,6 +16,8 @@ extern "C" {
 #define FUNC_FIND_ACK     0xF3u  /* Dev→GW: 1B on/off */
 #define FUNC_COORD_WRITE  0xF4u  /* GW→Dev: x(2B)+y(2B)+z(2B) */
 #define FUNC_COORD_ACK    0xF5u  /* Dev→GW: x(2B)+y(2B)+z(2B) */
+#define FUNC_COORD_READ   0xE1u  /* GW→Dev: read my coordinate back          */
+#define FUNC_COORD_REPORT 0xE2u  /* Dev→GW: my coordinate x(2B)+y(2B)+z(2B) */
 #define FUNC_OTA_DATA     0xF6u  /* GW→Dev: seq(1B)+data[248B]+crc16(2B) */
 #define FUNC_OTA_ACK      0xF7u  /* Dev→GW: seq(1B)+status(1B) */
 #define FUNC_OTA_END      0xE4u  /* GW→Dev: OTA complete, reboot now       */
