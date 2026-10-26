@@ -2,17 +2,23 @@
  * @file    downlink_protocol.h
  * @brief   BD8NCF-style mesh sync protocol for UWB TDOA positioning.
  *
- *          Architecture: every anchor is a peer.  Each anchor broadcasts a
- *          compact TimeSync frame on its own cadence (~100 ms).  Slaves sync
- *          to other anchors via embedded TX timestamp + per-anchor Kalman
- *          clock filter (clock_sync.h).
+ *          Architecture: ONE TDMA grid shared by the whole network.  The
+ *          Root (cs_level = 0) owns slot 0 and its beacon defines the
+ *          origin of every round.  Every anchor broadcasts one compact
+ *          TimeSync frame per round (50 ms → 20 frames/s) at
+ *              round_origin + slot × 6.25 ms
+ *          where round_origin is taken from the DW3000 SYS_TIME axis, so
+ *          all anchors share ONE physical time grid.  A round carries the
+ *          embedded TX timestamp, so the Tag derives the anchor clock
+ *          model from it (clock_sync.h) and the slot compensation cancels
+ *          the grid offsets from the TDOA.
  *
  *          Frame types:
  *            0xEE  TIMESYNC          Anchor → broadcast   periodic sync
  *            0xED  CLOCK_FEEDBACK    Observer → unicast    sync error report
  *            0xE3  POS_REPORT        Tag → broadcast       solved position
  *
- *          No TDMA.  No master/slave.  Cascading sync via cs_level field.
+ *          One "cycle" (超周期) = DL_ROUNDS_PER_CYCLE rounds = 100 ms.
  *
  * @attention
  * Copyright 2026 (c) UWB project authors.
@@ -133,25 +139,34 @@ extern "C" {
 /*============================================================================
  * Timing constants — per-anchor self-broadcast (BD8NCF style)
  *
- * TDMA grid (P0-2/P0-3): the network runs in cycles of
- *   NET_MAX_SLOTS × DL_SLOT_DTU_US = 8 × 10 ms = 80 ms.
- * Slot 0 belongs to the Root; the Root's beacon defines the cycle origin.
- * Every anchor transmits exactly once per cycle, at
- *   cycle_origin + slot × 10 ms
- * where cycle_origin is derived from the DW3000 SYS_TIME axis (never from
+ * TDMA grid (P0-2/P0-3): the network runs in ROUNDS of
+ *   NET_MAX_SLOTS × DL_SLOT_DTU_US = 8 × 6.25 ms = 50 ms.
+ * Slot 0 belongs to the Root; the Root's beacon defines the round origin.
+ * Every anchor transmits exactly once per round, at
+ *   round_origin + slot × 6.25 ms
+ * where round_origin is derived from the DW3000 SYS_TIME axis (never from
  * HAL_GetTick()), so all anchors share ONE physical time grid.
  *
- * The network is capped at 8 anchors (1 Root + 7 children).  The 80 ms
- * cycle is kept; each slot is widened to 10 ms, which doubles the per-slot
- * guard against clock drift while keeping the update rate (12.5 Hz) and all
- * the RX/timing loops untouched.  Halving the slot table also halves the
- * per-anchor state arrays (see ANCHOR_MAX_NEIGHBORS / DL_MAX_TRACKED_ANCHORS)
- * — the real win on the 64 KB STM32L412.
+ * 一周期（超周期）= DL_ROUNDS_PER_CYCLE 轮 = 100 ms：
+ *   • 锚站每轮广播一帧 → 20 帧/s；
+ *   • 标签每轮解算一次 → 20 Hz 输出。
+ *
+ * 槽宽由 10 ms 收到 6.25 ms 的两个好处：
+ *   • 频率：轮长 80 ms → 50 ms，帧率 12.5 → 20 Hz；
+ *   • 精度：槽补偿后的残余误差项 (slot_k − slot_j) × S × δf 正比于轮内
+ *     跨度 S，跨度 70 ms → 43.75 ms，主导误差项降到原来的 5/8。
+ *
+ * 网络规模上限 8 个锚站（1 Root + 7 子站），槽表同步减半，per-anchor 状态
+ * 数组（ANCHOR_MAX_NEIGHBORS / DL_MAX_TRACKED_ANCHORS）随之减半 —— 这才是
+ * 64 KB STM32L412 上真正的收益点。
  *============================================================================*/
-#define DL_TIMESYNC_PERIOD_MS      80u     /* 8 slots × 10 ms = one TDMA cycle  */
-#define DL_TIMESYNC_PERIOD_UUS     80000u
-#define DL_SLOT_DTU_US             10000u  /* one TDMA slot = 10 ms              */
-#define DL_RX_WINDOW_MS            80u     /* Tag RX window: 80ms covers 1-2 anchor TX cycles */
+#define DL_TIMESYNC_PERIOD_MS      50u     /* 一轮 = 8 槽 × 6.25 ms = 50 ms      */
+#define DL_TIMESYNC_PERIOD_UUS     50000u
+#define DL_SLOT_DTU_US             6250u   /* 一个 TDMA 槽 = 6.25 ms             */
+#define DL_ROUNDS_PER_CYCLE        2u      /* 一个超周期 = 2 轮                   */
+#define DL_SUPERCYCLE_MS           100u    /* 超周期（一周期）= 100 ms            */
+#define DL_SOLVE_INTERVAL_MS       50u     /* 标签解算节拍 = 一轮 = 20 Hz         */
+#define DL_RX_WINDOW_MS            100u    /* 标签 RX 窗口 = 一个超周期           */
 #define DL_MAX_TRACKED_ANCHORS     8u      /* Tag tracks up to 8 anchors          */
 
 /* Anchor election (used during Phase 1.2 cascading sync) ----------------- */
@@ -188,11 +203,11 @@ extern "C" {
  *       overwrote the level, so every frame looked like level == slot.
  *       They are now separate bytes with separate indices.
  *
- * P0-4: cycle_id tells the Tag which TDMA cycle a beacon belongs to.  The
+ * P0-4: cycle_id tells the Tag which TDMA round a beacon belongs to.  The
  *       slot-compensated TDOA formula
- *           toa = rx_local - slot × 10 ms
- *       only cancels the cycle origin when all beacons come from the SAME
- *       cycle; one cycle of skew is 80 ms = 3.07 M DTU, far beyond the
+ *           toa = rx_local - slot × 6.25 ms
+ *       only cancels the round origin when all beacons come from the SAME
+ *       round; one round of skew is 50 ms = 3.19 M DTU, far beyond the
  *       ±1.06 M DTU acceptance window.  The Tag now only pairs beacons
  *       that carry the same cycle_id.
  *
