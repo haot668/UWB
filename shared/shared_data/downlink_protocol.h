@@ -319,15 +319,43 @@ extern "C" {
 
 /*============================================================================
  * Tag Position Report (22 bytes — unchanged for host compatibility)
- *   [0-9]   header
- *   [10-11] int16 x_cm (Kalman-filtered)
+ *   [0-1]   frame type 0x41 0x88
+ *   [2]     sequence (per tag, incremented per report)
+ *   [3-4]   source EUI64 tag 0xCA 0xDE
+ *   [5-6]   destination (0xFFFF = broadcast)
+ *   [7-8]   source id (CRC16 over the tag's 96-bit STM32 UID)
+ *   [9]     FUNC_DL_POS_REPORT
+ *   [10-11] int16 x_cm (solved by the tag)
  *   [12-13] int16 y_cm
  *   [14-15] int16 z_cm
- *   [16-17] uint16 quality_score (0..1000 = 0.0..1.0)
+ *   [16-17] uint16 quality (0..1000 = 0.0..1.0; 65535 = no solution)
  *   [18-19] uint16 fw_version
  *   [20-21] pad (DW3210 RX corruption)
- *============================================================================*/
+ *
+ * The tag is a pure receiver in the TDMA grid.  Its report goes out in the
+ * GUARD TIME OF SLOT 0: slot 0 belongs to the Root alone, so the interval
+ * between the end of the Root's beacon and slot 1's beacon is guaranteed to
+ * be free of any anchor transmission — no matter how many anchors are in the
+ * network.  The tag therefore needs no slot of its own, and the anchor slot
+ * table (8 anchors / 50 ms round / 100 ms super-cycle / 20 Hz) is untouched.
+ *
+ * The report instant is measured from the arrival of the ROOT's beacon at the
+ * tag (rx_local), i.e. from the round origin itself:
+ *
+ *     report = root_rx_local + TAG_REPORT_DELAY_US + ALOHA jitter
+ *
+ * with DELAY + JITTER < DL_SLOT_DTU_US (6.25 ms), so the report always lands
+ * inside slot 0's guard and never disturbs an anchor's reception.
+ *
+ * The position in the report is solved BY THE TAG; the gateway only relays
+ * it.  The precision of the TX instant therefore does not affect the
+ * accuracy of the position at all — the delayed TX exists only to place the
+ * frame inside the guard window.
+ *==========================================================================*/
 #define DL_POS_REPORT_LEN          22u
+#define TAG_REPORT_DELAY_US       2200u  /* 2.2 ms after the Root's beacon   */
+#define TAG_REPORT_JITTER_US      2000u  /* ALOHA jitter between tags        */
+#define TAG_REPORT_QUALITY_NONE  65535u  /* "no solution" marker             */
 #define DL_MAX_ANCHORS             8u     /* Backward-compat for tdoa_solver.c */
 
 /*============================================================================

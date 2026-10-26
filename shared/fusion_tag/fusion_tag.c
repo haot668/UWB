@@ -158,6 +158,25 @@ static uint16_t s_root_rank      = 0;
 static double   s_root_rate      = 1.0;    /* (our clock)/(Root's clock)       */
 static uint8_t  s_root_rate_valid = 0;
 
+/*============================================================================
+ * Position report — the tag's UWB uplink (see DL_POS_REPORT_LEN)
+ *
+ * The tag solves the TDOA itself and ships the RESULT to the gateway, so
+ * the report frame carries x/y/z/q and not raw timestamps; the gateway only
+ * relays it to the host.  The report goes out once per TDMA round (20 Hz),
+ * in the guard time of slot 0.
+ *==========================================================================*/
+static uint16_t s_tag_id        = 0;    /* CRC16 over the 96-bit STM32 UID   */
+static bool     s_solve_valid   = false;
+static int16_t  s_solve_x_cm    = 0;
+static int16_t  s_solve_y_cm    = 0;
+static int16_t  s_solve_z_cm    = 0;
+static uint16_t s_solve_q       = TAG_REPORT_QUALITY_NONE;
+static uint32_t s_solve_ms      = 0;
+static uint8_t  s_report_seq    = 0;
+static uint32_t s_n_report_tx   = 0;    /* reports actually transmitted      */
+static uint32_t s_n_report_skip = 0;    /* reports dropped (too late)        */
+
 /* P1-4: independent Root-rate estimator.
  *
  * The Root's clock rate is needed to express a slot duration in OUR clock
@@ -580,6 +599,15 @@ static void tag_solve_and_report(void)
     int ret = tdoa_solve(anchors, toa_dtu, (uint8_t)n_valid,
                          &x_cm, &y_cm, &z_cm, &rms);
     if (ret != 0) return;
+
+    /* Hand the solution to the UWB uplink: the report goes out once per
+     * TDMA round, in the guard time of slot 0. */
+    s_solve_x_cm  = (int16_t)x_cm;
+    s_solve_y_cm  = (int16_t)y_cm;
+    s_solve_z_cm  = (int16_t)z_cm;
+    s_solve_q     = (uint16_t)(rms / 100.0f * 1000.0f);
+    s_solve_valid = true;
+    s_solve_ms    = HAL_GetTick();
 
 #if TAG_DEBUG_OUTPUT
     /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=qm */
@@ -1035,6 +1063,171 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
 }
 
 /*============================================================================
+ * Tag id — CRC16 over the full 96-bit STM32 UID, exactly like the anchors'
+ * rank.  A constant id would collapse every tag in the room into a single
+ * device in the host list.
+ *==========================================================================*/
+static uint16_t tag_compute_id(void)
+{
+    uint32_t w0 = HAL_GetUIDw0();
+    uint32_t w1 = HAL_GetUIDw1();
+    uint32_t w2 = HAL_GetUIDw2();
+    uint8_t  idb[12];
+    uint16_t crc = 0xFFFFu;
+    int i, b;
+
+    for (i = 0; i < 4; i++) idb[i]     = (uint8_t)((w0 >> (i * 8)) & 0xFF);
+    for (i = 0; i < 4; i++) idb[4 + i] = (uint8_t)((w1 >> (i * 8)) & 0xFF);
+    for (i = 0; i < 4; i++) idb[8 + i] = (uint8_t)((w2 >> (i * 8)) & 0xFF);
+
+    for (i = 0; i < 12; i++) {
+        crc ^= (uint16_t)((uint16_t)idb[i] << 8);
+        for (b = 0; b < 8; b++) {
+            if (crc & 0x8000u) crc = (uint16_t)((crc << 1) ^ 0x1021u);
+            else               crc = (uint16_t)(crc << 1);
+        }
+    }
+    if (crc == 0) crc = 1;  /* 0 stays reserved for the gateway */
+    return crc;
+}
+
+/*============================================================================
+ * Report the solved position to the gateway over UWB.
+ *
+ * Called right after the ROOT's beacon (slot 0) was received: root_rx is
+ * the instant the beacon arrived at the tag, i.e. the round origin in the
+ * tag's own clock.  The frame is transmitted with a DELAYED TX at
+ *
+ *     root_rx + TAG_REPORT_DELAY_US + ALOHA jitter
+ *
+ * which lies inside slot 0's guard time (< 6.25 ms) — the one interval of
+ * the round in which no anchor transmits.  The jitter is an ALOHA offset so
+ * that several tags do not always land on the same microsecond.
+ *
+ * The TX instant does NOT influence the accuracy of the reported position:
+ * the tag has already solved the TDOA itself and ships the result.  The
+ * delayed TX exists only to place the frame inside the guard window.
+ *==========================================================================*/
+static void tag_tx_pos_report(uint64_t root_rx)
+{
+    uint8_t  pkt[DL_POS_REPORT_LEN];
+    uint64_t now, target, slot1;
+    uint32_t delay_us;
+    int16_t  x, y, z;
+    uint16_t q;
+
+    /* ALOHA offset — an LFSR seeded from the UID, so that two tags in the
+     * room do not always report in the same microsecond. */
+    static uint32_t s_jitter = 0;
+    if (s_jitter == 0) {
+        s_jitter = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+        if (s_jitter == 0) s_jitter = 0xACE1u;
+    }
+    s_jitter = s_jitter * 1664525u + 1013904223u;
+    delay_us = TAG_REPORT_DELAY_US + (s_jitter % TAG_REPORT_JITTER_US);
+
+    now    = tag_now_sys_ext();
+    target = root_rx + (uint64_t)delay_us * UUS_TO_DWT_TIME;
+
+    /* Slot 1's beacon arrives at root_rx + 6.25 ms.  A report after that
+     * would land ON an anchor's transmission: it would spoil that anchor's
+     * reception AND corrupt the tag's own TDOA for that anchor.  Losing one
+     * report is far cheaper than corrupting a measurement, so the report is
+     * simply skipped. */
+    slot1 = root_rx + (uint64_t)DL_SLOT_DTU_US * UUS_TO_DWT_TIME;
+    if (now + (200ULL * UUS_TO_DWT_TIME) > slot1) {
+        s_n_report_skip++;
+        return;
+    }
+
+    /* Not enough time left to program the delayed TX (the SPI writes plus
+     * the start command take ~300 us) — transmit right away instead, which
+     * still lies inside the guard window (checked above). */
+    if (target < now + (400ULL * UUS_TO_DWT_TIME)) {
+        target = 0;
+    }
+
+    /* The payload: the last solution, or the "no solution" marker. */
+    x = s_solve_x_cm; y = s_solve_y_cm; z = s_solve_z_cm;
+    q = s_solve_q;
+    if (!s_solve_valid) {
+        x = 0; y = 0; z = 0;
+        q = TAG_REPORT_QUALITY_NONE;
+    } else if ((HAL_GetTick() - s_solve_ms) > 500u) {
+        /* The solution is stale — the tag is alive but no longer solving. */
+        q = TAG_REPORT_QUALITY_NONE;
+    }
+
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x41; pkt[1] = 0x88;
+    pkt[2] = s_report_seq++;
+    pkt[3] = 0xCA; pkt[4] = 0xDE;
+    pkt[5] = 0xFF; pkt[6] = 0xFF;                 /* broadcast */
+    pkt[7] = (uint8_t)(s_tag_id & 0xFF);
+    pkt[8] = (uint8_t)(s_tag_id >> 8);
+    pkt[9] = FUNC_DL_POS_REPORT;
+    pkt[10] = (uint8_t)((uint16_t)x & 0xFF);
+    pkt[11] = (uint8_t)(((uint16_t)x >> 8) & 0xFF);
+    pkt[12] = (uint8_t)((uint16_t)y & 0xFF);
+    pkt[13] = (uint8_t)(((uint16_t)y >> 8) & 0xFF);
+    pkt[14] = (uint8_t)((uint16_t)z & 0xFF);
+    pkt[15] = (uint8_t)(((uint16_t)z >> 8) & 0xFF);
+    pkt[16] = (uint8_t)(q & 0xFF);
+    pkt[17] = (uint8_t)((q >> 8) & 0xFF);
+    pkt[18] = (uint8_t)(FW_VERSION_U16 & 0xFF);
+    pkt[19] = (uint8_t)((FW_VERSION_U16 >> 8) & 0xFF);
+    /* [20..21] pad */
+
+    /* Quiet the radio before the TX, exactly like the anchors do. */
+    port_DisableEXT_IRQ();
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    dwt_writetxdata(DL_POS_REPORT_LEN, pkt, 0);
+    dwt_writetxfctrl(DL_POS_REPORT_LEN, 0, 0);
+
+    bool tx_started = false;
+    if (target != 0) {
+        /* DX_TIME holds the device time bits [39:8] — mask to 40 bits first
+         * (the device time counter is 40 bit) and then shift. */
+        dwt_setdelayedtrxtime((uint32_t)((target & 0xFFFFFFFFFFULL) >> 8));
+        if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
+            tx_started = true;
+        } else {
+            /* The delayed TX was refused (late programming / HPDWARN) — fall
+             * back to an immediate TX, but only while the guard window is
+             * still open; a report that lands on slot 1's beacon would
+             * corrupt a measurement, which is worse than a lost report. */
+            uint64_t n2 = tag_now_sys_ext();
+            if (n2 + (200ULL * UUS_TO_DWT_TIME) < slot1) {
+                dwt_starttx(DWT_START_TX_IMMEDIATE);
+                tx_started = true;
+            } else {
+                s_n_report_skip++;
+            }
+        }
+    } else {
+        dwt_starttx(DWT_START_TX_IMMEDIATE);
+        tx_started = true;
+    }
+
+    if (tx_started) {
+        /* Wait for the frame to leave the antenna.  The wait is bounded: the
+         * receiver has to come back even if the transmitter misbehaves. */
+        uint32_t dl = HAL_GetTick() + 10u;
+        while ((dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK) == 0) {
+            if (HAL_GetTick() > dl) break;
+        }
+        dwt_write32bitreg(SYS_STATUS_ID,
+                          SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
+        s_n_report_tx++;
+    }
+
+    port_rf_switch_rx();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    port_EnableEXT_IRQ();
+}
+
+/*============================================================================
  * Tag main loop (continuous RX + periodic solve)
  *============================================================================*/
 int fusion_tag(void)
@@ -1058,6 +1251,10 @@ int fusion_tag(void)
     dwt_setleds(DWT_LEDS_ENABLE);
     test_run_info((unsigned char *)"CONFIG OK\r\n");
     test_run_info((unsigned char *)"INIT DONE\r\n");
+
+    /* Our own 16-bit id (CRC16 over the 96-bit UID) — the gateway uses it
+     * as the source address of the position report. */
+    s_tag_id = tag_compute_id();
 
     /* Init tracker slots */
     int i;
@@ -1123,6 +1320,16 @@ int fusion_tag(void)
             }
             if (rx_buf[9] == FUNC_DOWNLINK_BEACON) {
                 tag_rx_timesync(rx_buf, frame_len, rx_hw_ts);
+
+                /* The Root's beacon (slot 0, level 0) defines the round
+                 * origin.  The tag reports its position in the guard time
+                 * that follows it — the one interval of the round in which
+                 * no anchor is transmitting, whatever the anchor count is. */
+                if (frame_len >= DL_TIMESYNC_LEN
+                    && rx_buf[DL_TS_SLOT_IDX] == 0
+                    && rx_buf[DL_TS_LEVEL_IDX] == 0) {
+                    tag_tx_pos_report(rx_hw_ts);
+                }
             }
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
@@ -1154,6 +1361,10 @@ int fusion_tag(void)
                     (unsigned int)(s->quality * 100),
                     age_ms);
             }
+            pos += sprintf(out + pos, " RPT tx=%u skip=%u id=%04x",
+                (unsigned)s_n_report_tx,
+                (unsigned)s_n_report_skip,
+                (unsigned)s_tag_id);
             pos += sprintf(out + pos, "\r\n");
             test_run_info((unsigned char *)out);
         }

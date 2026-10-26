@@ -800,7 +800,10 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
             uid[0] = gw_hex[(src_addr >> 12) & 0xF]; uid[1] = gw_hex[(src_addr >>  8) & 0xF];
             uid[2] = gw_hex[(src_addr >>  4) & 0xF]; uid[3] = gw_hex[ src_addr        & 0xF];
             uid[4] = '\0';
-            gateway_device_seen(uid, "TAG", 0);
+            /* The tag's source address IS its id (CRC16 over its UID), so
+             * the host can tell two tags apart.  Rank 0 stays reserved for
+             * the gateway. */
+            gateway_device_seen(uid, "TAG", src_addr);
             /* Extract firmware version from position report (bytes 18-19) */
             if (len >= GW_HDR_LEN + 10) {
                 uint16_t fw = (uint16_t)(frame[GW_HDR_LEN+8] | (frame[GW_HDR_LEN+9] << 8));
