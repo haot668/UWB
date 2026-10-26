@@ -1087,10 +1087,18 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pkt[DL_TS_RX_REF_CYCLE_IDX + 1] = (uint8_t)(s_ref_cycle >> 8);
 
     /* P1-1: presence bitmap over the participant roster.  Only the Root
-     * fills it in: bit N is set when the Root has heard participant N. */
+     * fills it in: bit N is set when the Root has heard participant N.
+     *
+     * P1-6: "heard" has to mean heard RECENTLY.  The bitmap used to be
+     * built from the neighbour list, which only ever grows — an anchor
+     * that fell off the grid stayed in the bitmap for ever, the gateway
+     * never saw the mask change and the host went on believing the
+     * network was complete.  Now a member counts as present only while it
+     * has been heard within DL_PRESENCE_TIMEOUT_MS (500 ms = ten rounds). */
     {
         uint16_t mask = 0;
         if (g_anchor.cs_level == 0) {
+            uint32_t now_ms = HAL_GetTick();
             int i;
             for (i = 0; i < s_roster_n; i++) {
                 uint16_t r = s_roster[i];
@@ -1099,7 +1107,9 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
                     int j;
                     for (j = 0; j < ANCHOR_MAX_NEIGHBORS; j++) {
                         if (g_anchor.neighbors[j].initialized
-                            && g_anchor.neighbors[j].neighbor_rank == r) {
+                            && g_anchor.neighbors[j].neighbor_rank == r
+                            && (int32_t)(now_ms - g_anchor.last_heard_ms[j])
+                               <= (int32_t)DL_PRESENCE_TIMEOUT_MS) {
                             heard = true;
                             break;
                         }

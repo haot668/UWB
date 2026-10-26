@@ -257,6 +257,13 @@ extern "C" {
 #define DL_TS_COORD_IDX           44u    /* x/y/z coords appended after slot table  */
 #define DL_TS_CYCLE_IDX           52u    /* uint16 TDMA cycle counter                */
 #define DL_TS_PRESENT_IDX         54u    /* uint16 roster presence bitmap            */
+
+/* P1-6: how recently a roster member has to have been heard to still count
+ * as "present" in the Root's presence bitmap.  A round is 50 ms, so 500 ms
+ * is ten rounds — a member that has been silent for that long is gone and
+ * has to disappear from the bitmap (and therefore from the host's
+ * "missing" list). */
+#define DL_PRESENCE_TIMEOUT_MS     500u
 #define DL_TS_RX_REF_TS_IDX       56u    /* 5-byte RX instant of the reference frame */
 #define DL_TS_RX_REF_CYCLE_IDX    61u    /* uint16 cycle id of that reference frame  */
 
