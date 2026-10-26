@@ -33,6 +33,31 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+# ---------------------------------------------------------------------
+#  Network phase (P1-5)
+# ---------------------------------------------------------------------
+NET_PHASE_IDLE     = "IDLE"
+NET_PHASE_STARTING = "STARTING"
+NET_PHASE_RUNNING  = "RUNNING"
+NET_PHASE_DEGRADED = "DEGRADED"
+
+NET_PHASE_LABEL = {
+    NET_PHASE_IDLE:     "未组网",
+    NET_PHASE_STARTING: "组网中",
+    NET_PHASE_RUNNING:  "运行中",
+    NET_PHASE_DEGRADED: "降级运行",
+}
+
+# P1-5: how long the anchors are given to confirm their slot before the
+# host complains.  The anchor de-bounces NETWORK_START for 800 ms, answers
+# with an ALOHA beacon every 500 ms and needs up to 3 s to confirm its slot
+# -- so 5 s is the first moment at which "still missing" means something.
+NET_SETTLE_MS = 5000
+
+# P1-5: how often the network is looked at again.
+NET_RECHECK_MS = 2000
+
+
 # ══════════════════════════════════════════════
 #  State
 # ══════════════════════════════════════════════
@@ -95,6 +120,17 @@ class State:
         # everybody, so this is its coverage — and therefore the measure the
         # netstart dialog uses to pick a sensible default Root.
         self.net_nbr_count: dict[int, int] = {}
+
+        # P1-5: the network phase and the persistent alarm
+        #   IDLE     — nothing has been started
+        #   STARTING — the network was asked for, not every member is up yet
+        #   RUNNING  — every roster member is on the grid
+        #   DEGRADED — the network was running and a member dropped out
+        self.net_phase: str = NET_PHASE_IDLE
+        self.net_dropped_ranks: set[int] = set()
+        self._net_recheck_id = None       # the 2 s re-check timer
+        self._net_settle_at = 0.0         # when the anchors had their chance
+        self._net_warned = False          # the "still missing" popup was shown
 
         self.grid_w: float = 100.0
         self.grid_h: float = 100.0
@@ -324,11 +360,11 @@ def parse_line(line: str):
         if hasattr(S, "_netstart_btn") and S._netstart_btn:
             S._netstart_btn.config(text="✓ 组网成功", state="disabled", bg=C["green"])
             S._netstart_btn = None
-        # P1-3: the anchor-side timing is much slower than the gateway's
-        # broadcast (de-bounce 800 ms, ALOHA 500 ms, slot confirmation up to
-        # 3 s).  Re-check the network state 2.5 s later so the operator sees
-        # the real result instead of the optimistic ACK count.
-        root.after(2500, _check_network_states)
+        # P1-3/P1-5: the anchor-side timing is much slower than the
+        # gateway's broadcast (de-bounce 800 ms, ALOHA 500 ms, slot
+        # confirmation up to 3 s).  The optimistic ACK count is therefore
+        # not the result — the periodic re-check watches the real states.
+        _net_recheck_start()
     elif head == "+NETSTART_ERR" and len(parts) >= 2 and parts[1].strip() == "NOROSTER":
         # P2-12: the gateway refuses to invent a roster
         set_status("组网启动被拒绝 — 没有参与基站名单", "error")
@@ -490,15 +526,179 @@ def anchor_net_state(d):
     """
     if d.get("type") != "ANCHOR":
         return ""
+    rank = int(d.get("rank") or 0)
+    # P1-5: "lost" — the member was on the grid and fell off it.  This is
+    # the alarm, so it outranks "offline": an anchor that dropped out is
+    # more than an anchor that happens to be off.
+    if d.get("net_dropped"):
+        return "lost"
     if not d.get("online"):
         return "off"
     roster = getattr(S, "net_roster", []) or []
-    rank = int(d.get("rank") or 0)
     if not roster or rank not in roster:
         return ""
     if d.get("net_state") == 3:
         return "root" if rank == getattr(S, "net_root_rank", 0) else "run"
     return "wait"
+
+
+def _anchor_running(rank):
+    """True when this roster member is on the grid.
+
+    Three independent signals have to agree: the anchor's own state (from
+    the beacons the gateway hears), its liveness (the gateway stops seeing
+    it altogether when it goes away), and the Root's presence bitmap (the
+    Root is the only one that can tell whether a member is reachable
+    THROUGH the grid).
+    """
+    d = S.devices.get(f"{rank:04X}", {})
+    if not d.get("net_state") == 3:
+        return False
+    if not d.get("online", True):
+        return False
+    if rank in (getattr(S, "net_missing_ranks", None) or set()):
+        return False
+    return True
+
+
+def net_phase():
+    """The state of the network, derived from what is known right now.
+
+    IDLE      — nothing has been started
+    STARTING  — the network was asked for, not every member is on the grid
+    RUNNING   — every roster member is on the grid
+    DEGRADED  — the network was running and a member has dropped out
+
+    The phase is DERIVED, never set by a command: the host hears the
+    anchors' own states (+NETSTATE) and the Root's presence bitmap
+    (+NETMISS), and those are the only things that say whether the network
+    is really up.
+    """
+    roster = getattr(S, "net_roster", []) or []
+    if not roster:
+        return NET_PHASE_IDLE
+    up = sum(1 for r in roster if _anchor_running(r))
+    if up == len(roster):
+        return NET_PHASE_RUNNING
+    # Once the network has been up, a member that is missing is a DROP, not
+    # a slow start — the difference decides whether the operator sees a
+    # transient "组网中" or a standing "降级运行" alarm.
+    prev = getattr(S, "net_phase", NET_PHASE_IDLE)
+    if prev in (NET_PHASE_RUNNING, NET_PHASE_DEGRADED):
+        return NET_PHASE_DEGRADED
+    return NET_PHASE_STARTING
+
+
+def set_net_phase(phase, dropped=None):
+    """The persistent network indicator (P1-5).
+
+    The status bar auto-resets after a few seconds, so it cannot carry an
+    alarm: a dropped anchor has to stay visible until it comes back.
+    """
+    if not hasattr(S, "_net_label") or not S._net_label:
+        return
+    if phase == NET_PHASE_DEGRADED and dropped:
+        txt = "⚠ " + NET_PHASE_LABEL[phase] + " — 掉线: " + \
+              ", ".join(f"R{r}" for r in sorted(dropped))
+        fg = C["red"]
+    elif phase == NET_PHASE_RUNNING:
+        txt = "● " + NET_PHASE_LABEL[phase]
+        fg = C["green"]
+    elif phase == NET_PHASE_STARTING:
+        txt = "◐ " + NET_PHASE_LABEL[phase]
+        fg = C["orange"]
+    else:
+        txt = ""
+        fg = C["muted"]
+    S._net_label.config(text=txt, fg=fg)
+
+
+def _net_recheck():
+    """P1-5: look at the network again, every 2 s.
+
+    A netstart is not a one-shot event.  An anchor can fall off the grid
+    minutes later, and the TDOA solve then silently runs on fewer anchors
+    — or on none — while the map still shows a perfectly plausible trail.
+    The phase is therefore derived continuously, and a dropped anchor
+    raises an alarm that STAYS until the anchor is back.
+    """
+    S._net_recheck_id = None
+    roster = getattr(S, "net_roster", []) or []
+    if not roster:
+        # The network was stopped — stop looking.
+        S.net_phase = NET_PHASE_IDLE
+        S.net_dropped_ranks = set()
+        set_net_phase(NET_PHASE_IDLE)
+        return
+
+    phase = net_phase()
+    prev = getattr(S, "net_phase", NET_PHASE_IDLE)
+    dropped = [r for r in roster if not _anchor_running(r)]
+
+    changed = (phase != prev
+               or set(dropped) != set(getattr(S, "net_dropped_ranks", set())))
+    S.net_phase = phase
+    S.net_dropped_ranks = set(dropped)
+    # The map and the device card show the alarm through this flag.
+    for r in roster:
+        d = S.devices.get(f"{r:04X}")
+        if d is not None:
+            d["net_dropped"] = (phase == NET_PHASE_DEGRADED and r in S.net_dropped_ranks)
+    # Only rebuild the lists when something actually changed — the re-check
+    # runs every 2 s and a needless rebuild would fight the operator's
+    # scrolling.
+    if changed:
+        S._dirty = True
+
+    set_net_phase(phase, dropped)
+
+    if phase != prev:
+        if phase == NET_PHASE_RUNNING:
+            set_status(f"● 网络运行中 — {len(roster)} 个基站在时隙表上", "success")
+        elif phase == NET_PHASE_DEGRADED:
+            txt = ", ".join(f"R{r}" for r in sorted(dropped))
+            set_status(f"⚠ 网络降级 — {txt} 掉线，已退出 TDOA 解算", "error")
+        elif phase == NET_PHASE_STARTING:
+            set_status("◐ 网络组网中 — 等待全部基站进入运行状态", "info")
+        else:
+            set_status("网络已停止", "info")
+
+    # The one-shot complaints: only after the anchors have had their
+    # settling time, and only once.
+    if not S._net_warned and time.time() >= S._net_settle_at:
+        S._net_warned = True
+        if dropped:
+            detail = ", ".join(f"R{r}" for r in sorted(dropped))
+            messagebox.showwarning("网络未完整",
+                f"以下基站在 {NET_SETTLE_MS // 1000} 秒后仍未进入运行状态：\n\n"
+                f"  {detail}\n\n"
+                "它们不会进入 TDOA 解算集合，定位精度会下降。\n"
+                "请检查这些基站的供电与射频链路。", parent=root)
+        _check_root_coverage()
+
+    S._net_recheck_id = root.after(NET_RECHECK_MS, _net_recheck)
+
+
+def _net_recheck_start():
+    """Start the periodic re-check (idempotent)."""
+    if S._net_recheck_id:
+        return
+    S._net_settle_at = time.time() + NET_SETTLE_MS / 1000.0
+    S._net_warned = False
+    S._net_recheck_id = root.after(NET_RECHECK_MS, _net_recheck)
+
+
+def _net_recheck_stop():
+    """Stop the periodic re-check."""
+    if S._net_recheck_id:
+        try:
+            root.after_cancel(S._net_recheck_id)
+        except Exception:
+            pass
+        S._net_recheck_id = None
+    S.net_phase = NET_PHASE_IDLE
+    S.net_dropped_ranks = set()
+    set_net_phase(NET_PHASE_IDLE)
 
 
 def net_running():
@@ -650,10 +850,15 @@ def handle_netmiss(parts):
         return
     miss_ranks = [int(p.strip()) for p in parts[3:3 + miss_cnt]
                   if p.strip().isdigit()]
+    # P1-5: the set is updated ALWAYS — including when it becomes empty.
+    # The Root's presence bitmap is a level, not an edge: it also reports
+    # "everybody is back", and without clearing the set here a member that
+    # had dropped out would stay excluded from the solve for ever.
+    S.net_missing_ranks = set(miss_ranks)
     if not miss_ranks:
+        set_status(f"✓ Root R{root_rank} 报告全部成员在位", "success")
         return
     miss_txt = ", ".join(f"R{r}" for r in miss_ranks)
-    S.net_missing_ranks = set(miss_ranks)
     set_status(f"⚠ Root R{root_rank} 未收到: {miss_txt} — 这些基站不参与 TDOA 解算",
                "warning")
 
@@ -702,37 +907,11 @@ def handle_netnbr(parts):
         S.devices[uid] = {"trail": [], "type": "ANCHOR", "rank": rank}
     S.devices[uid]["n_neighbors"] = n
 
-def _check_network_states():
-    """P1-3: 2.5 s after NETSTART, verify that every roster member really
-    reached RUNNING (state 3).  The gateway's ACK count is optimistic — an
-    anchor answers the NETWORK_START long before it has joined the grid."""
-    roster = getattr(S, "net_roster", []) or []
-    if not roster:
-        return
-    not_running = []
-    for rank in roster:
-        uid = f"{rank:04X}"
-        d = S.devices.get(uid, {})
-        state = d.get("net_state")
-        if state is None:
-            not_running.append((rank, None))
-        elif state != 3:
-            not_running.append((rank, state))
-    if not_running:
-        detail = ", ".join(f"R{r}({'未上报' if st is None else '状态'+str(st)})"
-                           for r, st in not_running)
-        set_status(f"组网复查 → 尚未进入运行状态: {detail}", "warning")
-        messagebox.showwarning("组网复查",
-            "以下基站在 2.5 秒后仍未进入运行状态：\n\n"
-            f"  {detail}\n\n"
-            "它们暂时不参与 TDOA 解算，请检查链路后重新组网。",
-            parent=root)
-    else:
-        set_status(f"组网复查 → 全部 {len(roster)} 个基站已进入运行状态", "success")
-
-    # P1-1: the Root must be able to reach the other anchors.  Its neighbour
-    # count is the only coverage measure we have; if the chosen Root hears
-    # almost nobody, suggest the anchor with the best coverage instead.
+def _check_root_coverage():
+    """P1-1: the Root must be able to reach the other anchors.  Its neighbour
+    count is the only coverage measure we have; if the chosen Root hears
+    almost nobody, suggest the anchor with the best coverage instead.
+    """
     root_rank = getattr(S, "net_root_rank", 0)
     root_nbr = S.devices.get(f"{root_rank:04X}", {}).get("n_neighbors")
     if root_nbr is not None and root_nbr < 2:
@@ -2284,6 +2463,9 @@ def build_settings():
             S.net_roster = list(roster)
             S.net_root_rank = root_rank
             S.net_missing_ranks = set()
+            S.net_phase = NET_PHASE_STARTING
+            _net_recheck_start()
+            set_net_phase(NET_PHASE_STARTING)
             send_cmd("AT+NETSTART=" + str(root_rank) + "," + ",".join(str(r) for r in roster[1:]))
             set_status(f"正在组网 — Root=R{root_rank}，参与基站 {len(roster)} 个"
                        f"（槽位顺序 {'→'.join(f'R{r}' for r in roster)}）...", "info")
@@ -2539,8 +2721,10 @@ def build_settings():
         S.net_roster = []
         S.net_missing_ranks = set()
         S.net_root_rank = 0
+        _net_recheck_stop()
         for d in S.devices.values():
             d.pop("net_state", None)
+            d.pop("net_dropped", None)
         S._dirty = True
         refresh_lists()
         set_status("已发送 AT+STOP — Master 返回配置模式", "info")
@@ -2790,6 +2974,9 @@ def refresh_lists(force_rebuild=False):
                     info += "  ● 在网"
                 elif st == "wait":
                     info += "  ○ 等待确认"
+                elif st == "lost":
+                    # P1-5: it was on the grid and fell off it
+                    info += "  ⚠ 掉线"
             if d.get("rank_collision"):
                 info += "  ⚠ rank冲突"
         elif d.get("x") is not None:
@@ -3827,12 +4014,18 @@ def draw_anchor(c, uid, d):
     map_label = f"A{rank:02d}"  # e.g. "A08" — rank shown on map icon
     if net_st == "root":
         map_label = f"R{rank:02d}"  # the Root is marked with an R
+    elif net_st == "lost":
+        map_label = f"A{rank:02d}!"  # P1-5: dropped out of the grid
 
     # Colors
     if net_st == "root":
         body_fill = C["green"]
         body_stroke = "#116329"
         glow_color = "#7ee787"
+    elif net_st == "lost":
+        body_fill = C["red"]
+        body_stroke = "#a40e26"
+        glow_color = "#ff8182"
     elif net_st == "wait":
         body_fill = "#e6a800"
         body_stroke = "#9a6700"
@@ -3876,7 +4069,7 @@ def draw_anchor(c, uid, d):
                   fill="#ffffff", outline="")
 
     # --- Ring accent ---
-    if online and net_st not in ("root", "wait"):
+    if online and net_st not in ("root", "wait", "lost"):
         ar = max(r // 2, 4 * icon_s) + icon_s
         c.create_oval(sx-ar, sy-ar, sx+ar, sy+ar,
                       fill="", outline=C["green"], width=max(1, 2*icon_s))
@@ -4180,6 +4373,12 @@ def build_footer(parent):
     S._status_label = tk.Label(ft, text="  就绪", bg=C["surface"], fg=C["muted"],
                                 font=("Segoe UI", 10), anchor="w")
     S._status_label.pack(side=tk.LEFT, padx=(6, 0))
+
+    # P1-5: the network phase lives here, not in the status bar — the status
+    # bar auto-resets, an alarm must not.
+    S._net_label = tk.Label(ft, text="", bg=C["surface"], fg=C["muted"],
+                             font=("Segoe UI", 10, "bold"), anchor="e")
+    S._net_label.pack(side=tk.RIGHT, padx=(0, 12))
 
     tk.Label(ft, text="F11 全屏  |  双击居中  |  滚轮缩放  |  拖拽平移",
              bg=C["surface"], fg=C["muted"], font=("Segoe UI", 7)).pack(side=tk.RIGHT, padx=10)
