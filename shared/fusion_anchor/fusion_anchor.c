@@ -502,11 +502,25 @@ static int find_or_alloc_neighbor_slot(uint16_t rank)
             return i;
         }
     }
-    /* No free slot — overwrite oldest (highest last_heard_ms) */
+    /* No free slot — overwrite the OLDEST entry, i.e. the one that has not
+     * been heard from for the longest time.
+     *
+     * P2-6: the old code picked the HIGHEST last_heard_ms, which is the
+     * most RECENTLY heard neighbour — exactly the one we want to keep.
+     * With more than ANCHOR_MAX_NEIGHBORS neighbours the list therefore
+     * thrashed: every new neighbour threw away the freshest entry, the
+     * clock model of the anchors we could actually hear was reset over
+     * and over, and the Root's view of the network kept changing.
+     *
+     * HAL_GetTick() is a free-running 32-bit counter, so the comparison
+     * has to survive the wrap: the difference is evaluated as a SIGNED
+     * 32-bit value, which is correct across the wrap point.
+     */
     int oldest = 0;
     uint32_t oldest_ms = g_anchor.last_heard_ms[0];
     for (i = 1; i < ANCHOR_MAX_NEIGHBORS; i++) {
-        if (g_anchor.last_heard_ms[i] > oldest_ms) {
+        int32_t d = (int32_t)(g_anchor.last_heard_ms[i] - oldest_ms);
+        if (d < 0) {           /* strictly older than the current candidate */
             oldest_ms = g_anchor.last_heard_ms[i];
             oldest = i;
         }
