@@ -31,6 +31,12 @@ extern void test_run_info(unsigned char *data);
 #define OUTLIER_THRESH   3.0f     /* outlier = |residual| > OUTLIER_THRESH * rms */
 #define MIN_WEIGHT_KEEP  0.1f     /* minimum weight to keep anchor in solve */
 
+/* P2-10: when every anchor stands at the same height the vertical direction
+ * carries no information at all: the 3D normal equations are singular in z
+ * and the solver would only be fitting noise.  Below this spread the
+ * network is treated as a horizontal plane and the solve is done in 2D. */
+#define SAME_PLANE_TOL_CM  1.0f
+
 /*============================================================================
  * solve_3x3 — Cramer's rule for H * x = g  (H is 3x3, g and x are 3x1)
  * Returns 0 on success, -1 if near-singular.
@@ -85,54 +91,32 @@ static int solve_3x3(float H[3][3], const float g[3], float x[3])
  *
  *   Returns 0 on success, -1 on singular matrix, -2 on too few anchors.
  *============================================================================*/
-int tdoa_solve(const dl_anchor_entry_t *anchors,
-               const uint64_t *toa_dtu,
-               uint8_t num_anchors,
-               float *x_cm_out, float *y_cm_out, float *z_cm_out,
-               float *rms_out)
+/*============================================================================
+ * gn_solve — ONE Gauss-Newton run, started from a given seed
+ *
+ *   anchors[]   : N anchor positions (id, x_cm, y_cm, z_cm)
+ *   tdoa_cm[]   : N-1 TDOA values in cm, relative to anchor 0
+ *   use_2d      : solve in the horizontal plane only (z is not solved for)
+ *   x0/y0/z0    : the seed of the iteration
+ *
+ *   Returns 0 on success, -1 on a singular matrix.
+ *============================================================================*/
+static int gn_solve(const dl_anchor_entry_t *anchors,
+                    const float *tdoa_cm,
+                    uint8_t num_anchors,
+                    int use_2d,
+                    float x0, float y0, float z0,
+                    float *x_out, float *y_out, float *z_out,
+                    float *rms_out)
 {
-    float tdoa_cm[DL_MAX_ANCHORS];
     float r[DL_MAX_ANCHORS];
-    float x, y, z;
+    float x = x0, y = y0, z = z0;
     int iter, k;
-    uint8_t n;
-    int use_2d = 0;
+    uint8_t n = num_anchors;
 
     /* Outlier tracking: each measurement's weight (0 = rejected) */
     float weight[DL_MAX_ANCHORS];
     for (k = 0; k < DL_MAX_ANCHORS; k++) weight[k] = 1.0f;
-
-    n = num_anchors;
-    if (n < 2)
-        return -2;
-
-    /* Use 2D mode (fix z) when fewer than 4 anchors */
-    if (n < 4)
-        use_2d = 1;
-
-    /* 1. Convert TDOA to cm */
-    {
-        uint64_t ref = toa_dtu[0];
-        for (k = 1; k < (int)n; k++)
-        {
-            int64_t diff = (int64_t)(toa_dtu[k] - ref);
-            tdoa_cm[k] = (float)diff * CM_PER_DTU;
-        }
-    }
-
-    /* 2. Initial guess: centroid of all anchors */
-    {
-        float sx = 0, sy = 0, sz = 0;
-        for (k = 0; k < (int)n; k++)
-        {
-            sx += (float)anchors[k].x_cm;
-            sy += (float)anchors[k].y_cm;
-            sz += (float)anchors[k].z_cm;
-        }
-        x = sx / (float)n;
-        y = sy / (float)n;
-        z = sz / (float)n;
-    }
 
     float prev_rms = 1e9f;
     int diverge_count = 0;
@@ -297,9 +281,159 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
         prev_rms = w_rms;
     }
 
+    *x_out = x;
+    *y_out = y;
+    *z_out = z;
+    *rms_out  = prev_rms;
+    return 0;
+}
+
+/*============================================================================
+ * tdoa_solve — multi-start Gauss-Newton
+ *
+ *   anchors[]   : N anchor positions (id, x_cm, y_cm, z_cm)
+ *   toa_dtu[]   : N TOA timestamps in DWT time units (toa_dtu[0] = beacon)
+ *   num_anchors : total anchors (N ≥ 3 for 2D, N ≥ 4 for 3D)
+ *   x/y/z_cm_out: output position in cm
+ *   rms_out     : final RMS residual in cm
+ *
+ *   Returns 0 on success, -1 on singular matrix, -2 on too few anchors.
+ *
+ *   P2-11: the seed decides whether the iteration finds the right minimum.
+ *   The tag moves a few centimetres between two rounds, so the PREVIOUS
+ *   frame's solution is a far better seed than the centroid of the anchors
+ *   — and the centroid is kept as a second start, so that one bad previous
+ *   solution cannot trap the iteration in a local minimum for ever.  The
+ *   start with the smaller residual wins.
+ *============================================================================*/
+
+/* The last solution, used as the seed of the next solve. */
+static float s_prev_x_cm = 0.0f;
+static float s_prev_y_cm = 0.0f;
+static float s_prev_z_cm = 0.0f;
+static int   s_prev_valid = 0;
+
+int tdoa_solve(const dl_anchor_entry_t *anchors,
+               const uint64_t *toa_dtu,
+               uint8_t num_anchors,
+               float *x_cm_out, float *y_cm_out, float *z_cm_out,
+               float *rms_out)
+{
+    float tdoa_cm[DL_MAX_ANCHORS];
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+    int k;
+    uint8_t n = num_anchors;
+    int use_2d = 0;
+
+    if (n < 2)
+        return -2;
+
+    /* 1. Convert TDOA to cm */
+    {
+        uint64_t ref = toa_dtu[0];
+        for (k = 1; k < (int)n; k++)
+        {
+            int64_t diff = (int64_t)(toa_dtu[k] - ref);
+            tdoa_cm[k] = (float)diff * CM_PER_DTU;
+        }
+    }
+
+    /* 2. Centroid of the anchors — the neutral seed */
+    {
+        float sx = 0, sy = 0, sz = 0;
+        for (k = 0; k < (int)n; k++)
+        {
+            sx += (float)anchors[k].x_cm;
+            sy += (float)anchors[k].y_cm;
+            sz += (float)anchors[k].z_cm;
+        }
+        cx = sx / (float)n;
+        cy = sy / (float)n;
+        cz = sz / (float)n;
+    }
+
+    /* 3. 2D or 3D?
+     *    P2-10: also 2D when every anchor stands at the same height — the
+     *    vertical direction is then unobservable, the 3D normal equations
+     *    are singular in z and the solver would only be fitting noise.
+     *
+     *    A 3D solve needs one measurement MORE than the three unknowns:
+     *    with exactly four anchors the system is exactly determined, so a
+     *    noisy TDOA is fitted exactly — the residual stays near zero while
+     *    the position is off by a metre (measured on the host simulation:
+     *    5 cm of TDOA noise → 94 cm of position error).  Five anchors make
+     *    it over-determined and the least-squares fit stable. */
+    if (n < 5)
+        use_2d = 1;
+    {
+        float zmin = (float)anchors[0].z_cm;
+        float zmax = zmin;
+        for (k = 1; k < (int)n; k++)
+        {
+            float az = (float)anchors[k].z_cm;
+            if (az < zmin) zmin = az;
+            if (az > zmax) zmax = az;
+        }
+        if (zmax - zmin <= SAME_PLANE_TOL_CM)
+            use_2d = 1;
+    }
+
+    /* 4. Multi-start: the previous solution and the centroid.
+     *
+     *    When the 3D system turns out to be singular the whole solve is
+     *    repeated in the horizontal plane.  That is not a rare corner:
+     *    with a tag INSIDE the polygon of the anchors the rows of the
+     *    TDOA Jacobian are nearly parallel, the normal matrix is
+     *    ill-conditioned, and the old code returned -1 — the tag printed
+     *    NO position at all for a four-anchor network. */
+    {
+        float bx = 0.0f, by = 0.0f, bz = 0.0f, br = 0.0f;
+        int have = 0;
+        int used_2d = use_2d;
+        int attempts = use_2d ? 1 : 2;
+        int attempt;
+
+        for (attempt = 0; attempt < attempts && !have; attempt++)
+        {
+            int try_2d = use_2d || (attempt > 0);
+
+            if (s_prev_valid)
+            {
+                float tx, ty, tz, tr;
+                if (gn_solve(anchors, tdoa_cm, n, try_2d,
+                             s_prev_x_cm, s_prev_y_cm, s_prev_z_cm,
+                             &tx, &ty, &tz, &tr) == 0)
+                {
+                    bx = tx; by = ty; bz = tz; br = tr; have = 1; used_2d = try_2d;
+                }
+            }
+            {
+                float tx, ty, tz, tr;
+                if (gn_solve(anchors, tdoa_cm, n, try_2d, cx, cy, cz,
+                             &tx, &ty, &tz, &tr) == 0)
+                {
+                    if (!have || tr < br) { bx = tx; by = ty; bz = tz; br = tr; have = 1; used_2d = try_2d; }
+                }
+            }
+        }
+        if (!have)
+            return -1;
+
+        x = bx; y = by; z = bz;
+
+        /* Remember the solution as the seed of the next round. */
+        s_prev_x_cm = bx; s_prev_y_cm = by; s_prev_z_cm = bz; s_prev_valid = 1;
+
+        /* In the horizontal-plane solve the height carries no information:
+         * report the plane of the anchors, not the seed. */
+        if (used_2d) z = cz;
+
+        *rms_out = br;
+    }
+
     *x_cm_out = x;
     *y_cm_out = y;
     *z_cm_out = z;
-    *rms_out  = prev_rms;
     return 0;
 }
