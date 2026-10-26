@@ -174,6 +174,56 @@ static int16_t  s_solve_z_cm    = 0;
 static uint16_t s_solve_q       = TAG_REPORT_QUALITY_NONE;
 static uint32_t s_solve_ms      = 0;
 static uint8_t  s_report_seq    = 0;
+
+/*============================================================================
+ * tag_build_pos_report — THE position report, one format for both outputs
+ *
+ * P2-3: the tag used to send a 47-byte frame over its local UART and a
+ * 22-byte frame over UWB.  The two shared the header but not the length,
+ * and byte 2 meant different things (the UART frame carried the firmware
+ * version, the UWB frame a sequence counter) — so a parser had to know
+ * which link it was looking at, and the two could not be compared.
+ *
+ * Now ONE builder fills ONE 22-byte frame, and the very same bytes go out
+ * over the air and over the wire.  (The local frame also used to send
+ * z = 0 while the radio frame sent the real height.)
+ *==========================================================================*/
+static void tag_build_pos_report(uint8_t *pkt)
+{
+    int16_t  x, y, z;
+    uint16_t q;
+
+    /* The payload: the last solution, or the "no solution" marker. */
+    x = s_solve_x_cm; y = s_solve_y_cm; z = s_solve_z_cm;
+    q = s_solve_q;
+    if (!s_solve_valid) {
+        x = 0; y = 0; z = 0;
+        q = TAG_REPORT_QUALITY_NONE;
+    } else if ((HAL_GetTick() - s_solve_ms) > 500u) {
+        /* The solution is stale — the tag is alive but no longer solving. */
+        q = TAG_REPORT_QUALITY_NONE;
+    }
+
+    memset(pkt, 0, DL_POS_REPORT_LEN);
+    pkt[0] = 0x41; pkt[1] = 0x88;
+    pkt[2] = s_report_seq++;
+    pkt[3] = 0xCA; pkt[4] = 0xDE;
+    pkt[5] = 0xFF; pkt[6] = 0xFF;                 /* broadcast */
+    pkt[7] = (uint8_t)(s_tag_id & 0xFF);
+    pkt[8] = (uint8_t)(s_tag_id >> 8);
+    pkt[9] = FUNC_DL_POS_REPORT;
+    pkt[10] = (uint8_t)((uint16_t)x & 0xFF);
+    pkt[11] = (uint8_t)(((uint16_t)x >> 8) & 0xFF);
+    pkt[12] = (uint8_t)((uint16_t)y & 0xFF);
+    pkt[13] = (uint8_t)(((uint16_t)y >> 8) & 0xFF);
+    pkt[14] = (uint8_t)((uint16_t)z & 0xFF);
+    pkt[15] = (uint8_t)(((uint16_t)z >> 8) & 0xFF);
+    pkt[16] = (uint8_t)(q & 0xFF);
+    pkt[17] = (uint8_t)((q >> 8) & 0xFF);
+    pkt[18] = (uint8_t)(FW_VERSION_U16 & 0xFF);
+    pkt[19] = (uint8_t)((FW_VERSION_U16 >> 8) & 0xFF);
+    /* [20..21] pad */
+}
 static uint32_t s_n_report_tx   = 0;    /* reports actually transmitted      */
 static uint32_t s_n_report_skip = 0;    /* reports dropped (too late)        */
 
@@ -670,26 +720,12 @@ static void tag_solve_and_report(void)
         test_run_info((unsigned char *)out);
     }
 #else
-    /* 47-byte binary protocol via UART2 */
+    /* P2-3: the local UART carries the SAME 22-byte report as the radio.
+     * One format, one parser — and the height is no longer dropped. */
     {
-        uint8_t tx[48];
-        tx[0] = 0x41; tx[1] = 0x88;
-        tx[2] = FW_VERSION_BYTE;
-        tx[3] = 0xCA; tx[4] = 0xDE;
-        tx[5] = 0xFF; tx[6] = 0xFF;
-        tx[7] = DL_TAG_ID & 0xFF; tx[8] = DL_TAG_ID >> 8;
-        tx[9] = FUNC_DL_POS_REPORT;
-        int16_t xi = (int16_t)x_cm, yi = (int16_t)y_cm, zi = 0;
-        uint16_t qi = (uint16_t)(rms / 100.0f * 1000.0f);
-        tx[10] = xi & 0xFF; tx[11] = (xi >> 8) & 0xFF;
-        tx[12] = yi & 0xFF; tx[13] = (yi >> 8) & 0xFF;
-        tx[14] = zi & 0xFF; tx[15] = (zi >> 8) & 0xFF;
-        tx[16] = qi & 0xFF; tx[17] = (qi >> 8) & 0xFF;
-        tx[18] = FW_VERSION_U16 & 0xFF; tx[19] = (FW_VERSION_U16 >> 8) & 0xFF;
-        int k;
-        for (k = 20; k < 47; k++) tx[k] = 0;
-        tx[47] = 0;
-        HAL_UART_Transmit(&huart2, tx, 47, 10);
+        uint8_t tx[DL_POS_REPORT_LEN];
+        tag_build_pos_report(tx);
+        HAL_UART_Transmit(&huart2, tx, DL_POS_REPORT_LEN, 10);
     }
 #endif
 }
@@ -1171,8 +1207,6 @@ static void tag_tx_pos_report(uint64_t root_rx)
     uint8_t  pkt[DL_POS_REPORT_LEN];
     uint64_t now, target, slot1;
     uint32_t delay_us;
-    int16_t  x, y, z;
-    uint16_t q;
 
     /* ALOHA offset — an LFSR seeded from the UID, so that two tags in the
      * room do not always report in the same microsecond. */
@@ -1205,36 +1239,8 @@ static void tag_tx_pos_report(uint64_t root_rx)
         target = 0;
     }
 
-    /* The payload: the last solution, or the "no solution" marker. */
-    x = s_solve_x_cm; y = s_solve_y_cm; z = s_solve_z_cm;
-    q = s_solve_q;
-    if (!s_solve_valid) {
-        x = 0; y = 0; z = 0;
-        q = TAG_REPORT_QUALITY_NONE;
-    } else if ((HAL_GetTick() - s_solve_ms) > 500u) {
-        /* The solution is stale — the tag is alive but no longer solving. */
-        q = TAG_REPORT_QUALITY_NONE;
-    }
-
-    memset(pkt, 0, sizeof(pkt));
-    pkt[0] = 0x41; pkt[1] = 0x88;
-    pkt[2] = s_report_seq++;
-    pkt[3] = 0xCA; pkt[4] = 0xDE;
-    pkt[5] = 0xFF; pkt[6] = 0xFF;                 /* broadcast */
-    pkt[7] = (uint8_t)(s_tag_id & 0xFF);
-    pkt[8] = (uint8_t)(s_tag_id >> 8);
-    pkt[9] = FUNC_DL_POS_REPORT;
-    pkt[10] = (uint8_t)((uint16_t)x & 0xFF);
-    pkt[11] = (uint8_t)(((uint16_t)x >> 8) & 0xFF);
-    pkt[12] = (uint8_t)((uint16_t)y & 0xFF);
-    pkt[13] = (uint8_t)(((uint16_t)y >> 8) & 0xFF);
-    pkt[14] = (uint8_t)((uint16_t)z & 0xFF);
-    pkt[15] = (uint8_t)(((uint16_t)z >> 8) & 0xFF);
-    pkt[16] = (uint8_t)(q & 0xFF);
-    pkt[17] = (uint8_t)((q >> 8) & 0xFF);
-    pkt[18] = (uint8_t)(FW_VERSION_U16 & 0xFF);
-    pkt[19] = (uint8_t)((FW_VERSION_U16 >> 8) & 0xFF);
-    /* [20..21] pad */
+    /* P2-3: the same builder as the local UART path — one format. */
+    tag_build_pos_report(pkt);
 
     /* Quiet the radio before the TX, exactly like the anchors do. */
     port_DisableEXT_IRQ();
