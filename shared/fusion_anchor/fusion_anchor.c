@@ -3,8 +3,9 @@
  *  @brief   BD8NCF-style per-anchor TimeSync broadcaster (Phase 1.1)
  *
  *  Every anchor runs the same firmware.  Each anchor:
- *    - Periodically broadcasts a compact 26-byte TimeSync frame (~100 ms cadence)
- *      carrying its predicted TX timestamp, cs_level, parent_EUI64, position.
+ *    - Broadcasts one compact 63-byte TimeSync frame per TDMA round (50 ms
+ *      → 20 frames/s) at its own slot instant, carrying the exact TX
+ *      timestamp, cs_level, parent_EUI64, position.
  *    - Listens between broadcasts for other anchors' TimeSync frames and
  *      updates its per-source Kalman clock-sync state (see clock_sync.h).
  *    - Accepts COORD_WRITE from the Gateway via UWB unicast to set its
@@ -54,18 +55,30 @@ extern void test_run_info(unsigned char *data);
 /*============================================================================
  * Compile-time configuration
  *============================================================================*/
-#define ANCHOR_RX_POLL_MS         78       /* Listen window inside the 80 ms TDMA cycle */
-#define ANCHOR_PERIOD_MS          DL_TIMESYNC_PERIOD_MS   /* 80 ms = 8 slots × 10 ms */
+#define ANCHOR_RX_POLL_MS         48       /* Listen window inside the 50 ms TDMA round */
+#define ANCHOR_PERIOD_MS          DL_TIMESYNC_PERIOD_MS   /* 50 ms = 8 slots × 6.25 ms */
 #define ANCHOR_MAX_NEIGHBORS      DL_MAX_TRACKED_ANCHORS
-#define ANCHOR_SLOT_DTU_US        DL_SLOT_DTU_US           /* 10 ms per TDMA slot */
+#define ANCHOR_SLOT_DTU_US        DL_SLOT_DTU_US           /* 6.25 ms per TDMA slot */
 #define ANCHOR_MAX_SLOTS          8        /* max simultaneous anchors in slot table */
 
-/* Lead time before the scheduled TX instant at which the delayed-TX is armed.
- * 2 ms — comfortably above the jitter of the listen-window wake-up (Sleep(1)
- * granularity) so that the wake-up never lands "too late to arm" and never
- * pushes the transmission into the next cycle. */
-#define ANCHOR_TX_LEAD_US         2000u
+/* Lead time before the scheduled TX instant at which the listen window ends
+ * and the delayed TX is armed.
+ *
+ * 4 ms — comfortably above the wake-up jitter of the listen window (Sleep(1)
+ * granularity, ~1 ms) so that the anchor always still has time to program the
+ * delayed TX, and still below the 6.25 ms slot width so the anchor keeps
+ * hearing the beacon of the slot in front of it. */
+#define ANCHOR_TX_LEAD_US         4000u
 #define ANCHOR_TX_LEAD_DTU        ((uint64_t)ANCHOR_TX_LEAD_US * UUS_TO_DWT_TIME)
+
+/* Minimum time that must still be left before the TX instant to program the
+ * delayed TX (SPI writes + dwt_starttx, ~100 µs).  This — NOT the lead — is
+ * the criterion for "can I still arm it": the lead only says when the listen
+ * window ends.  Using the lead as the criterion made the check land exactly
+ * on the wake-up boundary, and since the wake-up overshoots by up to one
+ * Sleep(1) tick the anchor dropped every grid beacon. */
+#define ANCHOR_TX_PROGRAM_US      300u
+#define ANCHOR_TX_PROGRAM_DTU     ((uint64_t)ANCHOR_TX_PROGRAM_US * UUS_TO_DWT_TIME)
 
 /* Antenna delay — must match Tag (same DW3000 hardware) */
 #define TX_ANT_DLY 16385
@@ -254,7 +267,7 @@ static uint32_t     s_twr_last_tx_ms = 0;  /* when the last correction batch wen
  *
  * Both disappear once the TX instant is corrected with the calibrated δ.
  * Note that the programmed instant is truncated to the DX_TIME granularity
- * of 256 DTU (4 ns); because the TDMA period (80 ms = 5,111,840,000 DTU) is
+ * of 256 DTU (4 ns); because the TDMA round (50 ms = 3,194,900,000 DTU) is
  * an exact multiple of 256 DTU, every grid target shares the same truncation
  * offset — so it is a constant and is absorbed by the calibration.
  *==========================================================================*/
@@ -749,7 +762,13 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
         uint64_t k    = (now - s_root_grid_base) / period;
         uint64_t tgt = s_root_grid_base + k * period;
         uint16_t cyc = (uint16_t)(k & 0xFFFFu);
-        if (tgt + ANCHOR_TX_LEAD_DTU < now) {   /* this cycle's instant is gone */
+        /* If this round's instant has already passed, take the next one.
+         * The criterion is "the instant is gone", NOT "the instant is more
+         * than LEAD in the past": with the latter the anchor kept an already
+         * passed instant as its target after its own transmission, dropped
+         * that round and then spun on the stale target until the lead had
+         * elapsed — a whole round of silence plus a busy-wait. */
+        if (tgt <= now) {
             tgt += period;
             cyc = (uint16_t)(cyc + 1u);
         }
@@ -790,7 +809,8 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
      * correction s_twr_corr_dtu is applied where base_origin is built. */
 
     uint16_t cyc  = (uint16_t)(g_tdma_ref.root_cycle_id + (uint16_t)k);
-    if (tgt + ANCHOR_TX_LEAD_DTU < now) {
+    /* Same rule as on the Root: the instant has passed → take the next one. */
+    if (tgt <= now) {
         tgt += period_local;
         cyc = (uint16_t)(cyc + 1u);
     }
@@ -803,8 +823,8 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
  *
  * P0-3: the gate and the transmission now share the SAME time source — the
  * function hands the caller the exact instant to transmit at, and it also
- * guarantees at most ONE transmission per TDMA cycle (never two in the same
- * slot, and never a whole cycle skipped because the gate and the radio
+ * guarantees at most ONE transmission per TDMA round (never two in the same
+ * slot, and never a whole round skipped because the gate and the radio
  * disagreed).
  *
  * Returns true if TX is permitted; *target_out / *cycle_out are then valid.
@@ -848,11 +868,11 @@ static bool tdma_may_tx(uint64_t *target_out, uint16_t *cycle_out)
 
     if (!tdma_grid_target(target_out, cycle_out)) return false;
 
-    /* At most one transmission per TDMA cycle: the grid instant of the cycle
+    /* At most one transmission per TDMA round: the grid instant of the round
      * we already used must not be reused. */
     uint64_t period = (uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME;
     if (s_last_tx_target != 0 && *target_out <= s_last_tx_target + period / 2u) {
-        return false;   /* this cycle was already transmitted */
+        return false;   /* this round was already transmitted */
     }
     return true;
 }
@@ -880,7 +900,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
 
     /* ── P0-2: THIS frame's TX instant, not the previous frame's ──────────
      * The frame used to carry prev_tx_ts_ext while every receiver paired it
-     * with THIS frame's rx_local — a whole TDMA period (80 ms) plus the
+     * with THIS frame's rx_local — a whole TDMA round (50 ms) plus the
      * propagation delay leaked into the clock offset estimate, so the filter
      * learned a wrong quantity and the child's grid placement inherited the
      * Root's per-cycle TX jitter.
@@ -946,7 +966,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pkt[DL_TS_COORD_IDX + 7] = 0xDD;
 
     /* P0-4: TDMA cycle counter.  The Tag only pairs beacons that carry the
-     * same cycle id — one cycle of skew is 80 ms, far beyond the TDOA
+     * same cycle id — one round of skew is 50 ms, far beyond the TDOA
      * acceptance window. */
     pkt[DL_TS_CYCLE_IDX]     = (uint8_t)(cycle_id & 0xFF);
     pkt[DL_TS_CYCLE_IDX + 1] = (uint8_t)(cycle_id >> 8);
@@ -2482,10 +2502,22 @@ static void anchor_loop(void)
         if (tx_armed) {
             uint64_t now = now_sys_ext();
             if (now + ANCHOR_TX_LEAD_DTU < tx_target) {
-                /* not yet due — wait for the instant (should not happen) */
+                /* not yet due — wait for the instant (should not happen:
+                 * the listen window ends at tx_target - LEAD) */
                 while (now_sys_ext() + ANCHOR_TX_LEAD_DTU < tx_target) { Sleep(1); }
+                now = now_sys_ext();
             }
-            if (now_sys_ext() + ANCHOR_TX_LEAD_DTU <= tx_target) {
+            /* Arm the delayed TX if there is still time to program it.
+             *
+             * The criterion is the PROGRAMMING margin (~300 µs), not the
+             * lead: the lead only decides when the listen window ends, and
+             * the wake-up overshoots that point by up to one Sleep(1) tick.
+             * Testing "now + LEAD <= target" instead put the check exactly
+             * on the wake-up boundary, so the anchor rejected every grid
+             * beacon it was supposed to send and the whole TDMA stayed
+             * silent.  With the 4 ms lead the wake-up still leaves ≥ 3 ms
+             * of slack, so the beacon goes out on the grid every round. */
+            if (now + ANCHOR_TX_PROGRAM_DTU <= tx_target) {
                 anchor_tx_timesync(tx_target, tx_cycle);
                 /* DS-TWR: the Root ships the measured path correction to one
                  * child per cycle.  We are in slot 0 right now, so the extra
@@ -2586,7 +2618,8 @@ static void anchor_loop(void)
 }
 
 /* Stub: AT+RATE command from gateway — not implemented in Phase 1.1
- * (fixed 100 ms period via DL_TIMESYNC_PERIOD_MS). */
+ * (fixed 50 ms round via DL_TIMESYNC_PERIOD_MS; one cycle = 2 rounds
+ *  = 100 ms). */
 void dl_set_beacon_interval(uint16_t ms)
 {
     (void)ms;
