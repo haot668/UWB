@@ -41,9 +41,9 @@ extern "C" {
 #define AUTO_BEACON_INTERVAL_S     10u     /* Master beacon interval (sec)   */
 
 /*============================================================================
- * Max anchors (rank 0 = master, 1..15 = slaves)
+ * Max anchors (rank 0 = master, 1..7 = slaves)
  *============================================================================*/
-#define AUTO_ANCHOR_MAX            16u
+#define AUTO_ANCHOR_MAX            8u
 
 /*============================================================================
  * Frame lengths
@@ -86,7 +86,7 @@ typedef enum {
  *============================================================================*/
 typedef struct {
     auto_state_t state;
-    uint8_t      my_rank;           /* 0 = master, 1..15 = slave        */
+    uint8_t      my_rank;           /* 0 = master, 1..7 = slave         */
     uint8_t      group_id;          /* Anchor group (from master beacon) */
     uint8_t      node_count;        /* Total anchors in group            */
     uint32_t     my_uid32;          /* STM32 UID[31:0] for election      */

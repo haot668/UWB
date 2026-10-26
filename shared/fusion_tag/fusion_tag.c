@@ -240,14 +240,14 @@ static void tag_solve_and_report(void)
     }
 
     /* Build packed arrays for tdoa_solve:
-     * Slot-based TDOA: toa_equiv = rx - slot × 5ms
+     * Slot-based TDOA: toa_equiv = rx - slot × 10ms
      * This normalizes all beacons to slot=0 (Root's TX time).
      * No anchor clock sync needed: Tag's local clock is the common reference.
      *
      * DTU bookkeeping (P0-4): one DW3000 device time unit is 15.65 ps, so
-     * 1 µs = 63,898 DTU and one 5 ms TDMA slot = 5000 × 63898 = 319,490,000
+     * 1 µs = 63,898 DTU and one 10 ms TDMA slot = 10000 × 63898 = 638,980,000
      * DTU.  The old constant (192,000) belonged to a 38.4 DTU/µs clock and was
-     * 1664× too small: the slot compensation could never cancel the 0..75 ms
+     * 3328× too small: the slot compensation could never cancel the 0..70 ms
      * spread between the slots, every TDOA was rejected and the solver
      * collapsed onto the centroid of the anchors. */
     #define DTU_PER_SLOT  ((int64_t)DL_SLOT_DTU_US * (int64_t)UUS_TO_DWT_TIME)
@@ -264,11 +264,11 @@ static void tag_solve_and_report(void)
 
     /* ── Slot spacing is defined in the ROOT's clock, not in ours ──────────
      * The anchors place their beacons on the Root's grid: anchor k transmits
-     * at  G + slot_k × 5 ms  where G and the 5 ms are the ROOT's clock.
-     * Our own crystal differs from the Root's by up to ±20 ppm, so 5 ms is
-     * 5 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
-     * clock).  Subtracting the nominal 5 ms instead would leave a per-anchor
-     * error of slot × 5 ms × 20 ppm = up to 700 ns ≈ 21 cm at slot 7 — far
+     * at  G + slot_k × 10 ms  where G and the 10 ms are the ROOT's clock.
+     * Our own crystal differs from the Root's by up to ±20 ppm, so 10 ms is
+     * 10 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
+     * clock).  Subtracting the nominal 10 ms instead would leave a per-anchor
+     * error of slot × 10 ms × 20 ppm = up to 1400 ns ≈ 42 cm at slot 7 — far
      * above the 0.67 ns the 20 cm target needs.  f is measured from the
      * Root's own beacon (its in-frame TX timestamp vs. our RX timestamp),
      * which is exactly the clock_sync factor of the Root's tracker. */
@@ -293,7 +293,7 @@ static void tag_solve_and_report(void)
 
     /* ── P0-4: only beacons of the SAME TDMA cycle may be paired ─────────
      * The slot-compensated TDOA
-     *     toa = rx_local - slot × 5 ms
+     *     toa = rx_local - slot × 10 ms
      * cancels the cycle origin only when every beacon belongs to the same
      * cycle — one cycle of skew is 80 ms = 5.1 M DTU and would poison every
      * pair it enters.  Find the cycle most of the visible anchors are
@@ -339,7 +339,7 @@ static void tag_solve_and_report(void)
 
     if (use_slot_compensation) {
         /* ── Slot-compensated TDOA ────────────────────────────────────────
-         * toa_equiv = rx - slot × 5ms (normalizes all to slot=0)
+         * toa_equiv = rx - slot × 10ms (normalizes all to slot=0)
          * Works when anchors are in Root's TDMA table. */
 
         /* Select ref = lowest slot number (Root = slot 0) */
@@ -887,7 +887,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     }
 
     /* ── P1-2: TDOA against the Root, averaged over several cycles ───────
-     * toa_equiv = rx_local - slot x 5 ms removes the TDMA slot from the
+     * toa_equiv = rx_local - slot x 10 ms removes the TDMA slot from the
      * arrival instant.  Against the Root's beacon of the SAME cycle the
      * cycle origin cancels as well, so the difference is the pure TDOA —
      * and, unlike the absolute TOA, it is comparable across cycles and

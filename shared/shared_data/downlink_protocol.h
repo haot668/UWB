@@ -45,7 +45,7 @@ extern "C" {
  * Manual network configuration
  *============================================================================*/
 #define NET_CHILD_TX_DELAY_MS   200u   /* Child waits this long after NET_START before TX */
-#define NET_MAX_SLOTS          16u     /* Max TDMA slots (same as ANCHOR_MAX_SLOTS) */
+#define NET_MAX_SLOTS          8u      /* Max TDMA slots (same as ANCHOR_MAX_SLOTS) */
 #define NET_CONFIRM_TIMEOUT_MS  3000u  /* Child waits up to 3s for Root slot confirmation */
 #define NET_DISCOVERY_PERIOD_MS 300u   /* Anchor discovery beacon period while NET_IDLE */
 #define NET_RUNNING_DISCOVERY_MS 2000u /* Low-rate discovery heartbeat once networked (P2-4) */
@@ -55,7 +55,7 @@ extern "C" {
 /* Roster of participating anchors carried by NETWORK_START (P1-1).
  * Every anchor receives the SAME ordered list, so bit N of the Root's
  * presence mask always refers to the same participant on every node. */
-#define NET_MAX_PARTICIPANTS   16u
+#define NET_MAX_PARTICIPANTS   8u
 #define NET_MIN_PARTICIPANTS   3u     /* fewer anchors -> TDOA is degenerate */
 
 /*============================================================================
@@ -134,18 +134,25 @@ extern "C" {
  * Timing constants — per-anchor self-broadcast (BD8NCF style)
  *
  * TDMA grid (P0-2/P0-3): the network runs in cycles of
- *   DL_MAX_SLOTS × DL_SLOT_DTU_US = 16 × 5 ms = 80 ms.
+ *   NET_MAX_SLOTS × DL_SLOT_DTU_US = 8 × 10 ms = 80 ms.
  * Slot 0 belongs to the Root; the Root's beacon defines the cycle origin.
  * Every anchor transmits exactly once per cycle, at
- *   cycle_origin + slot × 5 ms
+ *   cycle_origin + slot × 10 ms
  * where cycle_origin is derived from the DW3000 SYS_TIME axis (never from
  * HAL_GetTick()), so all anchors share ONE physical time grid.
+ *
+ * The network is capped at 8 anchors (1 Root + 7 children).  The 80 ms
+ * cycle is kept; each slot is widened to 10 ms, which doubles the per-slot
+ * guard against clock drift while keeping the update rate (12.5 Hz) and all
+ * the RX/timing loops untouched.  Halving the slot table also halves the
+ * per-anchor state arrays (see ANCHOR_MAX_NEIGHBORS / DL_MAX_TRACKED_ANCHORS)
+ * — the real win on the 64 KB STM32L412.
  *============================================================================*/
-#define DL_TIMESYNC_PERIOD_MS      80u     /* 16 slots × 5 ms = one TDMA cycle  */
+#define DL_TIMESYNC_PERIOD_MS      80u     /* 8 slots × 10 ms = one TDMA cycle  */
 #define DL_TIMESYNC_PERIOD_UUS     80000u
-#define DL_SLOT_DTU_US             5000u   /* one TDMA slot = 5 ms               */
+#define DL_SLOT_DTU_US             10000u  /* one TDMA slot = 10 ms              */
 #define DL_RX_WINDOW_MS            80u     /* Tag RX window: 80ms covers 1-2 anchor TX cycles */
-#define DL_MAX_TRACKED_ANCHORS     16u     /* Tag tracks up to 16 anchors         */
+#define DL_MAX_TRACKED_ANCHORS     8u      /* Tag tracks up to 8 anchors          */
 
 /* Anchor election (used during Phase 1.2 cascading sync) ----------------- */
 #define DL_CS_LEVEL_UNINIT         0xFFu  /* Anchor not yet assigned a level     */
@@ -154,7 +161,7 @@ extern "C" {
 #define DL_SCAN_TIMEOUT_MS          5000u  /* 5-second scan period on boot          */
 
 /*============================================================================
- * TimeSync frame layout (79 bytes total, including the 10-byte header)
+ * TimeSync frame layout (63 bytes total, including the 10-byte header)
  *   [0-1]   frame_ctrl       (0x41, 0x88)
  *   [2]     seq8
  *   [3-4]   pan_id           (0xCA, 0xDE)
@@ -167,13 +174,13 @@ extern "C" {
  *   [18]    slot             (own TDMA slot, 255 = unassigned/ALOHA)
  *   [19-26] parent_eui64     (8 bytes, 0 if cs_level=0)
  *   [27]    cs_level         (0xFF uninit, 0=root, 1+=child)   <-- P0-1
- *   [28-59] slot_table       (16 × uint16 rank, 0 = empty)     <-- P0-2
- *   [60-67] x/y/z coords (int16 each) + 2 pad bytes
- *   [68-69] cycle_id         (uint16, TDMA cycle counter)      <-- P0-4
- *   [70-71] present_mask     (uint16, roster presence bitmap)   <-- P1-1
- *   [72-76] rx_ref_ts40      (40-bit, RX instant of the frame this
+ *   [28-43] slot_table       (8 × uint16 rank, 0 = empty)      <-- P0-2
+ *   [44-51] x/y/z coords (int16 each) + 2 pad bytes
+ *   [52-53] cycle_id         (uint16, TDMA cycle counter)      <-- P0-4
+ *   [54-55] present_mask     (uint16, roster presence bitmap)   <-- P1-1
+ *   [56-60] rx_ref_ts40      (40-bit, RX instant of the frame this
  *                             beacon used as its clock reference) <-- DS-TWR
- *   [77-78] rx_ref_cycle     (uint16, cycle id of that frame)     <-- DS-TWR
+ *   [61-62] rx_ref_cycle     (uint16, cycle id of that frame)     <-- DS-TWR
  * DW3000 appends 2-byte CRC automatically; we still pad 2 bytes
  * before CRC zone to absorb DW3210 RX last-2-byte corruption.
  *
@@ -183,7 +190,7 @@ extern "C" {
  *
  * P0-4: cycle_id tells the Tag which TDMA cycle a beacon belongs to.  The
  *       slot-compensated TDOA formula
- *           toa = rx_local - slot × 5 ms
+ *           toa = rx_local - slot × 10 ms
  *       only cancels the cycle origin when all beacons come from the SAME
  *       cycle; one cycle of skew is 80 ms = 3.07 M DTU, far beyond the
  *       ±1.06 M DTU acceptance window.  The Tag now only pairs beacons
@@ -212,18 +219,18 @@ extern "C" {
  *       correction back (FUNC_TWR_CORR), so the child can place its own
  *       beacon exactly on the Root's grid.
  *============================================================================*/
-#define DL_TIMESYNC_LEN            79u
+#define DL_TIMESYNC_LEN            63u
 #define DL_TS_TX_TS_IDX           10u    /* 5-byte TX timestamp (lower 40 bits)    */
 #define DL_TS_FLAGS_IDX           15u    /* bit0 = TX_TS_PRECISE                    */
 #define DL_TS_SLOT_IDX            18u    /* own TDMA slot (255 = unassigned)        */
 #define DL_TS_PARENT_EUI_IDX      19u    /* 8-byte EUI64                             */
 #define DL_TS_LEVEL_IDX           27u    /* cs_level (P0-1: was DL_TS_CS_LEVEL_IDX) */
-#define DL_TS_SLOT_TABLE_IDX      28u    /* 16 × uint16_t rank, 0 = empty           */
-#define DL_TS_COORD_IDX           60u    /* x/y/z coords appended after slot table  */
-#define DL_TS_CYCLE_IDX           68u    /* uint16 TDMA cycle counter                */
-#define DL_TS_PRESENT_IDX         70u    /* uint16 roster presence bitmap            */
-#define DL_TS_RX_REF_TS_IDX       72u    /* 5-byte RX instant of the reference frame */
-#define DL_TS_RX_REF_CYCLE_IDX    77u    /* uint16 cycle id of that reference frame  */
+#define DL_TS_SLOT_TABLE_IDX      28u    /* 8 × uint16_t rank, 0 = empty            */
+#define DL_TS_COORD_IDX           44u    /* x/y/z coords appended after slot table  */
+#define DL_TS_CYCLE_IDX           52u    /* uint16 TDMA cycle counter                */
+#define DL_TS_PRESENT_IDX         54u    /* uint16 roster presence bitmap            */
+#define DL_TS_RX_REF_TS_IDX       56u    /* 5-byte RX instant of the reference frame */
+#define DL_TS_RX_REF_CYCLE_IDX    61u    /* uint16 cycle id of that reference frame  */
 
 /* TimeSync frame flags */
 #define DL_TS_FLAG_TX_TS_PRECISE  0x01u  /* tx_timestamp40 is exact (delayed TX)    */
@@ -247,7 +254,7 @@ extern "C" {
  *   P1-3: the corrections of ALL children travel in ONE frame, one batch
  *   per TDMA cycle.  The previous scheme (one unicast per cycle, round
  *   robin over the children) delayed a child's correction by up to N
- *   cycles — 1.3 s for 16 anchors — which made a "2 cycle" freshness
+ *   cycles — 0.64 s for 8 anchors — which made a "2 cycle" freshness
  *   limit impossible and let the path delay go badly stale.  With the
  *   batch every child learns its own delay every cycle.
  *
@@ -266,7 +273,7 @@ extern "C" {
 #define DL_TWR_CORR_QUAL_IDX    11u
 #define DL_TWR_CORR_ENTRY_IDX   12u
 #define DL_TWR_CORR_ENTRY_LEN   4u     /* rank (u16) + corr_dtu (u16)            */
-#define DL_TWR_CORR_MAX_ENTRIES 16u
+#define DL_TWR_CORR_MAX_ENTRIES 8u
 #define DL_TWR_CORR_MAX_LEN     (DL_TWR_CORR_HDR_LEN \
                                  + DL_TWR_CORR_ENTRY_LEN * DL_TWR_CORR_MAX_ENTRIES)
 
@@ -306,7 +313,7 @@ extern "C" {
  *   [20-21] pad (DW3210 RX corruption)
  *============================================================================*/
 #define DL_POS_REPORT_LEN          22u
-#define DL_MAX_ANCHORS             16u    /* Backward-compat for tdoa_solver.c */
+#define DL_MAX_ANCHORS             8u     /* Backward-compat for tdoa_solver.c */
 
 /*============================================================================
  * Per-anchor position entry (7 bytes, int16 cm — full field range)

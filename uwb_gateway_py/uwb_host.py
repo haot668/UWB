@@ -14,6 +14,15 @@ import sys
 import serial
 import serial.tools.list_ports
 
+# ══════════════════════════════════════════════
+#  方案参数（必须与固件 downlink_protocol.h 保持一致）
+# ══════════════════════════════════════════════
+# NET_MAX_PARTICIPANTS：一次组网最多参与的基站总数（1 个 Root + 7 个子站）。
+# 固件侧 NET_MAX_PARTICIPANTS 也是 8，超出的成员会被丢弃，所以上位机要拦。
+NET_MAX_PARTICIPANTS = 8
+# 少于 3 个基站时 TDOA 解算没有几何约束，坐标会退化到质心。
+NET_MIN_PARTICIPANTS = 3
+
 # ── High DPI ──
 if sys.platform == "win32":
     try:
@@ -1821,10 +1830,19 @@ def build_settings():
             for rank, var in sorted(participate.items()):
                 if var.get() and rank != root_rank and rank not in roster:
                     roster.append(rank)
-            if len(roster) < 3:
+            if len(roster) < NET_MIN_PARTICIPANTS:
                 if not messagebox.askyesno("开始组网",
                         f"当前名单只有 {len(roster)} 个基站。\n\n"
-                        "少于 3 个基站时 TDOA 解算没有几何约束，坐标会退化到质心。\n"
+                        f"少于 {NET_MIN_PARTICIPANTS} 个基站时 TDOA 解算没有几何约束，"
+                        "坐标会退化到质心。\n"
+                        "仍然继续组网吗？", parent=dlg):
+                    return
+            if len(roster) > NET_MAX_PARTICIPANTS:
+                if not messagebox.askyesno("开始组网",
+                        f"当前名单有 {len(roster)} 个基站。\n\n"
+                        f"本方案最多支持 {NET_MAX_PARTICIPANTS} 个基站"
+                        f"（1 个 Root + {NET_MAX_PARTICIPANTS - 1} 个子站），"
+                        "超出的成员会被固件丢弃。\n"
                         "仍然继续组网吗？", parent=dlg):
                     return
             dlg.destroy()

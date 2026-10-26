@@ -37,7 +37,7 @@ extern "C" {
  * microsecond one.  Everything that converts between cm and DTU must use the
  * constants below — never a bare number.
  *
- *   1 m   = 213.20 DTU        5 ms slot = 319,490,000 DTU
+ *   1 m   = 213.20 DTU        10 ms slot = 638,980,000 DTU
  *   1 cm  =   2.1320 DTU       40-bit wrap = 17.21 s
  *   20 cm =  42.64 DTU         80 ms cycle = 5,111,840,000 DTU
  *---------------------------------------------------------------------------*/

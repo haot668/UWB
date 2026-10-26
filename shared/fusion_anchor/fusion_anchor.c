@@ -55,10 +55,10 @@ extern void test_run_info(unsigned char *data);
  * Compile-time configuration
  *============================================================================*/
 #define ANCHOR_RX_POLL_MS         78       /* Listen window inside the 80 ms TDMA cycle */
-#define ANCHOR_PERIOD_MS          DL_TIMESYNC_PERIOD_MS   /* 80 ms = 16 slots × 5 ms */
+#define ANCHOR_PERIOD_MS          DL_TIMESYNC_PERIOD_MS   /* 80 ms = 8 slots × 10 ms */
 #define ANCHOR_MAX_NEIGHBORS      DL_MAX_TRACKED_ANCHORS
-#define ANCHOR_SLOT_DTU_US        DL_SLOT_DTU_US           /* 5 ms per TDMA slot */
-#define ANCHOR_MAX_SLOTS          16       /* max simultaneous anchors in slot table */
+#define ANCHOR_SLOT_DTU_US        DL_SLOT_DTU_US           /* 10 ms per TDMA slot */
+#define ANCHOR_MAX_SLOTS          8        /* max simultaneous anchors in slot table */
 
 /* Lead time before the scheduled TX instant at which the delayed-TX is armed.
  * 2 ms — comfortably above the jitter of the listen-window wake-up (Sleep(1)
@@ -607,7 +607,7 @@ static bool is_in_root_slot_table(void)
  *
  * The old code decided "is it my slot?" from HAL_GetTick() % 50 ms while the
  * actual transmission was scheduled on the DW3000 SYS_TIME axis (root_tx_ts +
- * slot × 5 ms).  Those two clocks are unrelated, so the gate and the radio
+ * slot × 10 ms).  Those two clocks are unrelated, so the gate and the radio
  * disagreed: an anchor could pass the gate and then have its delayed TX land
  * outside its slot (or be silently dropped), which in the worst case meant an
  * entire cycle without any beacon from that anchor.  The Tag then paired
@@ -616,7 +616,7 @@ static bool is_in_root_slot_table(void)
  * Everything below is derived from the DW3000 SYS_TIME counter:
  *   • the grid origin is the Root's beacon TX timestamp (the Root defines the
  *     cycle),
- *   • our slot instant is  origin + my_slot × 5 ms,
+ *   • our slot instant is  origin + my_slot × 10 ms,
  *   • the Root's clock is mapped into OUR clock with the clock-sync model we
  *     maintain towards the Root (each DW3000's SYS_TIME starts at 0 on
  *     power-up, so the raw Root timestamp is NOT usable as a local target).
@@ -767,7 +767,7 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
      * the Root's clock is therefore factor × longer in ours.  The old code
      * divided instead of multiplying — invisible while the factor estimate
      * was stuck at 1.0, but at 200 ppm it displaced the slot instant by
-     * slot × 5 ms × 200 ppm ≈ 15 µs (≈ 5 m). */
+     * slot × 10 ms × 200 ppm ≈ 15 µs (≈ 5 m). */
     double f = 1.0;
     const AnchorClockSync *s = root_sync();
     if (s && s->update_count >= 3) f = s->factor;
@@ -919,7 +919,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pkt[DL_TS_SLOT_IDX]  = g_anchor.my_slot_idx;   /* 255 = not admitted */
     pack_eui64_u64(&pkt[DL_TS_PARENT_EUI_IDX], g_anchor.parent_eui64);
 
-    /* Root broadcasts TX slot table (16 slots × 2 bytes = 32 bytes).
+    /* Root broadcasts TX slot table (8 slots × 2 bytes = 16 bytes).
      * Layout: uint16_t rank per slot, 0 = empty. All anchors listen to the
      * same table so they can compute their own slot index. Non-root anchors
      * store this table to find their slot but do not re-broadcast it. */
@@ -1214,7 +1214,7 @@ static uint16_t root_current_cycle(void)
  *   [5..6]  destination (0xFFFF broadcast)
  *   [7..8]  source rank (Root)
  *   [9]     FUNC_TWR_CORR
- *   [10]    entry count N (1..16)
+ *   [10]    entry count N (1..8)
  *   [11]    quality: age of the OLDEST entry, in TDMA cycles
  *   [12..]  N entries of 4 bytes:
  *            target rank (uint16 LE)
@@ -1222,7 +1222,7 @@ static uint16_t root_current_cycle(void)
  *
  * P1-3: ALL children are served in ONE frame, once per TDMA cycle.  The old
  * scheme (one unicast per cycle, round robin over the children) delayed a
- * child's correction by up to N cycles — 1.3 s with 16 anchors — so the
+ * child's correction by up to N cycles — 0.64 s with 8 anchors — so the
  * path delay was long stale before it reached the child and a "2 cycle"
  * freshness limit could not be enforced at all.
  *============================================================================*/
@@ -1466,7 +1466,7 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
         uint32_t diff = (g_anchor.rank > designated_root)
                         ? (uint32_t)(g_anchor.rank - designated_root)
                         : (uint32_t)(g_anchor.rank + 65536u - designated_root);
-        s_net_slot_idx = (uint8_t)((diff % (NET_MAX_SLOTS - 1u)) + 1u);  /* slot 1..15 */
+        s_net_slot_idx = (uint8_t)((diff % (NET_MAX_SLOTS - 1u)) + 1u);  /* slot 1..7 */
         if (s_net_slot_idx >= NET_MAX_SLOTS) s_net_slot_idx = NET_MAX_SLOTS - 1;
         anchor_clear_slot("NOT_ADMITTED_YET");   /* P1-2 */
         s_net_state = NET_STARTING;
@@ -2135,7 +2135,7 @@ static void anchor_process_rx(uint8_t *rx_buf, uint32_t frame_len)
     }
 
     /* NETWORK_START from Gateway (rank 0) — variable length (roster), bypass
-     * anchor_rx_timesync() length check (DL_TIMESYNC_LEN=72). */
+     * anchor_rx_timesync() length check (DL_TIMESYNC_LEN). */
     if (func == FUNC_NETWORK_START && src == GW_MASTER_ADDR) {
         anchor_handle_network_start(rx_buf, frame_len);
         anchor_send_network_ack();

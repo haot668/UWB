@@ -14,8 +14,8 @@
  *        factor = 1.0 + (cfo_raw / 2^26)
  *  Divisor is 2^26 = 67,108,864 (NOT 2^16).  The CFO is a *frequency*
  *  estimate with a noise of a few ppm — good enough to converge quickly,
- *  but not accurate enough to place a beacon on a grid: at slot 7 (35 ms)
- *  a 10 ppm error displaces the beacon by 350 ns ≈ 10 cm.
+ *  but not accurate enough to place a beacon on a grid: at slot 7 (70 ms)
+ *  a 10 ppm error displaces the beacon by 700 ns ≈ 20 cm.
  *
  *  The far better rate source is the timestamp pair itself:
  *        factor = Δrx_local / Δtx_remote
