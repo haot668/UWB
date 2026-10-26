@@ -52,6 +52,19 @@ extern "C" {
  *============================================================================*/
 #define NET_CHILD_TX_DELAY_MS   200u   /* Child waits this long after NET_START before TX */
 #define NET_MAX_SLOTS          8u      /* Max TDMA slots (same as ANCHOR_MAX_SLOTS) */
+
+/* Anchor network state — reported by the gateway to the host as
+ * "+NETSTATE,<uid>,<state>".  The gateway derives it from the beacons it
+ * hears on the grid, so no extra uplink is needed:
+ *   IDLE      — the anchor is not on the grid (or was never heard)
+ *   STARTING  — the anchor announces itself but has no slot yet
+ *   WAIT      — the anchor transmits but the Root has not confirmed its slot
+ *   RUNNING   — the anchor is on the grid and its beacon is on the slot
+ */
+#define GW_NETSTATE_IDLE       0u
+#define GW_NETSTATE_STARTING   1u
+#define GW_NETSTATE_WAIT       2u
+#define GW_NETSTATE_RUNNING    3u
 #define NET_CONFIRM_TIMEOUT_MS  3000u  /* Child waits up to 3s for Root slot confirmation */
 #define NET_DISCOVERY_PERIOD_MS 300u   /* Anchor discovery beacon period while NET_IDLE */
 #define NET_RUNNING_DISCOVERY_MS 2000u /* Low-rate discovery heartbeat once networked (P2-4) */

@@ -387,6 +387,25 @@ def _geom_warnings(items):
     return warns
 
 
+def net_running():
+    """True while the formed network is up.
+
+    The gateway reports every anchor's state as "+NETSTATE,<uid>,<state>"
+    (3 = RUNNING), derived from the beacons it hears on the grid.  While
+    the grid is running an anchor's coordinate must NOT change: the Tag
+    compensates every beacon by its slot instant, so a moved anchor shifts
+    the solution silently — the map still looks fine, the numbers are just
+    wrong.  Coordinate editing is therefore locked until the network is
+    stopped.
+    """
+    roster = getattr(S, "net_roster", []) or []
+    for r in roster:
+        d = S.devices.get(f"{r:04X}", {})
+        if d.get("net_state") == 3:
+            return True
+    return False
+
+
 def get_label(uid: str) -> str:
     """Return display label for a device."""
     dtype = S.devices.get(uid, {}).get("type", "")
@@ -2024,6 +2043,12 @@ def build_settings():
     def _write_uniform_z():
         if not (S.ser and S.ser.is_open):
             set_status("未连接", "warning"); return
+        # P1-1: same lock as the single-anchor coordinate dialog.
+        if net_running():
+            messagebox.showwarning("网络运行中，不能修改坐标",
+                "组网运行期间不能修改基站坐标。\n\n"
+                "请先停止组网，再统一写 Z。", parent=root)
+            return
         try:
             z = float(z_var.get())
         except ValueError:
@@ -2382,6 +2407,14 @@ def toggle_find(uid):
 # ══════════════════════════════════════════════
 def open_coord_dialog(uid):
     d = S.devices.get(uid, {})
+    # P1-1: no coordinate edits while the network is running.
+    if net_running():
+        messagebox.showwarning("网络运行中，不能修改坐标",
+            "组网运行期间不能修改基站坐标。\n\n"
+            "标签按栅格槽位补偿每一帧信标，运行中改动坐标会让解算结果\n"
+            "整体漂移，而且从界面上看不出来。\n\n"
+            "请先停止组网，再修改坐标。", parent=root)
+        return
     DW, DH = 460, 460
     dialog = tk.Toplevel(root)
     dialog.title(f"基站坐标 — {uid}")

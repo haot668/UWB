@@ -254,6 +254,7 @@ typedef struct
      * fingerprint changes for the same rank we report +RANKCOLL. */
     uint64_t uid_fp;
     uint8_t  uid_fp_valid;
+    uint8_t  net_state;   /* GW_NETSTATE_* — derived from the anchor's beacon */
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
@@ -274,6 +275,16 @@ static int      gw_net_roster_n = 0;
 static uint16_t gw_net_root = 0;
 static uint16_t gw_net_present = 0;
 static int      gw_net_present_valid = 0;
+
+/* Find a device by its uid string.  Returns NULL if it is not known. */
+static gw_dev_t *gw_find_dev(const char *uid)
+{
+    int i;
+    for (i = 0; i < gw_dev_count; i++) {
+        if (strcmp(gw_devs[i].uid, uid) == 0) return &gw_devs[i];
+    }
+    return NULL;
+}
 
 void gateway_set_master_uid(const char *uid)
 {
@@ -324,6 +335,7 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
         d->last_heartbeat_ms = now;
         d->uid_fp = 0;
         d->uid_fp_valid = 0;
+        d->net_state = GW_NETSTATE_IDLE;
         /* Do NOT send +ONLINE yet — wait for 2nd sighting */
         return;
     }
@@ -363,6 +375,7 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
             d->last_heartbeat_ms = now;
             d->uid_fp = 0;
             d->uid_fp_valid = 0;
+            d->net_state = GW_NETSTATE_IDLE;
         }
         /* Like a fresh registration: no +ONLINE until the 2nd sighting. */
         return;
@@ -874,6 +887,46 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         uid[3] = gw_hex[ src_addr        & 0xF];
         uid[4] = '\0';
         gateway_device_seen(uid, "ANCHOR", src_addr);
+
+        /* P1-5: derive the anchor's network state from the beacon it just
+         * sent, and report it to the host.
+         *
+         * The gateway HEARS every beacon of the grid, so it knows which
+         * anchors are really on it — no extra uplink is needed:
+         *   level 0                → the Root, running
+         *   level 1, slot != 255   → admitted to the grid, running
+         *   level 1, slot == 255   → still waiting for the Root to confirm
+         *
+         * Nothing ever emitted +NETSTATE before, so the host's post-
+         * formation check reported EVERY member as "未上报" and the map
+         * could not tell who was in the network.  The line is sent only
+         * when the state CHANGES, so the UART stays quiet.
+         */
+        if (len >= (uint16_t)(DL_TS_LEVEL_IDX + 1)) {
+            uint8_t st = GW_NETSTATE_IDLE;
+            uint8_t level = frame[DL_TS_LEVEL_IDX];
+            uint8_t slot  = frame[DL_TS_SLOT_IDX];
+            gw_dev_t *d;
+
+            if (level == 0)        st = GW_NETSTATE_RUNNING;
+            else if (slot != 255u) st = GW_NETSTATE_RUNNING;
+            else                   st = GW_NETSTATE_WAIT;
+
+            d = gw_find_dev(uid);
+            if (d && d->net_state != st) {
+                char sout[32];
+                int sp = 0;
+                d->net_state = st;
+                sout[sp++]='+'; sout[sp++]='N'; sout[sp++]='E'; sout[sp++]='T';
+                sout[sp++]='S'; sout[sp++]='T'; sout[sp++]='A'; sout[sp++]='T';
+                sout[sp++]='E'; sout[sp++]=',';
+                sp += fmt_str(&sout[sp], uid);
+                sout[sp++]=',';
+                sout[sp++] = (char)('0' + st);
+                sout[sp]='\0';
+                test_run_info((unsigned char *)sout);
+            }
+        }
 
         /* P1-1: the Root publishes a presence bitmap over the roster it was
          * given in NETWORK_START.  Compare it with our copy of the roster and
