@@ -1137,7 +1137,10 @@ int fusion_tag(void)
         static uint32_t s_summary_ctr;
         if (++s_summary_ctr >= 50) {
             s_summary_ctr = 0;
-            char out[128]; int pos = 0;
+            /* 288 bytes: 8 trackers x " R65535:F=+123456:Q=100:A=9999"
+             * (~30 bytes each) plus the header is ~246 bytes — the old
+             * 128-byte buffer overflowed with 5+ active anchors. */
+            char out[288]; int pos = 0;
             pos += sprintf(out + pos, "TSUM");
             int i;
             for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
