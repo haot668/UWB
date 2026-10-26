@@ -565,16 +565,57 @@ void gateway_check_timeout(void)
  * UWB frame TX helpers
  *============================================================================*/
 
-/* Send a UWB command and wait for ACK with a specific func code.
- * Returns 1 if ACK received, 0 if all retries exhausted.
- * delay_ms: per-attempt RX poll window
- * retries: max TX attempts */
-static int gateway_send_cmd_wait_ack(uint16_t dst, uint8_t cmd_func,
-                                      uint8_t *payload, uint8_t payload_len,
-                                      uint8_t ack_func, int delay_ms, int retries)
+/* P1-1: the retry spacing follows the TDMA slot.
+ *
+ * The grid is 8 slots of 6.25 ms.  A command that is repeated too soon
+ * lands in the SAME slot as the previous attempt and therefore collides
+ * with the same beacon again — the retry would be wasted on the very
+ * same collision.  Waiting a whole slot between the attempts makes
+ * consecutive attempts probe DIFFERENT slots, so the chance of hitting
+ * an occupied slot drops with every retry.
+ *
+ * DL_SLOT_DTU_US is 6250 us; the wait is rounded UP because HAL_GetTick()
+ * has a 1 ms resolution and a wait that is 1 us short would still land
+ * in the same slot. */
+#define GW_SLOT_PERIOD_MS   7
+
+/* P1-1: the ACK window of a coordinate command.
+ *
+ * The anchor answers a COORD_WRITE / COORD_READ within a couple of
+ * milliseconds — it only has to store (or read back) the value and send
+ * a short answer.  So the window is SHORT: a long one would keep the
+ * gateway from hearing the grid, and the grid is where the tag's
+ * position reports come from.
+ *
+ * 12 attempts spaced by one slot cover ~320 ms, i.e. six whole rounds. */
+#define GW_COORD_ACK_WINDOW_MS   20
+#define GW_COORD_ACK_RETRIES     12
+
+/* P1-1: print the func code and length of every frame that arrives
+ * while we wait for an ACK.  Off by default: the grid produces 160
+ * beacons per second and this print is the loudest thing on the UART
+ * — it fills the receive ring and makes the host drop bytes. */
+#define GW_DIAG_RX_VERBOSE   0
+
+/* Send a UWB command and wait for the answer with a specific func code.
+ * Returns 1 if the answer arrived, 0 if all retries were exhausted.
+ * delay_ms:     per-attempt RX poll window
+ * retries:      max TX attempts
+ * retry_gap_ms: idle time between two attempts (P1-1: this is what
+ *               makes the retries slot-aligned).  0 = retry at once.
+ * ack_buf:      if not NULL, the answer frame is copied here
+ * ack_max:      size of ack_buf */
+static int gateway_cmd_tx_wait(uint16_t dst, uint8_t cmd_func,
+                                uint8_t *payload, uint8_t payload_len,
+                                uint8_t ack_func,
+                                int delay_ms, int retries, int retry_gap_ms,
+                                uint8_t *ack_buf, uint8_t ack_max)
 {
     int _r, ack_ok = 0;
     for (_r = 0; _r < retries && !ack_ok; _r++) {
+        /* P1-1: the gap between two attempts.  It comes FIRST so that the
+         * retries probe different slots — see GW_SLOT_PERIOD_MS. */
+        if (_r > 0 && retry_gap_ms > 0) Sleep((uint32_t)retry_gap_ms);
         gateway_send_uwb_ack(dst, cmd_func, payload, payload_len);
         {
             uint32_t dl = HAL_GetTick() + (uint32_t)delay_ms;
@@ -592,6 +633,7 @@ static int gateway_send_cmd_wait_ack(uint16_t dst, uint8_t cmd_func,
                     if (fl >= GW_HDR_LEN && fl <= 32) {
                         uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
                         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
+#if GW_DIAG_RX_VERBOSE
                         /* Diagnostic: print func code of every RX frame */
                         { char _rx[20]; int _rxp=0;
                           _rx[_rxp++]='R'; _rx[_rxp++]='X'; _rx[_rxp++]=':';
@@ -600,7 +642,24 @@ static int gateway_send_cmd_wait_ack(uint16_t dst, uint8_t cmd_func,
                           _rx[_rxp++]=gw_hex[(fl>>4)&0xF]; _rx[_rxp++]=gw_hex[fl&0xF];
                           _rx[_rxp++]='\r'; _rx[_rxp++]='\n'; _rx[_rxp]='\0';
                           test_run_info((unsigned char *)_rx); }
-                        if (rb[9] == ack_func) { ack_ok = 1; break; }
+#endif
+                        if (rb[9] == ack_func) {
+                            ack_ok = 1;
+                            if (ack_buf) {
+                                uint8_t n = (fl < (uint32_t)ack_max) ? (uint8_t)fl : ack_max;
+                                memcpy(ack_buf, rb, n);
+                            }
+                            break;
+                        }
+                        /* P1-1: a frame that is NOT the answer we are waiting
+                         * for is not thrown away.  The gateway is the only
+                         * node that hears the whole grid, and the tag's
+                         * position reports arrive 20 times a second —
+                         * dropping them for the duration of an ACK wait
+                         * would blank the host's map for a moment.  So the
+                         * frame goes through the normal dispatcher, exactly
+                         * as if it had arrived in the main loop. */
+                        gateway_handle_uwb_rx(rb, (uint16_t)fl);
                     } else {
                         dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
                     }
@@ -630,6 +689,17 @@ static int gateway_send_cmd_wait_ack(uint16_t dst, uint8_t cmd_func,
         }
     }
     return ack_ok;
+}
+
+/* Send a UWB command and wait for its ACK.  See gateway_cmd_tx_wait(). */
+static int gateway_send_cmd_wait_ack(uint16_t dst, uint8_t cmd_func,
+                                      uint8_t *payload, uint8_t payload_len,
+                                      uint8_t ack_func, int delay_ms, int retries,
+                                      int retry_gap_ms)
+{
+    return gateway_cmd_tx_wait(dst, cmd_func, payload, payload_len,
+                               ack_func, delay_ms, retries, retry_gap_ms,
+                               NULL, 0);
 }
 
 /* Build and send a UWB data frame immediately.
@@ -1192,12 +1262,34 @@ static void gateway_coord_write(const char *cmd)
         /* Write coordinate directly — do NOT send PREP_CMD first.
          * PREP_CMD put the Master into config mode (pausing TDMA) and was
          * never resumed, so after a coordinate write during TDOA every
-         * slave dropped off the air.  The Master's RX phase (~470ms of each
-         * 500ms cycle) hears COORD_WRITE reliably with retries, and the
-         * anchor-side handler re-syncs DLY_TS after the ACK TX. */
+         * slave dropped off the air.
+         *
+         * P1-1: the comment that used to sit here described a "RX phase of
+         * ~470 ms of each 500 ms cycle".  That was the pre-TDMA timing and
+         * it is long gone — and the truth is the opposite of what the
+         * comment implied.  The anchor listens for the WHOLE round; it only
+         * stops receiving while its OWN beacon is in the air.  So the
+         * request is heard within a couple of milliseconds.
+         *
+         * What actually decides the outcome is whether the REQUEST
+         * collides with a beacon of the grid — and that is what the
+         * retries are for.  They are spaced by one slot now, so every
+         * attempt lands in a different slot and cannot hit the same
+         * collision twice (GW_SLOT_PERIOD_MS).
+         *
+         * The RX window is short on purpose: while the gateway waits, it
+         * is deaf to the rest of the grid, and the tag's position reports
+         * arrive 20 times a second.
+         *
+         * The host refuses to write a coordinate while the network is
+         * running (P1-1, host side), so this path is used while the grid
+         * is idle. */
         ack_ok = gateway_send_cmd_wait_ack(dst, FUNC_COORD_WRITE,
                                            payload, 8,
-                                           FUNC_COORD_ACK, 200, 5);
+                                           FUNC_COORD_ACK,
+                                           GW_COORD_ACK_WINDOW_MS,
+                                           GW_COORD_ACK_RETRIES,
+                                           GW_SLOT_PERIOD_MS);
 
         if (ack_ok) send_coord_ack(dst, x, y, z);
         else { char err[24]; int pos = 0;
@@ -1244,7 +1336,6 @@ static void gateway_coord_read(const char *cmd)
     uint8_t payload[4];
     uint8_t resp[8];
     int ok = 0;
-    int r;
 
     if (*p != '=') return;
     p++;
@@ -1257,43 +1348,33 @@ static void gateway_coord_read(const char *cmd)
     payload[0] = 0; payload[1] = 0; payload[2] = 0; payload[3] = 0;
 
     /* Ask the anchor and wait for its answer — the same shape as the write
-     * path (a few tries, a short window each). */
-    for (r = 0; r < 3 && !ok; r++) {
-        gateway_send_uwb_ack(dst, FUNC_COORD_READ, payload, 4);
-        {
-            uint32_t dl = HAL_GetTick() + 200u;
-            port_DisableEXT_IRQ();
-            while (HAL_GetTick() < dl) {
-                uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
-                if (st & SYS_STATUS_ALL_RX_ERR) {
-                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
-                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                    Sleep(1); continue;
-                }
-                if (st & SYS_STATUS_RXFCG_BIT_MASK) {
-                    uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
-                    if (fl >= GW_HDR_LEN && fl <= 32) {
-                        uint8_t rb[32];
-                        dwt_readrxdata(rb, fl, 0);
-                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-                        if (rb[9] == FUNC_COORD_REPORT) {
-                            uint16_t src_rank = (uint16_t)(rb[7] | ((uint16_t)rb[8] << 8));
-                            if (src_rank == dst) {
-                                resp[0] = rb[10]; resp[1] = rb[11];
-                                resp[2] = rb[12]; resp[3] = rb[13];
-                                resp[4] = rb[14]; resp[5] = rb[15];
-                                ok = 1; break;
-                            }
-                        }
-                    } else {
-                        dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-                    }
-                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                }
-                Sleep(1);
+     * path (a few tries, a short window each).
+     *
+     * P1-1: this used to be a hand-rolled copy of the write path with a
+     * 200 ms window and three attempts, and it THREW AWAY every frame
+     * that was not the answer.  The host reads back the coordinate of
+     * every roster member before it starts a network, so with eight
+     * anchors this path made the gateway deaf for up to 4.8 s — during
+     * which the tag's position reports were simply lost.
+     *
+     * Now it goes through the same helper as the write: a short window,
+     * the retries spaced by one slot, and every other frame handed to the
+     * normal dispatcher instead of the bin. */
+    {
+        uint8_t ackbuf[32];
+        if (gateway_cmd_tx_wait(dst, FUNC_COORD_READ, payload, 4,
+                                FUNC_COORD_REPORT,
+                                GW_COORD_ACK_WINDOW_MS,
+                                GW_COORD_ACK_RETRIES,
+                                GW_SLOT_PERIOD_MS,
+                                ackbuf, (uint8_t)sizeof(ackbuf))) {
+            uint16_t src_rank = (uint16_t)(ackbuf[7] | ((uint16_t)ackbuf[8] << 8));
+            if (src_rank == dst) {
+                resp[0] = ackbuf[10]; resp[1] = ackbuf[11];
+                resp[2] = ackbuf[12]; resp[3] = ackbuf[13];
+                resp[4] = ackbuf[14]; resp[5] = ackbuf[15];
+                ok = 1;
             }
-            EXTI->PR1 = (1u << 12);
-            port_EnableEXT_IRQ();
         }
     }
     gateway_rx_flush();
@@ -2302,7 +2383,7 @@ void gateway_poll_uart(void)
         if (uid == 0x0000) {
             uint8_t start_pad[3] = {0xCC, 0xDD, 0xEE};
             gateway_send_cmd_wait_ack(uid, FUNC_START_TDOA,
-                                      start_pad, 3, FUNC_START_ACK, 150, 5);
+                                      start_pad, 3, FUNC_START_ACK, 150, 5, 0);
         }
 
         {
