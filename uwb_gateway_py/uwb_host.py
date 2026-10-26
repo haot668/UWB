@@ -185,8 +185,8 @@ def parse_line(line: str):
     elif head == "+COORDAck" and len(parts) >= 5:
         handle_coord(parts)
     elif head == "+COORD" and len(parts) >= 5:
-        # AT+COORD? read response: raw cm integers (e.g. "+COORD,0001,150,200,0")
-        handle_coord(parts, from_read=True)
+        # AT+COORD? read response — metres, like +COORDAck (P1-3)
+        handle_coord(parts)
     elif head == "+COORD_ERR" and len(parts) >= 2:
         uid = parts[1].strip()
         label = get_label(uid)
@@ -606,15 +606,16 @@ def handle_pos(parts):
     if len(d["trail"]) > 300:
         d["trail"].pop(0)
 
-def handle_coord(parts, from_read=False):
+def handle_coord(parts):
+    """Handle a coordinate line from the gateway.
+
+    P1-3: BOTH the read response (+COORD) and the write ACK (+COORDAck)
+    carry METRES ("2.00" = 2.00 m).  The read response used to carry raw
+    centimetres ("200" = 2.00 m), which forced the host to know which of
+    the two lines it was looking at; now there is a single unit.
+    """
     uid = parts[1].strip()
-    x_raw, y_raw, z_raw = float(parts[2]), float(parts[3]), float(parts[4])
-    # AT+COORD? read response sends raw cm integers (e.g. "150" = 1.50m) → convert to m
-    # AT+COORD write-ACK sends meter values (e.g. "2.00" = 2.00m) → store as-is
-    if from_read:
-        x, y, z = x_raw / 100.0, y_raw / 100.0, z_raw / 100.0
-    else:
-        x, y, z = x_raw, y_raw, z_raw
+    x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
     old = S.devices.get(uid, {})
     old_x, old_y, old_z = old.get("ax"), old.get("ay"), old.get("az")
     if uid in S.devices:

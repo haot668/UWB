@@ -1199,11 +1199,17 @@ static void gateway_coord_read(const char *cmd)
             pos = 7;
             pos += fmt_str(&ack[pos], uid_str);
             ack[pos++] = ',';
-            pos += fmt_dec(&ack[pos], fx);
+            /* P1-3: the read response speaks METRES, exactly like the
+             * +COORDAck of a write (fmt_coord).  It used to emit the raw
+             * centimetres ("150" for 1.50 m), so the host had to know
+             * which of the two lines it was looking at and convert
+             * accordingly — and any third consumer had to guess.  One
+             * unit for both lines, always metres. */
+            pos += fmt_coord(&ack[pos], fx);
             ack[pos++] = ',';
-            pos += fmt_dec(&ack[pos], fy);
+            pos += fmt_coord(&ack[pos], fy);
             ack[pos++] = ',';
-            pos += fmt_dec(&ack[pos], fz);
+            pos += fmt_coord(&ack[pos], fz);
             ack[pos] = '\0';
         }
         else
