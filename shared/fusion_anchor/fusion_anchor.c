@@ -260,6 +260,10 @@ static uint32_t     s_twr_last_tx_ms = 0;  /* when the last correction batch wen
  *==========================================================================*/
 #define TX_DELAY_SAMPLES  16u
 #define TX_DELAY_MIN      4u      /* frames needed before the average is used */
+/* Sanity bound for one TX-delay sample (3.1 us).  A real device TX delay
+ * is a few hundred ns; a larger difference means the two stamps come from
+ * different epochs (a wrap), not from the TX pipeline. */
+#define TX_DELAY_MAX_DTU  200000u
 static uint64_t s_tx_delay_buf[TX_DELAY_SAMPLES];
 static uint8_t  s_tx_delay_idx   = 0;
 static uint8_t  s_tx_delay_n     = 0;
@@ -618,16 +622,58 @@ static bool is_in_root_slot_table(void)
  *     power-up, so the raw Root timestamp is NOT usable as a local target).
  *==========================================================================*/
 
-/* Current SYS_TIME, extended to 64 bit (the 40-bit counter wraps every ~17 s). */
+/* Current SYS_TIME, extended to 64 bit (the 40-bit counter wraps every 17.21 s).
+ *
+ * The epoch (the number of wraps so far) is CARRIED OVER from the previous
+ * call and only the low 40 bits are replaced by the new reading.  The old
+ * code added 2^40 to the raw value in the single cycle in which the wrap
+ * was detected and then stored that value — from the next call on the
+ * epoch was gone again, so the "extended" clock silently fell back into the
+ * raw 40-bit domain and only the wrap cycle itself was off by 2^40.  That
+ * single cycle was enough to break everything that compares a local
+ * instant with another one (the grid, the DS-TWR round trip, the TX-delay
+ * calibration). */
 static uint64_t now_sys_ext(void)
 {
     uint64_t raw = get_sys_timestamp_u64() & 0xFFFFFFFFFFULL;
-    if (s_sys_time_ext != 0 && raw < (s_sys_time_ext & 0xFFFFFFFFFFULL)
-        && (s_sys_time_ext - raw) > (1ULL << 39)) {
-        raw += (1ULL << 40);
+    uint64_t ext = s_sys_time_ext;
+    if (ext != 0) {
+        uint64_t last_raw = ext & 0xFFFFFFFFFFULL;
+        uint64_t epoch    = ext & ~0xFFFFFFFFFFULL;
+        if (raw < last_raw && (last_raw - raw) > (1ULL << 39)) {
+            epoch += (1ULL << 40);      /* the counter wrapped */
+        }
+        ext = epoch | raw;
+    } else {
+        ext = raw;
     }
-    s_sys_time_ext = raw;
-    return raw;
+    s_sys_time_ext = ext;
+    return ext;
+}
+
+/* Local RX timestamp, extended to the same 64-bit timeline as now_sys_ext().
+ *
+ * The DW3000's RX timestamp is a 40-bit counter that wraps every 17.21 s.
+ * Every local instant that is compared with another local instant (the grid
+ * arithmetic, the DS-TWR round trip, the clock-sync rate window) therefore
+ * has to live in the EXTENDED timeline: mixing a raw 40-bit stamp with an
+ * extended one breaks every comparison as soon as the first wrap happens
+ * (the raw stamp restarts at 0 while the extended one keeps counting).
+ *
+ * The RX latch is read FIRST and SYS_TIME afterwards, so SYS_TIME is
+ * guaranteed to be >= the RX instant.  The epoch of the result is taken
+ * from SYS_TIME; an RX instant that still belongs to the previous epoch
+ * (the wrap happened between the frame and the SYS_TIME read) is pulled
+ * back by one wrap.  The 512-DTU tolerance covers the truncation of
+ * SYS_TIME, whose low 8 bits are always zero (it is read as a 32-bit
+ * register and shifted up by 8). */
+static uint64_t rx_ts_ext(void)
+{
+    uint64_t raw = get_rx_timestamp_u64() & 0xFFFFFFFFFFULL;
+    uint64_t now = now_sys_ext();          /* SYS_TIME read AFTER the latch */
+    uint64_t ext = (now & ~0xFFFFFFFFFFULL) | raw;
+    if (ext > now + 512ULL && ext >= (1ULL << 40)) ext -= (1ULL << 40);
+    return ext;
 }
 
 /* Clock-sync model of this anchor towards the designated Root (if any). */
@@ -1024,11 +1070,24 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
     port_EnableEXT_IRQ();
 
-    /* Extended-timestamp update with 40-bit wrap detection. */
-    if (g_anchor.prev_tx_ts_ext != 0 &&
-        ts_raw < g_anchor.prev_tx_ts_ext &&
-        (g_anchor.prev_tx_ts_ext - ts_raw) > (1ULL << 39)) {
-        ts_raw += (1ULL << 40);
+    /* Extended-timestamp update with 40-bit wrap detection.
+     *
+     * The TX stamp and SYS_TIME are the SAME counter, so the TX stamp is
+     * put on the epoch of the SYS clock — that keeps the two timelines in
+     * step by construction.  (The old code kept a separate wrap counter
+     * and added 2^40 to the raw value: that only ever reached epoch 1, so
+     * from the second wrap on the TX clock was one epoch behind the SYS
+     * clock and every difference ts_raw - scheduled_tx was 2^40.)
+     *
+     * The TX instant lies in the PAST, so it normally comes out below
+     * `now`; the only case in which it comes out above is the wrap that
+     * happened between the transmission and the SYS_TIME read — then it is
+     * pulled back by one wrap. */
+    {
+        uint64_t now = now_sys_ext();
+        uint64_t ext = (now & ~0xFFFFFFFFFFULL) | (ts_raw & 0xFFFFFFFFFFULL);
+        if (ext > now + 512ULL && ext >= (1ULL << 40)) ext -= (1ULL << 40);
+        ts_raw = ext;
     }
     g_anchor.prev_tx_ts_ext = ts_raw;
 
@@ -1036,8 +1095,16 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * ts_raw is the instant the preamble actually left the antenna,
      * scheduled_tx the instant we programmed.  Both are on the same 64-bit
      * extended timeline ✓.  The difference is the fixed pipeline delay
-     * (plus the constant DX_TIME truncation offset, see the note above). */
-    if (scheduled_tx != 0 && ts_raw > scheduled_tx) {
+     * (plus the constant DX_TIME truncation offset, see the note above).
+     *
+     * The bound below is a safety net: the two stamps come from two
+     * different wrap counters, and a difference of 2^40 (a whole epoch)
+     * would poison the average of the calibration for good — the average
+     * would then be ~2^40/TX_DELAY_SAMPLES and every advertised TX stamp
+     * would be nonsense.  A real device TX delay is a few hundred ns
+     * (< 100 000 DTU), so anything above that is an anomaly, not a delay. */
+    if (scheduled_tx != 0 && ts_raw > scheduled_tx
+        && (ts_raw - scheduled_tx) < TX_DELAY_MAX_DTU) {
         tx_delay_note(ts_raw - scheduled_tx);
     }
 
@@ -1058,10 +1125,14 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         static int64_t s_tx_min, s_tx_max;
         static uint32_t s_tx_n;
         int64_t d = (int64_t)(ts_raw - scheduled_tx);
-        if (s_tx_n == 0) { s_tx_min = s_tx_max = d; }
-        else { if (d < s_tx_min) s_tx_min = d; if (d > s_tx_max) s_tx_max = d; }
-        s_tx_n++;
-        if ((s_tx_n % 25) == 0) {
+        /* A difference of a whole epoch (2^40) is not a grid error — it is
+         * a wrap, and it would poison the min/max statistics for good. */
+        if (d >= 0 && (uint64_t)d < TX_DELAY_MAX_DTU) {
+            if (s_tx_n == 0) { s_tx_min = s_tx_max = d; }
+            else { if (d < s_tx_min) s_tx_min = d; if (d > s_tx_max) s_tx_max = d; }
+            s_tx_n++;
+        }
+        if ((s_tx_n % 25) == 0 && s_tx_n > 0) {
             char dbg[72];
             sprintf(dbg, "TX_GRID err=%ld dtu (%.2f cm) spread=%ld dtu\r\n",
                     (long)d, (double)d * CM_PER_DTU_F, (long)(s_tx_max - s_tx_min));
@@ -1514,8 +1585,13 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
 {
     /* [FIX4] Capture rx_local BEFORE parsing the buffer — minimizes ISR delay.
      * get_rx_timestamp_u64() reads the DW3000 hardware register directly,
-     * not the buffer, so this is safe to do as soon as the frame is received. */
-    uint64_t rx_local = get_rx_timestamp_u64();
+     * not the buffer, so this is safe to do as soon as the frame is received.
+     *
+     * rx_ts_ext() puts the 40-bit hardware stamp onto the extended 64-bit
+     * local timeline: the raw stamp wraps every 17.21 s and must not be
+     * compared with the extended instants (the grid base, the Root's TX
+     * stamps) — after the first wrap every such comparison is wrong. */
+    uint64_t rx_local = rx_ts_ext();
 
     if (frame_len < DL_TIMESYNC_LEN) return;
 
@@ -1527,7 +1603,8 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * (LRU eviction if > 8), but does NOT restrict which rank values are accepted.
      * Rank 633/643 > 254 is perfectly valid and must be processed. */
 
-    /* P1 fix: unpack extended 64-bit timestamp to avoid 40-bit wrap ambiguity */
+    /* The remote's TX stamp is the RAW 40-bit value of the remote's clock —
+     * that is what the clock model is anchored on (see clock_sync.h). */
     uint64_t tx_remote  = unpack_40bit_ts(&rx_buf[DL_TS_TX_TS_IDX]);
 
     /* P0-2: only a frame whose TX timestamp is EXACT may be used for the
@@ -1750,7 +1827,13 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * placement error is bounded by 40 ms × Δf ≈ 40 ns at 1 ppm. */
         g_tdma_ref.base_origin = rx_local;
         if (s_twr_corr_valid) {
-            g_tdma_ref.base_origin -= (uint64_t)s_twr_corr_dtu;
+            /* Guard the subtraction: right after a power-up the local stamp
+             * can be smaller than the correction (which is bounded by the
+             * 100 m maximum path), and an unsigned underflow would turn the
+             * grid origin into an astronomically large instant — the anchor
+             * would then wait for a TX target that is centuries away. */
+            uint64_t corr = (uint64_t)s_twr_corr_dtu;
+            if (corr < g_tdma_ref.base_origin) g_tdma_ref.base_origin -= corr;
         }
         /* Subtract our OWN device TX delay as well.
          *
@@ -1763,7 +1846,8 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * the advertised TX stamp then adds δ̂_child back and lands on the
          * Root's antenna instant (up to the calibration residual). */
         if (s_tx_delay_valid) {
-            g_tdma_ref.base_origin -= (uint64_t)s_tx_delay_dtu;
+            uint64_t dtx = (uint64_t)s_tx_delay_dtu;
+            if (dtx < g_tdma_ref.base_origin) g_tdma_ref.base_origin -= dtx;
         }
         g_tdma_ref.base_local_time = now_local;
 

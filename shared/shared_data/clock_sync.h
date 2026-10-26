@@ -144,7 +144,7 @@ typedef struct {
 
     /* Bookkeeping */
     uint64_t last_remote_tx_ts;  /* last remote TX timestamp (40-bit)       */
-    uint64_t last_local_rx_ts;   /* last local RX timestamp (u64)            */
+    uint64_t last_local_rx_ts;   /* last local RX timestamp (extended u64)   */
     int64_t  last_update_ms;     /* HAL tick of the last update             */
     uint32_t update_count;
     uint32_t outlier_count;      /* outliers in the last 32 updates         */
@@ -211,8 +211,16 @@ void clock_sync_init(AnchorClockSync *s,
 /* Update with new measurement.
  *   cfo_raw   : raw value from dwt_readclockoffset() (16-bit signed)
  *   rx_local  : this device's RX timestamp at the moment the remote's
- *               TX timestamp tx_remote was received.
- *   tx_remote : the remote's TX timestamp extracted from the TimeSync payload.
+ *               TX timestamp tx_remote was received.  It MUST be the
+ *               EXTENDED 64-bit local stamp (see fusion_anchor.c:
+ *               rx_ts_ext()), not the raw 40-bit hardware value: the raw
+ *               stamp wraps every 17.21 s and the rate window measures
+ *               DIFFERENCES of it, so a wrap would make every difference
+ *               in that window wrong.
+ *   tx_remote : the remote's TX timestamp extracted from the TimeSync
+ *               payload — the RAW 40-bit value of the REMOTE's clock.
+ *               (The two stamps live in different timelines, which is
+ *               exactly what the clock model maps between.)
  *   now_ms    : current monotonic tick (HAL_GetTick()) — used for the
  *               process-noise scaling and for the "last update" stamp.
  * Returns true if the update was applied (not rejected as outlier). */

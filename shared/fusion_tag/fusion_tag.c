@@ -631,6 +631,64 @@ static int alloc_tracker_slot(uint16_t rank)
     return worst;
 }
 
+/*============================================================================
+ * Local clock — 40-bit extended to 64 bit
+ *
+ * The DW3000's timestamps are a 40-bit counter that wraps every 17.21 s.
+ * The tag compares the RX instants of DIFFERENT anchors with each other
+ * (that is the whole TDOA), and the TDOA window is only a few tens of
+ * microseconds wide — so as soon as one anchor's beacon is received before
+ * the wrap and another's after it, the raw 40-bit difference is 2^40 instead
+ * of the real few hundred DTU, and the pair is thrown away.  The same
+ * happens in the clock-sync rate window.
+ *
+ * All local instants are therefore kept on an extended 64-bit timeline
+ * that never wraps: the raw stamp is combined with the epoch of SYS_TIME.
+ *==========================================================================*/
+static uint64_t s_tag_sys_time_ext = 0;
+
+/* Current SYS_TIME, extended to 64 bit.
+ *
+ * The epoch (the number of wraps so far) is carried over from the previous
+ * call and only the low 40 bits are replaced by the new reading — otherwise
+ * the "extended" clock falls back into the raw 40-bit domain one call after
+ * every wrap, and the stamps of the different anchors stop being
+ * comparable exactly when they have to be. */
+static uint64_t tag_now_sys_ext(void)
+{
+    uint64_t raw = get_sys_timestamp_u64() & 0xFFFFFFFFFFULL;
+    uint64_t ext = s_tag_sys_time_ext;
+    if (ext != 0) {
+        uint64_t last_raw = ext & 0xFFFFFFFFFFULL;
+        uint64_t epoch    = ext & ~0xFFFFFFFFFFULL;
+        if (raw < last_raw && (last_raw - raw) > (1ULL << 39)) {
+            epoch += (1ULL << 40);      /* the counter wrapped */
+        }
+        ext = epoch | raw;
+    } else {
+        ext = raw;
+    }
+    s_tag_sys_time_ext = ext;
+    return ext;
+}
+
+/* Local RX timestamp, extended to the 64-bit timeline.
+ *
+ * The RX latch is read FIRST and SYS_TIME afterwards, so SYS_TIME is
+ * guaranteed to be >= the RX instant; the epoch comes from SYS_TIME and an
+ * RX instant that still belongs to the previous epoch is pulled back by one
+ * wrap.  The 512-DTU tolerance covers the truncation of SYS_TIME, whose low
+ * 8 bits are always zero (it is read as a 32-bit register and shifted up
+ * by 8). */
+static uint64_t tag_rx_ts_ext(void)
+{
+    uint64_t raw = get_rx_timestamp_u64() & 0xFFFFFFFFFFULL;
+    uint64_t now = tag_now_sys_ext();
+    uint64_t ext = (now & ~0xFFFFFFFFFFULL) | raw;
+    if (ext > now + 512ULL && ext >= (1ULL << 40)) ext -= (1ULL << 40);
+    return ext;
+}
+
 static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_ts)
 {
     if (frame_len < DL_TIMESYNC_LEN) return;
@@ -983,8 +1041,10 @@ int fusion_tag(void)
             uint8_t rx_buf[128];
             dwt_readrxdata(rx_buf, frame_len, 0);
             /* Read RX HW timestamp BEFORE re-enabling RX, while RX_TIME
-             * latch still holds the timestamp for the received frame. */
-            uint64_t rx_hw_ts = get_rx_timestamp_u64();
+             * latch still holds the timestamp for the received frame.
+             * tag_rx_ts_ext() puts it on the extended 64-bit local timeline
+             * (the raw 40-bit stamp wraps every 17.21 s). */
+            uint64_t rx_hw_ts = tag_rx_ts_ext();
             if (!match_header(rx_buf, match_timesync, 10, 1, 0, 1)) {
                 dwt_rxenable(DWT_START_RX_IMMEDIATE);
                 continue;

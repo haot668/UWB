@@ -114,9 +114,15 @@ static double cs_rate_measure(AnchorClockSync *s,
     if (d_tx == 0) return 0.0;
 
     /* Δrx is taken on our own 64-bit extended clock — monotonic, so a plain
-     * subtraction is correct. */
+     * subtraction is correct.  (The remote's stamps are 40-bit and wrap
+     * every 17.2 s, which is why Δtx needs the mask and Δrx does not.)
+     *
+     * The ratio bound below is a safety net: a caller that hands in the RAW
+     * 40-bit hardware stamp would produce a Δrx of 2^40 at the wrap, and
+     * that must not be allowed to enter the filter as a rate measurement. */
     int64_t d_rx = (int64_t)(rx_local - s->rate_rx[oldest]);
     if (d_rx <= 0) return 0.0;
+    if ((uint64_t)d_rx > (d_tx * 4u)) return 0.0;   /* rate outside 0.25..4 */
 
     return (double)d_rx / (double)d_tx;
 }
@@ -165,6 +171,7 @@ static bool cs_gate_check(AnchorClockSync *s,
         uint64_t d_tx = (s->rate_tx[i1] - s->rate_tx[i0]) & 0xFFFFFFFFFFULL;
         int64_t  d_rx = (int64_t)(s->rate_rx[i1] - s->rate_rx[i0]);
         if (d_tx == 0 || d_rx <= 0) continue;
+        if ((uint64_t)d_rx > (d_tx * 4u)) continue;  /* rate outside 0.25..4 */
         ir[m++] = (double)d_rx / (double)d_tx;
     }
     if (m < 2) return false;
@@ -177,6 +184,7 @@ static bool cs_gate_check(AnchorClockSync *s,
     uint64_t d_tx = (tx_remote - s->rate_tx[last]) & 0xFFFFFFFFFFULL;
     int64_t  d_rx = (int64_t)(rx_local - s->rate_rx[last]);
     if (d_tx == 0 || d_rx <= 0) return true;    /* inconsistent -> reject */
+    if ((uint64_t)d_rx > (d_tx * 4u)) return true;  /* rate outside 0.25..4 */
 
     double med   = cs_median(ir, m);
     double sigma = 1.4826 * cs_mad(ir, m, med);
