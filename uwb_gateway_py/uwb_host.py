@@ -387,6 +387,32 @@ def _geom_warnings(items):
     return warns
 
 
+def anchor_net_state(d):
+    """The network state of an anchor, for the map and the device card.
+
+    "root" — the Root of the running network (the clock source)
+    "run"  — a member that is on the grid
+    "wait" — a member of the roster that is not (yet) on the grid
+    "off"  — offline
+    ""     — no network formed, or not a member of one
+
+    An anchor without a coordinate has no place on the map at all — it is
+    not drawn, because there is nowhere truthful to draw it.  The device
+    card marks it with "⚠ 未设坐标".
+    """
+    if d.get("type") != "ANCHOR":
+        return ""
+    if not d.get("online"):
+        return "off"
+    roster = getattr(S, "net_roster", []) or []
+    rank = int(d.get("rank") or 0)
+    if not roster or rank not in roster:
+        return ""
+    if d.get("net_state") == 3:
+        return "root" if rank == getattr(S, "net_root_rank", 0) else "run"
+    return "wait"
+
+
 def net_running():
     """True while the formed network is up.
 
@@ -2098,6 +2124,15 @@ def build_settings():
         if not (S.ser and S.ser.is_open):
             set_status("未连接", "warning"); return
         send_cmd("AT+STOP")
+        # The grid is down: drop the roster and the per-anchor state, so the
+        # coordinate lock is released and the map stops showing the network.
+        S.net_roster = []
+        S.net_missing_ranks = set()
+        S.net_root_rank = 0
+        for d in S.devices.values():
+            d.pop("net_state", None)
+        S._dirty = True
+        refresh_lists()
         set_status("已发送 AT+STOP — Master 返回配置模式", "info")
     tk.Button(start_row, text="⏹ 停止", bg="#dc3545", fg="#ffffff",
               font=("Segoe UI", 10, "bold"), bd=1, relief="solid",
@@ -2336,6 +2371,15 @@ def refresh_lists(force_rebuild=False):
                 info += "  ⚠ 未加入网络"
             elif d.get("pending"):
                 info += "  ○ 待确认"
+            else:
+                # P1-7: show where the anchor stands in the network.
+                st = anchor_net_state(d)
+                if st == "root":
+                    info += "  ● Root"
+                elif st == "run":
+                    info += "  ● 在网"
+                elif st == "wait":
+                    info += "  ○ 等待确认"
             if d.get("rank_collision"):
                 info += "  ⚠ rank冲突"
         elif d.get("x") is not None:
@@ -3365,10 +3409,25 @@ def draw_anchor(c, uid, d):
     r = (14 if highlight else 10) * icon_s
     label = get_label(uid)
     rank = d.get("rank", 0)
+    # P1-7: the network state decides both the colour and the badge.
+    #   root → green  (the Root, the clock source of the grid)
+    #   run  → blue   (a member on the grid)
+    #   wait → amber  (in the roster, but not yet on the grid)
+    net_st = anchor_net_state(d)
     map_label = f"A{rank:02d}"  # e.g. "A08" — rank shown on map icon
+    if net_st == "root":
+        map_label = f"R{rank:02d}"  # the Root is marked with an R
 
     # Colors
-    if online:
+    if net_st == "root":
+        body_fill = C["green"]
+        body_stroke = "#116329"
+        glow_color = "#7ee787"
+    elif net_st == "wait":
+        body_fill = "#e6a800"
+        body_stroke = "#9a6700"
+        glow_color = "#f0b72f"
+    elif online:
         body_fill = C["anchor"]     # blue
         body_stroke = "#0550ae"     # darker blue border
         glow_color = "#54aeff"      # light blue glow
@@ -3407,7 +3466,7 @@ def draw_anchor(c, uid, d):
                   fill="#ffffff", outline="")
 
     # --- Ring accent ---
-    if online:
+    if online and net_st not in ("root", "wait"):
         ar = max(r // 2, 4 * icon_s) + icon_s
         c.create_oval(sx-ar, sy-ar, sx+ar, sy+ar,
                       fill="", outline=C["green"], width=max(1, 2*icon_s))
