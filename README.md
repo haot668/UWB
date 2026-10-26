@@ -173,7 +173,7 @@ offset = factor × first_tx_ts − rx_at_first
 
 - **IDE**: Keil MDK-ARM
 - **编译**: C99 标准（Keil ARM Compiler）
-- **调试**: UART 输出 (115200 8N1)
+- **调试**: UART 输出 (921600 8N1；bootloader 引导日志仍为 115200)
 - **协议**: 下行 TDOA
 
 ---

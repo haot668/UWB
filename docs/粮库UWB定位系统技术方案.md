@@ -604,7 +604,7 @@ import numpy as np
 def test_position_accuracy():
     \"\"\"在粮库中多点测试定位精度\"\"\"
     
-    ser = serial.Serial('COM5', 115200, timeout=1)
+    ser = serial.Serial('COM5', 921600, timeout=1)
     
     test_points = [
         (0, 0),          # 起点

@@ -3,7 +3,7 @@
   * @file           : main.c
   * @brief          : UWB Tag firmware for DW3210 on STM32L412KBU6
   *                   Clock: HSE 8MHz -> PLL -> 80MHz SYSCLK
-  *                   Debug: USART2 (PA2/PA3) 115200-8N1
+  *                   Debug: USART2 (PA2/PA3) 921600-8N1
   ******************************************************************************
   */
 #include <main.h>
@@ -174,7 +174,7 @@ static void MX_SPI1_Init(void)
 static void MX_USART2_UART_Init(void)
 {
     huart2.Instance = USART2;
-    huart2.Init.BaudRate = 115200;
+    huart2.Init.BaudRate = 921600;
     huart2.Init.WordLength = UART_WORDLENGTH_8B;
     huart2.Init.StopBits = UART_STOPBITS_1;
     huart2.Init.Parity = UART_PARITY_NONE;

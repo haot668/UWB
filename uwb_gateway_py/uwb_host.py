@@ -1253,7 +1253,7 @@ def build_header(parent):
     # Baud rate
     tk.Label(right, text="波特率", bg=C["surface"], fg=C["muted"],
              font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 4))
-    baud_var = tk.StringVar(value="115200")
+    baud_var = tk.StringVar(value="921600")
     baud_cb = ttk.Combobox(right, textvariable=baud_var, width=8,
         values=["9600","19200","38400","57600","115200","230400","460800","921600"],
         state="readonly", font=("Segoe UI", 10))
