@@ -2,8 +2,8 @@
  *  @file    fusion_tag.c
  *  @brief   BD8NCF-style tag — multi-anchor tracking + pairwise TDOA solve
  *
- *  Each cycle:
- *    1. Continuous RX for ~95 ms — track all visible anchors' TimeSync
+ *  Each super-cycle (100 ms = 2 TDMA rounds):
+ *    1. Continuous RX for one super-cycle — track all visible anchors' beacons
  *    2. Per-anchor Kalman clock-sync state (clock_sync.h)
  *    3. Every ~50 ms: collect active trackers, compute pairwise TDOAs,
  *       solve 2D position with Gauss-Newton
@@ -89,11 +89,11 @@ typedef struct {
 
     /* ── P1-2: multi-cycle average of the TDOA against the Root ─────────
      * The ABSOLUTE slot-compensated TOA cannot be averaged across cycles:
-     * it contains the cycle origin, which advances by one cycle (80 ms) in
+     * it contains the round origin, which advances by one round (50 ms) in
      * the tag's clock, so averaging it would smear the TDOA by the tag's
-     * clock error (50 ppm x 0.64 s = 32 ns = 1 m!).  The DIFFERENCE
-     * against the Root's beacon of the SAME cycle is comparable across
-     * cycles — the origin cancels — and that difference is exactly what
+     * clock error (50 ppm x 0.4 s = 20 ns = 0.6 m!).  The DIFFERENCE
+     * against the Root's beacon of the SAME round is comparable across
+     * rounds — the origin cancels — and that difference is exactly what
      * the TDOA is.  So the average is taken on the difference. */
     int64_t            tdoa_now;         /* this cycle's TDOA against the Root   */
     uint8_t            tdoa_valid;       /* tdoa_now holds a value                */
@@ -125,7 +125,8 @@ typedef struct {
 #define TAG_SELFCHECK_BASELINE   16u   /* frames between re-baselining (1.3 s) */
 #define TAG_DESYNC_DTU           2000LL
 #define TAG_DESYNC_LIMIT         3u    /* consecutive failures before exclusion */
-#define TAG_TOA_AVG_N            8u    /* cycles in the TDOA average (0.64 s)  */
+#define TAG_TOA_AVG_N            8u    /* rounds in the TDOA average (0.4 s)     */
+#define TAG_TRACKER_FRESH_MS     250u  /* drop an anchor after 5 silent rounds  */
 
 static TagAnchorTracker s_trackers[DL_MAX_TRACKED_ANCHORS];
 
@@ -212,7 +213,7 @@ static void tag_solve_and_report(void)
         if (s_trackers[i].desynced) { n_desync++; continue; }
         uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
                           : (now_ms - s_trackers[i].last_seen_ms);
-        if (age_ms > 500) continue;  /* measurement too stale */
+        if (age_ms > TAG_TRACKER_FRESH_MS) continue;  /* measurement too stale */
         active_idx[n_active++] = i;
     }
     if (n_active < 3) {
@@ -240,36 +241,36 @@ static void tag_solve_and_report(void)
     }
 
     /* Build packed arrays for tdoa_solve:
-     * Slot-based TDOA: toa_equiv = rx - slot × 10ms
+     * Slot-based TDOA: toa_equiv = rx - slot × 6.25ms
      * This normalizes all beacons to slot=0 (Root's TX time).
      * No anchor clock sync needed: Tag's local clock is the common reference.
      *
      * DTU bookkeeping (P0-4): one DW3000 device time unit is 15.65 ps, so
-     * 1 µs = 63,898 DTU and one 10 ms TDMA slot = 10000 × 63898 = 638,980,000
-     * DTU.  The old constant (192,000) belonged to a 38.4 DTU/µs clock and was
-     * 3328× too small: the slot compensation could never cancel the 0..70 ms
-     * spread between the slots, every TDOA was rejected and the solver
-     * collapsed onto the centroid of the anchors. */
+     * 1 µs = 63,898 DTU and one 6.25 ms TDMA slot = 6250 × 63898 =
+     * 399,362,500 DTU.  The old constant (192,000) belonged to a 38.4
+     * DTU/µs clock and was 3328× too small: the slot compensation could
+     * never cancel the 0..43.75 ms spread between the slots, every TDOA was
+     * rejected and the solver collapsed onto the centroid of the anchors. */
     #define DTU_PER_SLOT  ((int64_t)DL_SLOT_DTU_US * (int64_t)UUS_TO_DWT_TIME)
 
     /* Acceptance window for a TDOA difference.  Light covers 1 m in 3.3356 ns
      * = 213.20 DTU (1 DTU = 15.65 ps), so ±100 m of path difference covers
      * any indoor deployment.  The dominant error source (a beacon from a
-     * different TDMA cycle, 80 ms = 5.1 M DTU) is removed by the cycle-id
+     * different TDMA round, 50 ms = 3.19 M DTU) is removed by the cycle-id
      * pairing below — and by this window as a second line of defence: with
      * the old (1000x too large) constant the window was ±100 km and let
-     * cross-cycle frames through. */
+     * cross-round frames through. */
     #define TDOA_DTU_PER_METER  213LL
     #define TDOA_MAX_DTU        (100LL * TDOA_DTU_PER_METER)   /* 21,300 */
 
     /* ── Slot spacing is defined in the ROOT's clock, not in ours ──────────
      * The anchors place their beacons on the Root's grid: anchor k transmits
-     * at  G + slot_k × 10 ms  where G and the 10 ms are the ROOT's clock.
-     * Our own crystal differs from the Root's by up to ±20 ppm, so 10 ms is
-     * 10 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
-     * clock).  Subtracting the nominal 10 ms instead would leave a per-anchor
-     * error of slot × 10 ms × 20 ppm = up to 1400 ns ≈ 42 cm at slot 7 — far
-     * above the 0.67 ns the 20 cm target needs.  f is measured from the
+     * at  G + slot_k × 6.25 ms  where G and the 6.25 ms are the ROOT's clock.
+     * Our own crystal differs from the Root's by up to ±20 ppm, so 6.25 ms is
+     * 6.25 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
+     * clock).  Subtracting the nominal 6.25 ms instead would leave a
+     * per-anchor error of slot × 6.25 ms × 20 ppm = up to 875 ns ≈ 26 cm at
+     * slot 7 — far above the 0.67 ns the 20 cm target needs.  f is measured from the
      * Root's own beacon (its in-frame TX timestamp vs. our RX timestamp),
      * which is exactly the clock_sync factor of the Root's tracker. */
     double slot_rate = 1.0;
@@ -291,22 +292,64 @@ static void tag_solve_and_report(void)
         }
     }
 
-    /* ── P0-4: only beacons of the SAME TDMA cycle may be paired ─────────
+    /* ── P0-4: pairing rule ───────────────────────────────────────────────
      * The slot-compensated TDOA
-     *     toa = rx_local - slot × 10 ms
-     * cancels the cycle origin only when every beacon belongs to the same
-     * cycle — one cycle of skew is 80 ms = 5.1 M DTU and would poison every
-     * pair it enters.  Find the cycle most of the visible anchors are
-     * currently in and drop the rest. */
-    uint16_t best_cycle_sel = 0, best_cycle_all = 0;
-    int best_cnt_sel = 0, best_cnt_all = 0, i2, j2, k2;
+     *     toa = rx_local - slot × 6.25 ms
+     * cancels the round origin only when both beacons belong to the same
+     * round — one round of skew is 50 ms = 3.19 M DTU and would poison every
+     * pair it enters.
+     *
+     * The Root-reference path (the normal case) does NOT need a cycle
+     * filter on the anchor SET: the per-anchor tdoa_avg was built in the
+     * RX path out of pairs of the SAME round (there an anchor is only
+     * paired with the Root's TOA of an identical cycle_id), so every
+     * sample inside the average is a round-consistent difference.
+     *
+     * Filtering the set by the cycle of each anchor's LAST frame used to
+     * throw away every anchor whose last frame is one round old.  At
+     * 20 Hz that is roughly half of them at any moment — and worse, it
+     * could filter the ROOT out, which pushed the solve onto the
+     * absolute-TOA path where rounds ARE mixed and the geometry is
+     * meaningless. */
+    int i2, j2, k2;
+    uint16_t best_cycle_all = 0;
+    int best_cnt_all = 0;
+
+    /* Is the Root (slot 0) among the slot-known anchors?  Its beacon
+     * defines the round origin, so it is the reference of the good path. */
+    int root_idx = -1;
     for (i2 = 0; i2 < n_sel; i2++) {
-        uint16_t c = s_trackers[sel_idx[i2]].cycle_id;
-        int cnt = 0;
-        for (j2 = 0; j2 < n_sel; j2++)
-            if (s_trackers[sel_idx[j2]].cycle_id == c) cnt++;
-        if (cnt > best_cnt_sel) { best_cnt_sel = cnt; best_cycle_sel = c; }
+        if (s_trackers[sel_idx[i2]].rank == s_root_rank) {
+            root_idx = sel_idx[i2];
+            break;
+        }
     }
+
+    /* The legacy paths (no Root in the set) still need the cycle filter:
+     * there the absolute TOAs are differenced, and only beacons of the
+     * same round may be differenced against each other. */
+    uint16_t best_cycle_sel = 0;
+    int best_cnt_sel = 0;
+    if (root_idx < 0) {
+        for (i2 = 0; i2 < n_sel; i2++) {
+            uint16_t c = s_trackers[sel_idx[i2]].cycle_id;
+            int cnt = 0;
+            for (j2 = 0; j2 < n_sel; j2++)
+                if (s_trackers[sel_idx[j2]].cycle_id == c) cnt++;
+            if (cnt > best_cnt_sel) { best_cnt_sel = cnt; best_cycle_sel = c; }
+        }
+        k2 = 0;
+        for (i2 = 0; i2 < n_sel; i2++) {
+            int idx = sel_idx[i2];
+            if (s_trackers[idx].cycle_id == best_cycle_sel) {
+                sel_idx[k2++] = idx;
+            } else {
+                s_n_cycle_mismatch++;
+            }
+        }
+        n_sel = k2;
+    }
+
     for (i2 = 0; i2 < n_active; i2++) {
         uint16_t c = s_trackers[active_idx[i2]].cycle_id;
         int cnt = 0;
@@ -314,22 +357,6 @@ static void tag_solve_and_report(void)
             if (s_trackers[active_idx[j2]].cycle_id == c) cnt++;
         if (cnt > best_cnt_all) { best_cnt_all = cnt; best_cycle_all = c; }
     }
-
-    /* Filter the slot-known set down to the dominant cycle */
-    k2 = 0;
-    for (i2 = 0; i2 < n_sel; i2++) {
-        int idx = sel_idx[i2];
-        if (s_trackers[idx].cycle_id == best_cycle_sel) {
-            sel_idx[k2++] = idx;
-        } else {
-            s_n_cycle_mismatch++;
-            { char dbg[64];
-              sprintf(dbg, "TDOA_CYCLE_MISMATCH R=%u cyc=%u!=cyc=%u\r\n",
-                  s_trackers[idx].rank, s_trackers[idx].cycle_id, best_cycle_sel);
-              test_run_info((unsigned char *)dbg); }
-        }
-    }
-    n_sel = k2;
 
     int ref_idx;
     int n_valid;
@@ -339,39 +366,36 @@ static void tag_solve_and_report(void)
 
     if (use_slot_compensation) {
         /* ── Slot-compensated TDOA ────────────────────────────────────────
-         * toa_equiv = rx - slot × 10ms (normalizes all to slot=0)
+         * toa_equiv = rx - slot × 6.25 ms (normalizes all to slot=0)
          * Works when anchors are in Root's TDMA table. */
 
-        /* Select ref = lowest slot number (Root = slot 0) */
-        ref_idx = sel_idx[0];
-        for (i = 1; i < n_sel; i++) {
-            if (s_trackers[sel_idx[i]].slot < s_trackers[ref_idx].slot) {
-                ref_idx = sel_idx[i];
+        /* Reference = the Root when it is in the set (its beacon defines
+         * the round origin); otherwise the anchor with the lowest slot. */
+        bool ref_is_root = (root_idx >= 0);
+        if (ref_is_root) {
+            ref_idx = root_idx;
+        } else {
+            ref_idx = sel_idx[0];
+            for (i = 1; i < n_sel; i++) {
+                if (s_trackers[sel_idx[i]].slot < s_trackers[ref_idx].slot) {
+                    ref_idx = sel_idx[i];
+                }
             }
         }
 
         uint8_t ref_slot = s_trackers[ref_idx].slot;
 
-        /* P1-2: the multi-cycle average can only be used when the values
-         * are DIFFERENCES against the reference anchor of the same cycle
-         * (the absolute TOA contains the cycle origin, which drifts).
-         * When the reference is the Root, the per-anchor values computed
-         * in the RX path are already such differences — so the average
-         * can be used directly. */
-        bool ref_is_root = (s_trackers[ref_idx].rank == s_root_rank);
-        use_avg = false;
-        if (ref_is_root) {
-            use_avg = true;
-            for (i = 0; i < n_sel; i++) {
-                int idx = sel_idx[i];
-                if (idx == ref_idx) continue;
-                if (s_trackers[idx].tdoa_n == 0) { use_avg = false; break; }
-            }
-        }
-
         if (ref_is_root) {
             /* Every value is a difference against the Root, so the Root is
-             * the origin and the solver sees the same TDOAs as before. */
+             * the origin and the solver sees the same TDOAs as before.
+             *
+             * The value used is the multi-round average (P1-2): each of its
+             * samples was paired with the Root's TOA of the SAME round in
+             * the RX path, so the average is round-consistent by
+             * construction and needs no cycle filter — while it also
+             * removes the per-frame RX jitter, which is the dominant noise
+             * term at a 6.25 ms slot spacing. */
+            use_avg = true;
             toa_dtu[0] = 0;
             anchors[0] = s_trackers[ref_idx].pos;
             valid_idx[0] = ref_idx;
@@ -382,8 +406,7 @@ static void tag_solve_and_report(void)
                 if (idx == ref_idx) continue;
                 if (!s_trackers[idx].tdoa_valid) continue;
 
-                int64_t tdoa_dtu = use_avg ? s_trackers[idx].tdoa_avg
-                                           : s_trackers[idx].tdoa_now;
+                int64_t tdoa_dtu = s_trackers[idx].tdoa_avg;
                 if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
                 s_n_pair++;
 
@@ -850,7 +873,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
             if (s_rate_have_prev && d_tx > 0u && d_rx > 0u
                 && d_tx < (1ULL << 30) && d_rx < (1ULL << 30)) {
                 double r = (double)d_rx / (double)d_tx;
-                /* A cycle is 80 ms; anything outside 1 % is not a clock
+                /* A round is 50 ms; anything outside 1 % is not a clock
                  * ratio but a lost or duplicated frame. */
                 if (r > 0.99 && r < 1.01) {
                     s_rate_buf[s_rate_idx] = r;
@@ -887,7 +910,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     }
 
     /* ── P1-2: TDOA against the Root, averaged over several cycles ───────
-     * toa_equiv = rx_local - slot x 10 ms removes the TDMA slot from the
+     * toa_equiv = rx_local - slot x 6.25 ms removes the TDMA slot from the
      * arrival instant.  Against the Root's beacon of the SAME cycle the
      * cycle origin cancels as well, so the difference is the pure TDOA —
      * and, unlike the absolute TOA, it is comparable across cycles and
@@ -1007,21 +1030,31 @@ int fusion_tag(void)
         s_trackers[i].sync.initialized = false;
     }
 
+    /* Solve cadence: one solve per TDMA round (DL_SOLVE_INTERVAL_MS = 50 ms
+     * → 20 Hz).
+     *
+     * The deadline lives OUTSIDE the RX-window loop on purpose.  It used to
+     * be re-armed with every window; since the window and the solve
+     * interval had the same length, the timer could only ever fire ONCE
+     * per window — the "20 Hz solve" was in fact 12.5 Hz (one solve per
+     * 80 ms window).  An absolute deadline keeps the cadence at 20 Hz and
+     * does not drift with the duration of the solve itself. */
+    uint32_t last_solve_ms = HAL_GetTick();
+
     while (1) {
-        /* Phase 1: Continuous RX for ~95 ms */
+        /* Phase 1: Continuous RX for one super-cycle */
         dwt_forcetrxoff();
         port_rf_switch_rx();
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
         uint32_t rx_start = HAL_GetTick();
-        uint32_t last_solve_ms = rx_start;
         while ((HAL_GetTick() - rx_start) < DL_RX_WINDOW_MS) {
             Sleep(1);
             uint32_t now = HAL_GetTick();
 
-            /* 20 Hz solve: fixed 50 ms interval (checked every iteration) */
-            if ((int32_t)(now - last_solve_ms) >= 50) {
-                last_solve_ms += 50;
+            /* 20 Hz solve: fixed 50 ms interval on an absolute grid */
+            if ((int32_t)(now - last_solve_ms) >= DL_SOLVE_INTERVAL_MS) {
+                last_solve_ms += DL_SOLVE_INTERVAL_MS;
                 tag_solve_and_report();
             }
 
