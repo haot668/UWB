@@ -80,6 +80,18 @@ extern void test_run_info(unsigned char *data);
 #define ANCHOR_TX_PROGRAM_US      300u
 #define ANCHOR_TX_PROGRAM_DTU     ((uint64_t)ANCHOR_TX_PROGRAM_US * UUS_TO_DWT_TIME)
 
+/* Diagnostic output throttling.
+ *
+ * The debug UART is a BLOCKING resource: HAL_UART_Transmit() spins until
+ * the last byte has left the shift register, so every printed line stalls
+ * the RX loop for (bytes x 10 bits) / baud.  An anchor hears one beacon
+ * per neighbour per round (7 neighbours x 20 rounds/s = 140 RX/s) and the
+ * DW3000 RX buffer is ONE frame deep — a print that outlasts the 6.25 ms
+ * slot spacing overruns it and the beacon is lost.  The per-frame
+ * diagnostics are therefore sampled; the low-rate health lines (TX_GRID,
+ * TX_JITTER, GRID_REF, A_STATE) are untouched. */
+#define ANCHOR_DIAG_EVERY         8u   /* per-frame diagnostics: 1 frame in 8 */
+
 /* Antenna delay — must match Tag (same DW3000 hardware) */
 #define TX_ANT_DLY 16385
 #define RX_ANT_DLY 16385
@@ -1900,9 +1912,20 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
         }
     }
 
-    /* Root diagnostic: print neighbor table and slot table on every RX */
+    /* Root diagnostic: print the neighbour table and the slot table.
+     *
+     * The table was printed on EVERY RX — 140 RX/s on a Root with 7
+     * children, ~120 bytes each, i.e. ~17 kB/s of a 115200 baud link
+     * (11.5 kB/s).  The blocking print also stalled the RX loop, and the
+     * one-frame-deep DW3000 RX buffer then dropped beacons.
+     *
+     * The table only changes when a neighbour joins or leaves, so it is
+     * printed ON CHANGE instead.  The buffer is 288 bytes: the worst case
+     * (8 neighbours with 5-digit ranks + 8 slot owners) is ~220 bytes, so
+     * the old 128-byte buffer could overflow it. */
     if (g_anchor.cs_level == 0) {
-        char dbg[128]; int pos = 0;
+        static char s_last_tbl[288];
+        char dbg[288]; int pos = 0;
         int n_neigh = 0; int ni;
         for (ni = 0; ni < ANCHOR_MAX_NEIGHBORS; ni++) {
             if (g_anchor.neighbors[ni].initialized) n_neigh++;
@@ -1920,7 +1943,11 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
             pos += sprintf(dbg + pos, " sl%d=R%u", si, (unsigned)g_anchor.slot_owners[si]);
         }
         pos += sprintf(dbg + pos, "\r\n");
-        DBG_PRINT(dbg);
+        if (strcmp(dbg, s_last_tbl) != 0) {
+            strncpy(s_last_tbl, dbg, sizeof(s_last_tbl) - 1);
+            s_last_tbl[sizeof(s_last_tbl) - 1] = '\0';
+            DBG_PRINT(dbg);
+        }
     }
 
     /* Delta-range check on RAW timestamps (no wrap correction here).
@@ -1973,14 +2000,17 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     g_anchor.rx_count++;
 
     {
+        static uint32_t s_rx_diag_ctr;
         char dbg[48];
         const AnchorClockSync *s = &g_anchor.neighbors[slot];
-        sprintf(dbg, "RX[R=%03u] Q=%02u%% F=%.9f (%+.1f ppm)\r\n",
-            src_rank,
-            (unsigned int)(s->quality * 100),
-            s->factor,
-            (double)(s->factor - 1.0) * 1e6);
-        DBG_PRINT(dbg);
+        if ((s_rx_diag_ctr++ % ANCHOR_DIAG_EVERY) == 0) {
+            sprintf(dbg, "RX[R=%03u] Q=%02u%% F=%.9f (%+.1f ppm)\r\n",
+                src_rank,
+                (unsigned int)(s->quality * 100),
+                s->factor,
+                (double)(s->factor - 1.0) * 1e6);
+            DBG_PRINT(dbg);
+        }
     }
 
     /* ── DS-TWR: close the round trip (Root side) ─────────────────────────
@@ -2075,11 +2105,13 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                         L->child_rx_ref = r1;
                         L->ref_cycle = refc;
                         L->have = 1;
-                        { char dbg[64];
+                        { static uint32_t s_twr_diag_ctr;
+                          char dbg[64];
+                          if ((s_twr_diag_ctr++ % ANCHOR_DIAG_EVERY) == 0) {
                           sprintf(dbg, "TWR R=%u prop=%ucm\r\n",
                                   (unsigned)src_rank,
                                   (unsigned)((uint32_t)(p_root * CM_PER_DTU_F + 0.5)));
-                          DBG_PRINT(dbg); }
+                          DBG_PRINT(dbg); } }
                     }
                 }
             }

@@ -53,6 +53,23 @@ extern UART_HandleTypeDef huart2;
 /* Diagnostics */
 #define TAG_DIAG  0
 
+/* Diagnostic output throttling.
+ *
+ * The debug UART is a BLOCKING resource: HAL_UART_Transmit() spins until
+ * the last byte has left the shift register, so every printed line stalls
+ * the RX loop for (bytes x 10 bits) / baud.  With 8 anchors the tag
+ * receives 160 beacons/s (8 anchors x 20 rounds/s) and the DW3000 RX
+ * buffer is ONE frame deep — a print that lasts longer than the 6.25 ms
+ * slot spacing overruns it and the beacon is lost.  At 115200 baud the
+ * two per-frame lines (RX_TS + CFO, ~90 bytes) blocked the loop for 8 ms
+ * per frame, i.e. the tag was dropping beacons by construction.
+ *
+ * The per-frame diagnostics are therefore sampled.  The per-solve summary
+ * (TSUM) and the product line (P,SEQ,...) stay at full rate: they
+ * describe the solution and are what the bench actually needs. */
+#define TAG_DIAG_RX_EVERY      8u   /* RX_TS / CFO: 1 beacon in 8       */
+#define TAG_DIAG_DETAIL_EVERY  4u   /* TDOA_DBG / TSUM_CYC: 1 solve in 4 */
+
 /*============================================================================
  * Hardware config (same as before)
  *============================================================================*/
@@ -200,6 +217,12 @@ static void tag_solve_and_report(void)
 {
     int i;
     uint32_t now_ms = HAL_GetTick();
+
+    /* Solve counter for the diagnostic decimation (TAG_DIAG_DETAIL_EVERY).
+     * The solve itself runs at 20 Hz; the detailed TDOA dump is 1 in 4. */
+    static uint32_t s_solve_diag_ctr;
+    uint32_t solve_n = s_solve_diag_ctr++;
+    bool detail = ((solve_n % TAG_DIAG_DETAIL_EVERY) == 0);
 
     /* Find fresh active trackers (within FRESH_MS_MAX ms) */
     int n_active = 0;
@@ -503,8 +526,12 @@ static void tag_solve_and_report(void)
      * early exit — a solve that is silently dropped looks exactly like a
      * solve that never ran, and there is no way to tell the two apart on
      * the bench. */
-    /* Debug: print raw TDOA values */
-    { char dbg[128]; int pos = 0;
+    /* Debug: print raw TDOA values (1 solve in TAG_DIAG_DETAIL_EVERY).
+     * The buffer is 288 bytes: the worst case is 8 anchors x (" R" + 5-digit
+     * id + "=" + 14-digit signed DTU difference) plus a 40-byte header, i.e.
+     * ~220 bytes — the old 128-byte buffer could overflow it. */
+    if (detail) {
+      char dbg[288]; int pos = 0;
       pos += sprintf(dbg + pos, "TDOA_DBG REF=R%d TOA=%llu",
           s_trackers[ref_idx].rank, (unsigned long long)toa_dtu[0]);
       for (i = 1; i < n_valid; i++) {
@@ -530,8 +557,9 @@ static void tag_solve_and_report(void)
       test_run_info((unsigned char *)dbg); }
 
     /* Per-anchor cycle id of the selected set — the fastest way to see
-     * which anchor is one cycle behind. */
-    { char dbg[128]; int pos = 0;
+     * which anchor is one round behind.  Sampled 1 solve in 4. */
+    if (detail) {
+      char dbg[128]; int pos = 0;
       pos += sprintf(dbg + pos, "TSUM_CYC");
       for (i = 0; i < n_sel && pos < 100; i++) {
           int idx = sel_idx[i];
@@ -740,16 +768,24 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     }
 
     /* Diagnostic: print RX timestamp diff between consecutive frames.
-     * If all anchors report identical rx_local, RX timestamp latch is broken. */
+     * If all anchors report identical rx_local, RX timestamp latch is broken.
+     *
+     * Sampled (TAG_DIAG_RX_EVERY): this runs on EVERY received beacon
+     * (160/s with 8 anchors) and the print blocks the RX loop.  The diff
+     * itself is still updated on every frame, so a stall of the RX latch
+     * shows up in the sampled line as well. */
     {
         static uint64_t s_last_rx;
+        static uint32_t s_rx_diag_ctr;
         char dbg[96];
-        sprintf(dbg, "RX_TS R=%u tx=%llu rx=%llu diff=%lld\r\n",
-            src_rank,
-            (unsigned long long)tx_remote,
-            (unsigned long long)rx_local,
-            (long long)(rx_local - s_last_rx));
-        test_run_info((unsigned char *)dbg);
+        if ((s_rx_diag_ctr++ % TAG_DIAG_RX_EVERY) == 0) {
+            sprintf(dbg, "RX_TS R=%u tx=%llu rx=%llu diff=%lld\r\n",
+                src_rank,
+                (unsigned long long)tx_remote,
+                (unsigned long long)rx_local,
+                (long long)(rx_local - s_last_rx));
+            test_run_info((unsigned char *)dbg);
+        }
         s_last_rx = rx_local;
     }
 
@@ -778,12 +814,15 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * "factor" was off by a factor of 1024 and hid the real behaviour. */
     {
         static int16_t s_last_cfo;
+        static uint32_t s_cfo_diag_ctr;
         char dbg2[64];
-        sprintf(dbg2, "CFO cfo_raw=%d factor_meas=%.9f\r\n",
-            cfo_raw, 1.0 + (double)cfo_raw / 67108864.0);
-        if (cfo_raw != s_last_cfo || s_last_cfo == 0) {
-            test_run_info((unsigned char *)dbg2);
-            s_last_cfo = cfo_raw;
+        if ((s_cfo_diag_ctr++ % TAG_DIAG_RX_EVERY) == 0) {
+            sprintf(dbg2, "CFO cfo_raw=%d factor_meas=%.9f\r\n",
+                cfo_raw, 1.0 + (double)cfo_raw / 67108864.0);
+            if (cfo_raw != s_last_cfo || s_last_cfo == 0) {
+                test_run_info((unsigned char *)dbg2);
+                s_last_cfo = cfo_raw;
+            }
         }
     }
 
