@@ -296,14 +296,21 @@ static void tag_solve_and_report(void)
     #define DTU_PER_SLOT  ((int64_t)DL_SLOT_DTU_US * (int64_t)UUS_TO_DWT_TIME)
 
     /* Acceptance window for a TDOA difference.  Light covers 1 m in 3.3356 ns
-     * = 213.20 DTU (1 DTU = 15.65 ps), so ±100 m of path difference covers
-     * any indoor deployment.  The dominant error source (a beacon from a
-     * different TDMA round, 50 ms = 3.19 M DTU) is removed by the cycle-id
-     * pairing below — and by this window as a second line of defence: with
-     * the old (1000x too large) constant the window was ±100 km and let
-     * cross-round frames through. */
-    #define TDOA_DTU_PER_METER  213LL
-    #define TDOA_MAX_DTU        (100LL * TDOA_DTU_PER_METER)   /* 21,300 */
+     * = 213.20 DTU (1 DTU = 15.65 ps), so the window has to cover the
+     * largest legitimate path difference of the site.  The dominant error
+     * source (a beacon from a different TDMA round, 50 ms = 3.19 M DTU) is
+     * removed by the cycle-id pairing below — and by this window as a second
+     * line of defence: with the old (1000x too large) constant the window
+     * was ±100 km and let cross-round frames through.
+     *
+     * P2-4: the unit was the truncated 213 and the cap 100 m — both too
+     * tight for a site whose anchors are more than 100 m apart.  The value
+     * now comes from shared_defines.h (213.20 DTU/m, kept at 1/1000
+     * resolution) and the cap is 150 m of path difference, which is still
+     * two orders of magnitude below the cross-round error. */
+    #define TDOA_DTU_PER_M_MILLI  213200LL   /* 213.20 DTU per metre × 1000 */
+    #define TDOA_MAX_PATH_M        150LL     /* ±150 m of path difference    */
+    #define TDOA_MAX_DTU           ((TDOA_MAX_PATH_M * TDOA_DTU_PER_M_MILLI) / 1000LL)
 
     /* ── Slot spacing is defined in the ROOT's clock, not in ours ──────────
      * The anchors place their beacons on the Root's grid: anchor k transmits

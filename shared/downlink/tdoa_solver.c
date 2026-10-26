@@ -9,8 +9,8 @@
  *          toa[i] (i=1..N-1) are the slave blink TOAs.
  *          tdoa[i] = toa[i] - toa[0]  (in DW3000 device time units)
  *
- *          CM_PER_DTU ≈ 0.4691 cm/dtu
- *            = SPEED_OF_LIGHT * 100.0 / (499.2e6 * 128.0)
+ *          cm per DWT time unit = CM_PER_DTU_F (shared_defines.h)
+ *            = 0.46907 cm/dtu
  *============================================================================*/
 #include <math.h>
 #include <shared_defines.h>
@@ -18,12 +18,9 @@
 
 extern void test_run_info(unsigned char *data);
 
-/* DWT time unit in seconds: 1/(499.2e6 * 128) */
-#define DWT_TIME_S   (1.0f / (499.2e6f * 128.0f))
-
-/* cm per DWT time unit */
-#define CM_PER_DTU   ((float)SPEED_OF_LIGHT * 100.0f * DWT_TIME_S)
-/* ≈ 0.4691 */
+/* P2-9: the conversion constant is the one in shared_defines.h — the local
+ * copy (SPEED_OF_LIGHT / 499.2 MHz / 128) had drifted from it by 0.006 %. */
+#define CM_PER_DTU   CM_PER_DTU_F
 
 #define MAX_ITER         12
 #define CONV_THRESH      0.10f    /* convergence: step length < 0.10 cm */

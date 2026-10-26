@@ -380,8 +380,10 @@ extern "C" {
  *============================================================================*/
 #define DL_ANCHOR_ENTRY_SIZE  7u
 
-/* TDOA conversion: 1 DW3000 device time unit ≈ 15.65 ps ≈ 0.4691 cm */
-#define TDOA_CM_PER_DTU         0.4691f
+/* TDOA conversion: 1 DW3000 device time unit ≈ 15.65 ps ≈ 0.46907 cm.
+ * P2-9: the canonical value is CM_PER_DTU_F in shared_defines.h — this
+ * alias must not drift from it. */
+#define TDOA_CM_PER_DTU         0.46907f
 
 typedef struct {
     uint16_t id;    /* anchor rank (16-bit to support ranks > 255) */
