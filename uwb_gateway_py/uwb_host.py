@@ -749,25 +749,43 @@ def handle_pos(parts):
     d = S.devices[uid]
 
     # --- TDOA position smoothing: outlier rejection + exponential filter ---
-    OUTLIER_MAX_M  = 2.0      # reject jumps > 2m (x/y are meters)
     SMOOTH_ALPHA   = 0.3      # blend factor (0.3 = 30% new, 70% old)
+
+    # P2-1: the jump threshold follows the TIME, not a fixed distance.
+    # A fixed 2 m is wrong in both directions: after a stall (a second
+    # without a fix) a tag that simply walked 2.5 m is legitimate and used
+    # to be thrown away, while at 20 Hz a 1 m glitch is not a jump at all
+    # and used to be accepted.  The threshold is therefore the distance a
+    # tag can cover in the gap at OUTLIER_SPEED_MPS, with a floor of
+    # OUTLIER_MIN_M for the fast case (20 Hz → 50 ms → 0.15 m).
+    OUTLIER_MIN_M    = 0.5    # never accept a jump shorter than this
+    OUTLIER_SPEED_MPS = 3.0   # ... but always accept this fast
 
     prev_x = d.get("x")       # last smoothed position (None on first fix)
     prev_y = d.get("y")
+    now = time.time()
 
     if prev_x is not None and prev_y is not None:
+        # The gap is measured from the last ACCEPTED position — a dropped
+        # frame must not make the next jump look bigger than it is.
+        dt = now - d.get("last_acc_t", now)
+        if dt < 0.0:
+            dt = 0.0
+        jump_max = max(OUTLIER_MIN_M, OUTLIER_SPEED_MPS * dt)
         dist = math.hypot(x - prev_x, y - prev_y)
-        if dist > OUTLIER_MAX_M and q < 300:
-            # Outlier: position jumped too far in one cycle → drop it
+        if dist > jump_max and q < 300:
+            # Outlier: position jumped too far for the time that passed
             d["dropped"] = d.get("dropped", 0) + 1
         else:
             # Accepted: exponential smoothing
             d["x"] = prev_x * (1.0 - SMOOTH_ALPHA) + x * SMOOTH_ALPHA
             d["y"] = prev_y * (1.0 - SMOOTH_ALPHA) + y * SMOOTH_ALPHA
+            d["last_acc_t"] = now
     else:
         # First fix: no smoothing
         d["x"] = x
         d["y"] = y
+        d["last_acc_t"] = now
 
     d["rx"] = x; d["ry"] = y  # raw (unsmoothed) for diagnostics
     d["online"] = True; d["z"] = z; d["q"] = q
