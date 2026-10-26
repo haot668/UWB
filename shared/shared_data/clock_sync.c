@@ -3,6 +3,7 @@
  * @brief   Kalman + RC implementation for BD8NCF-style anchor clock sync.
  * --------------------------------------------------------------------------- */
 #include "clock_sync.h"
+#include "downlink_protocol.h"
 #include <math.h>
 
 /* Population count of a 32-bit word (the outlier history). */
@@ -206,9 +207,13 @@ bool clock_sync_update(AnchorClockSync *s,
 
     s->rx_total++;
 
-    /* P1-10: the beacons arrive every 80 ms (not 100 ms); the value only
-     * scales the process noise. */
-    uint32_t dt_ms = 80;
+    /* P1-10: the beacons arrive once per TDMA round — DL_TIMESYNC_PERIOD_MS
+     * (8 slots x 6.25 ms = 50 ms).  The value only scales the process
+     * noise, so it has to match the real beacon period: the hard-coded 80
+     * came from the old 2-round/100 ms grid and made the filter's noise
+     * band too wide for the actual cadence.
+     * P2-9: use the protocol constant instead of a literal. */
+    uint32_t dt_ms = DL_TIMESYNC_PERIOD_MS;
     if (s->last_update_ms != 0 && now_ms >= (uint32_t)s->last_update_ms) {
         dt_ms = now_ms - (uint32_t)s->last_update_ms;
     }
