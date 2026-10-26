@@ -674,30 +674,53 @@ static int find_tracker_slot(uint16_t rank)
 static int alloc_tracker_slot(uint16_t rank)
 {
     int i;
-    /* Find empty slot */
+    /* Find an empty slot.
+     *
+     * P2-8: the old test was `!is_active && rank == 0`.  Once a slot had
+     * been used its rank was non-zero forever, so it could never be
+     * reused — the "find empty" loop always ran to the end and every new
+     * anchor went straight to the eviction path.  With 8 anchors and 8
+     * tracker slots that only bites at the ninth anchor, but the eviction
+     * path then picked the tracker with the LOWEST quality, and the Root's
+     * tracker is a perfectly valid candidate: the Root owns the grid the
+     * other anchors are placed on and the TDOA solve is referenced to its
+     * beacon, so evicting it collapses the whole estimate.
+     */
     for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
-        if (!s_trackers[i].is_active && s_trackers[i].rank == 0) {
+        if (!s_trackers[i].is_active) {
             s_trackers[i].rank = rank;
             s_trackers[i].slot = 255;      /* unknown until beacon received */
             s_trackers[i].last_rx_ts = 0;
             s_trackers[i].cycle_id = 0;    /* P0-4: TDMA cycle id (0 = unknown) */
+            s_trackers[i].last_seen_ms = 0;
+            s_trackers[i].quality = 0.0f;
+            s_trackers[i].tdoa_valid = 0;
+            s_trackers[i].desynced = 0;
+            s_trackers[i].desync_count = 0;
             clock_sync_init(&s_trackers[i].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
             return i;
         }
     }
-    /* Replace lowest-quality */
-    int worst = 0;
-    float worst_q = s_trackers[0].quality;
-    for (i = 1; i < DL_MAX_TRACKED_ANCHORS; i++) {
-        if (s_trackers[i].quality < worst_q) {
+    /* Every slot is taken: evict the WEAKEST anchor — but never the Root.
+     * The Root sits in slot 0 of the TDMA grid and is the reference of the
+     * slot-compensated TDOA; the reference anchor is chosen by quality
+     * (see tag_solve_and_report), so the Root has to stay in the table. */
+    int worst = -1;
+    float worst_q = 0.0f;
+    for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
+        if (s_trackers[i].slot == 0) continue;   /* the Root — keep it */
+        if (worst < 0 || s_trackers[i].quality < worst_q) {
             worst_q = s_trackers[i].quality;
             worst = i;
         }
     }
+    if (worst < 0) worst = 0;   /* only the Root is present — cannot happen */
     s_trackers[worst].rank = rank;
     s_trackers[worst].slot = 255;
     s_trackers[worst].last_rx_ts = 0;
     s_trackers[worst].cycle_id = 0;      /* P0-4 */
+    s_trackers[worst].last_seen_ms = 0;
+    s_trackers[worst].quality = 0.0f;
     s_trackers[worst].tdoa_now   = 0;
     s_trackers[worst].tdoa_valid = 0;
     s_trackers[worst].tdoa_avg   = 0;
