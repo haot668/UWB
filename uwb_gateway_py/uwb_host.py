@@ -329,6 +329,17 @@ def parse_line(line: str):
         # 3 s).  Re-check the network state 2.5 s later so the operator sees
         # the real result instead of the optimistic ACK count.
         root.after(2500, _check_network_states)
+    elif head == "+NETSTART_ERR" and len(parts) >= 2 and parts[1].strip() == "NOROSTER":
+        # P2-12: the gateway refuses to invent a roster
+        set_status("组网启动被拒绝 — 没有参与基站名单", "error")
+        messagebox.showerror("组网启动被拒绝",
+            "网关没有收到参与基站名单，拒绝组网。\n\n"
+            "以前网关会把「它认识的所有基站」当成名单，"
+            "其中可能包含没有坐标的基站，会把解算拉向原点。\n"
+            "现在必须显式给出名单。", parent=root)
+        if hasattr(S, "_netstart_btn") and S._netstart_btn:
+            S._netstart_btn.config(text="开始组网", state="normal", bg=C["card"])
+            S._netstart_btn = None
     elif head == "+NETSTART_ERR":
         set_status("组网启动失败 — 基站未响应", "error")
         if hasattr(S, "_netstart_btn") and S._netstart_btn:
@@ -2362,6 +2373,15 @@ def build_settings():
                        if var.get() and r != root_rank]
             roster = [root_rank] + _sort_roster_members(
                 members, order_mode.get(), coords_all, root_rank)
+            # P2-12: the gateway refuses a network without a participant
+            # roster (it used to fall back to "every anchor it knows"), so a
+            # Root-only network has to be stopped here — with a reason.
+            if len(roster) < 2:
+                messagebox.showerror("开始组网",
+                    "组网至少需要 2 个基站（1 个 Root + 至少 1 个子站）。\n\n"
+                    "只有 Root 一个基站时没有 TDOA 几何约束，无法解算位置。\n"
+                    "请再勾选至少一个已设坐标的基站。", parent=dlg)
+                return
             if len(roster) < NET_MIN_PARTICIPANTS:
                 if not messagebox.askyesno("开始组网",
                         f"当前名单只有 {len(roster)} 个基站。\n\n"

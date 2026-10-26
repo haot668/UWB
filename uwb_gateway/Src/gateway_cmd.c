@@ -2420,8 +2420,11 @@ void gateway_poll_uart(void)
          * bitmap always refers to the same participant.  Without a roster a
          * Root can only learn its neighbours from the frames it happens to
          * hear, so a single one-way link makes network formation impossible
-         * and undetectable.  When the host sends no roster the gateway falls
-         * back to "every known anchor", which keeps the old command working.
+         * and undetectable.
+         *
+         * P2-12: when the host sends no roster the gateway does NOT fall back
+         * to "every anchor it happens to know" any more — it refuses and
+         * says why (see below).
          */
         const char *p = cmd + 12;
         unsigned int root_rank = 0;
@@ -2446,20 +2449,23 @@ void gateway_poll_uart(void)
         }
 
         {
-            int i, j, dup;
-            /* --- fallback roster: root + every known anchor --- */
+            int i;
+            /* P2-12: a roster is MANDATORY.
+             *
+             * The old fallback was "the Root plus every anchor the gateway
+             * happens to know".  That silently put anchors into the network
+             * that the operator never chose — and an anchor without a
+             * coordinate contributes a (0,0) position to the TDOA solve,
+             * which drags the answer towards the origin.  A network whose
+             * membership is not the one that was asked for is worse than no
+             * network at all, because it looks like it works.
+             *
+             * So: no roster → refuse, and say so. */
             if (roster_n == 0) {
-                roster[roster_n++] = (uint16_t)root_rank;
-                for (i = 0; i < gw_dev_count && roster_n < (int)NET_MAX_PARTICIPANTS; i++) {
-                    uint16_t r;
-                    if (gw_devs[i].type != 'A') continue;
-                    if (!gw_devs[i].online) continue;
-                    r = gw_devs[i].rank;
-                    if (r == 0 || r == (uint16_t)root_rank) continue;
-                    dup = 0;
-                    for (j = 0; j < roster_n; j++) if (roster[j] == r) { dup = 1; break; }
-                    if (!dup) roster[roster_n++] = r;
-                }
+                static const char no_roster[] = "+NETSTART_ERR,NOROSTER\r\n";
+                test_run_info((unsigned char *)no_roster);
+                gateway_rx_flush();
+                return;
             }
             /* Keep our own copy so the presence mask can be decoded later */
             /* The Root is always a member of the network (it owns slot 0), so
