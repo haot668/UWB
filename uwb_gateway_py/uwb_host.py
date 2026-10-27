@@ -57,6 +57,10 @@ NET_SETTLE_MS = 5000
 # P1-5: how often the network is looked at again.
 NET_RECHECK_MS = 2000
 
+# The quality scale of the tag's position report: 0..1000, HIGHER IS
+# BETTER.  65535 is the "no solution" marker and is NOT a quality value.
+QUALITY_NONE = 65535
+
 
 # ══════════════════════════════════════════════
 #  State
@@ -65,6 +69,9 @@ class State:
     def __init__(self):
         self.ser: serial.Serial | None = None
         self.devices: dict[str, dict] = {}
+        # How many position reports arrived for an id that belongs to an
+        # anchor (a tag and an anchor with the same CRC16 id).
+        self.n_id_conflicts: int = 0
         self.selected_uid: str = ""
         self.find_states: dict[str, bool] = {}
         self.anchor_coords: dict[str, tuple] = {}
@@ -933,10 +940,34 @@ def _check_root_coverage():
 
 def handle_pos(parts):
     uid = parts[1].strip()
-    x, y, z, q = float(parts[2]), float(parts[3]), float(parts[4]), int(parts[5])
+    x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+    q = int(parts[5])
+    # The flags and the residual are appended at the end of the line (the
+    # gateway only adds them when the tag sent the extended report).
+    flags  = int(parts[6]) if len(parts) > 6 else 0
+    rms_mm = int(parts[7]) if len(parts) > 7 else 0
     if uid not in S.devices:
         S.devices[uid] = {"trail": [], "type": "TAG"}
     d = S.devices[uid]
+
+    # --- The ID space is shared by anchors and tags -------------------------
+    # Both are a CRC16 over the 96-bit STM32 UID, rendered as 4 hex digits,
+    # so a tag can collide with an anchor's id (8 anchors x 16 tags ~ 2%).
+    # The host keys the devices by that id alone, so a colliding tag would
+    # have its position written into the ANCHOR's record — and the anchor
+    # would then be drawn at the tag's place on the map.
+    #
+    # The position of a colliding tag is therefore NOT written into the
+    # anchor's record.  The conflict is counted and reported: it is a
+    # configuration problem (two devices with the same id) and the operator
+    # has to fix it, not something the host may paper over.
+    if d.get("type") == "ANCHOR":
+        d["id_conflict"] = d.get("id_conflict", 0) + 1
+        S.n_id_conflicts = getattr(S, "n_id_conflicts", 0) + 1
+        # The raw values are kept for diagnostics only — the smoothed
+        # position, the height and the trail stay untouched.
+        d["conf_rx"] = x; d["conf_ry"] = y; d["conf_q"] = q
+        return
 
     # --- TDOA position smoothing: outlier rejection + exponential filter ---
     SMOOTH_ALPHA   = 0.3      # blend factor (0.3 = 30% new, 70% old)
@@ -951,11 +982,33 @@ def handle_pos(parts):
     OUTLIER_MIN_M    = 0.5    # never accept a jump shorter than this
     OUTLIER_SPEED_MPS = 3.0   # ... but always accept this fast
 
+    # THE QUALITY SCALE.
+    #
+    # The tag sends a SCORE on 0..1000 (bigger is better) and the special
+    # value 65535 for "no solution".  Before the scale was pinned down the
+    # tag sent the RESIDUAL in millimetres under the same name — so a big
+    # number meant a BAD fix — while this code read it as "higher is
+    # better".  The host therefore threw the good fixes away and kept the
+    # bad ones.  One scale, one meaning.
+    #
+    # The thresholds below are on the 0..1000 scale:
+    #   >= 700  good,  >= 400  usable,  < 400  poor,  < 300  rejected
+    Q_GOOD = 700
+    Q_OK   = 400
+    Q_OUTLIER = 300
+
     prev_x = d.get("x")       # last smoothed position (None on first fix)
     prev_y = d.get("y")
     now = time.time()
 
-    if prev_x is not None and prev_y is not None:
+    # A "no solution" report (or one that went stale in the tag) carries no
+    # position at all.  It must not be smoothed into the previous fix —
+    # that would drag the displayed position towards the origin — and it
+    # must not extend the trail either: the trail is the path the tag
+    # actually walked.
+    no_fix = (q >= QUALITY_NONE)
+
+    if not no_fix and prev_x is not None and prev_y is not None:
         # The gap is measured from the last ACCEPTED position — a dropped
         # frame must not make the next jump look bigger than it is.
         dt = now - d.get("last_acc_t", now)
@@ -963,7 +1016,7 @@ def handle_pos(parts):
             dt = 0.0
         jump_max = max(OUTLIER_MIN_M, OUTLIER_SPEED_MPS * dt)
         dist = math.hypot(x - prev_x, y - prev_y)
-        if dist > jump_max and q < 300:
+        if dist > jump_max and q < Q_OUTLIER:
             # Outlier: position jumped too far for the time that passed
             d["dropped"] = d.get("dropped", 0) + 1
         else:
@@ -971,7 +1024,7 @@ def handle_pos(parts):
             d["x"] = prev_x * (1.0 - SMOOTH_ALPHA) + x * SMOOTH_ALPHA
             d["y"] = prev_y * (1.0 - SMOOTH_ALPHA) + y * SMOOTH_ALPHA
             d["last_acc_t"] = now
-    else:
+    elif not no_fix:
         # First fix: no smoothing
         d["x"] = x
         d["y"] = y
@@ -979,13 +1032,21 @@ def handle_pos(parts):
 
     d["rx"] = x; d["ry"] = y  # raw (unsmoothed) for diagnostics
     d["online"] = True; d["z"] = z; d["q"] = q
+    d["flags"] = flags
+    d["rms_mm"] = rms_mm
+    # Was the height MEASURED, or is it the plane of the anchors?  The tag
+    # says so in the flags; with coplanar anchors the height carries no
+    # information at all and must not be used as if it did.
+    d["z_valid"] = bool(flags & 0x01)
+    d["no_fix"] = no_fix
     S.last_update[uid] = time.time()
     S.timed_out.discard(uid)
 
-    # Trail uses smoothed position
-    d["trail"].append((d["x"], d["y"]))
-    if len(d["trail"]) > 300:
-        d["trail"].pop(0)
+    if not no_fix:
+        # Trail uses smoothed position
+        d["trail"].append((d["x"], d["y"]))
+        if len(d["trail"]) > 300:
+            d["trail"].pop(0)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  P1-2: the coordinate read-back
@@ -3857,9 +3918,16 @@ def show_info(uid):
     if d.get("x") is not None:
         lines.append(f"实时:    {d['x']:.3f}, {d['y']:.3f}, {d.get('z',0):.3f}")
     if d.get("q") is not None:
-        lines.append(f"质量: {d['q']}")
+        lines.append(f"质量: {d['q']}/1000")
+        if d.get("rms_mm") is not None and d.get("q", QUALITY_NONE) < QUALITY_NONE:
+            lines.append(f"残差: {d['rms_mm']} mm")
+        if d.get("z_valid") is False:
+            lines.append("高度: 无效（共面锚点，Z 仅为锚点平面）")
     if d.get("fw_ver"):
         lines.append(f"固件: {d['fw_ver']}")
+    if d.get("id_conflict"):
+        lines.append(f"⚠ ID 冲突：{d['id_conflict']} 次位置上报来自同 ID 的标签，"
+                     f"其坐标未写入本记录")
 
     S._info.config(text="\n".join(lines))
     S._info.place(x=10, rely=1.0, y=-10, anchor="sw"); S._info.lift()
@@ -4163,13 +4231,14 @@ def draw_tag(c, uid, d):
                   fill="#ffffff", outline="")
 
     # --- Quality indicator (colored arc inside head) ---
+    # The quality is the tag's SCORE on 0..1000 (bigger is better).
     q = d.get("q")
-    if q is not None and q < 65535 and online:
-        qc = C["green"] if q >= 5 else (C["yellow"] if q >= 3 else C["red"])
+    if q is not None and q < QUALITY_NONE and online:
+        qc = C["green"] if q >= 700 else (C["yellow"] if q >= 400 else C["red"])
         qr = max(hr // 2, 4) + 1
         c.create_oval(hx-qr, hy-qr, hx+qr, hy+qr,
                       fill="", outline=qc, width=3)
-    elif q == 65535 and online:
+    elif q is not None and q >= QUALITY_NONE and online:
         # No-fix indicator — gray dashed ring
         qr = max(hr // 2, 4) + 1
         c.create_oval(hx-qr, hy-qr, hx+qr, hy+qr,
