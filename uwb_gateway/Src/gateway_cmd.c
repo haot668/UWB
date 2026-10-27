@@ -237,6 +237,10 @@ static int hex_byte(char hi, char lo, uint8_t *out)
 #define GW_MAX_DEVICES        48
 #define GW_TIMEOUT_MS         15000  /* 15 s → offline */
 #define GW_HEARTBEAT_MS        8000  /*  8 s heartbeat */
+/* How often a type conflict may be reported for the same id.  A colliding
+ * anchor/tag pair flips the type on every frame, so the report has to be
+ * rate-limited or the serial link drowns in it. */
+#define GW_DEVTYPE_PERIOD_MS   5000  /*  5 s */
 
 
 typedef struct
@@ -255,6 +259,10 @@ typedef struct
     uint64_t uid_fp;
     uint8_t  uid_fp_valid;
     uint8_t  net_state;   /* GW_NETSTATE_* — derived from the anchor's beacon */
+    /* When +DEVTYPE was last reported for this id.  A type conflict
+     * flips the type back and forth on every frame, so the report is
+     * rate-limited to one per GW_DEVTYPE_PERIOD_MS. */
+    uint32_t last_type_ms;
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
@@ -297,11 +305,41 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
 {
     uint32_t now = HAL_GetTick();
     int i;
+    char new_type = (type && type[0] == 'T') ? 'T'
+                  : (type && type[0] == 'G') ? 'G' : 'A';
     for (i = 0; i < gw_dev_count; i++)
     {
         if (strcmp(gw_devs[i].uid, uid) == 0)
         {
             int was_offline = !gw_devs[i].online;
+            /* A TYPE CONFLICT: the same id shows up with a different
+             * identity.  Anchors and tags share the id space (both are a
+             * CRC16 over the 96-bit STM32 UID, rendered as 4 hex digits),
+             * so a tag can collide with an anchor.
+             *
+             * The gateway knows the true identity of a frame -- the frame
+             * type says whether it came from an anchor or from a tag -- so
+             * this is not a guess: it is a real conflict.  The old code
+             * simply kept the FIRST type it saw and merged the two devices
+             * silently.  The type is corrected and the conflict reported. */
+            if (gw_devs[i].type != new_type) {
+                char sout[24];
+                int sp = 0;
+                if ((now - gw_devs[i].last_type_ms) >= GW_DEVTYPE_PERIOD_MS) {
+                    gw_devs[i].last_type_ms = now;
+                    sout[sp++]='+'; sout[sp++]='D'; sout[sp++]='E';
+                    sout[sp++]='V'; sout[sp++]='T'; sout[sp++]='Y';
+                    sout[sp++]='P'; sout[sp++]='E'; sout[sp++]=',';
+                    { int k; for (k = 0; k < 4 && uid[k]; k++) sout[sp++] = uid[k]; }
+                    sout[sp++]=',';
+                    sout[sp++]= gw_devs[i].type;
+                    sout[sp++]=',';
+                    sout[sp++]= new_type;
+                    sout[sp]=' ';
+                    test_run_info((unsigned char *)sout);
+                }
+                gw_devs[i].type = new_type;
+            }
             /* Always refresh rank — it may have been truncated/stale on a
              * previous sighting (e.g. device re-registered with a new rank). */
             gw_devs[i].rank = rank;
@@ -336,6 +374,7 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
         d->uid_fp = 0;
         d->uid_fp_valid = 0;
         d->net_state = GW_NETSTATE_IDLE;
+        d->last_type_ms = 0;
         /* Do NOT send +ONLINE yet — wait for 2nd sighting */
         return;
     }
@@ -376,6 +415,7 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
             d->uid_fp = 0;
             d->uid_fp_valid = 0;
             d->net_state = GW_NETSTATE_IDLE;
+            d->last_type_ms = 0;
         }
         /* Like a fresh registration: no +ONLINE until the 2nd sighting. */
         return;

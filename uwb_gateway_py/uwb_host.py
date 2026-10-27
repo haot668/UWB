@@ -227,6 +227,8 @@ def parse_line(line: str):
         handle_netnbr(parts)
     elif head == "+RANKCOLL" and len(parts) >= 3:
         handle_rankcoll(parts)
+    elif head == "+DEVTYPE" and len(parts) >= 4:
+        handle_devtype(parts)
     elif head == "+POS" and len(parts) >= 6:
         handle_pos(parts)
     elif head == "+COORDAck" and len(parts) >= 5:
@@ -760,6 +762,15 @@ def handle_online(parts):
     d = S.devices[uid]
     was_offline = not d.get("online")
     old_type = d.get("type")
+    # A type CHANGE for the same id is a conflict: anchors and tags share
+    # the id space (both are a CRC16 over the 96-bit STM32 UID rendered as
+    # 4 hex digits), so one of them shadows the other.  It is counted and
+    # reported — the two devices have to be told apart by the operator, the
+    # host may not merge them silently.
+    if old_type is not None and old_type != dtype:
+        d["id_conflict"] = d.get("id_conflict", 0) + 1
+        S.n_id_conflicts = getattr(S, "n_id_conflicts", 0) + 1
+        set_status(f"⚠ ID 冲突：{uid} 的类型由 {old_type} 变为 {dtype}", "warning")
     d["type"] = dtype
     d["rank"] = rank  # store rank for display
     d["pending"] = False   # confirmed online now (it was only "seen" before)
@@ -803,6 +814,28 @@ def handle_offline(parts):
     uid = parts[1].strip()
     if uid in S.devices:
         S.devices[uid]["online"] = False
+    S._dirty = True; refresh_lists()
+
+def handle_devtype(parts):
+    """+DEVTYPE,<uid>,<old>,<new> — the same id was seen with a different
+    identity.
+
+    The gateway can tell an anchor from a tag by the frame type, so this is
+    not a guess: it means a tag and an anchor share the same CRC16 id and
+    the host would otherwise merge the two devices into one record.
+    """
+    if len(parts) < 4:
+        return
+    uid = parts[1].strip()
+    old = parts[2].strip().upper()
+    new = parts[3].strip().upper()
+    names = {"A": "基站", "T": "标签", "G": "网关"}
+    old_n = names.get(old, old)
+    new_n = names.get(new, new)
+    S.n_id_conflicts = getattr(S, "n_id_conflicts", 0) + 1
+    d = S.devices.setdefault(uid, {"trail": []})
+    d["id_conflict"] = d.get("id_conflict", 0) + 1
+    set_status(f"⚠ ID 冲突：{uid} 同时被识别为{old_n}和{new_n}", "warning")
     S._dirty = True; refresh_lists()
 
 def handle_seen(parts):
