@@ -25,12 +25,8 @@
 #include <shared_functions.h>
 #include <example_selection.h>
 #include "downlink_protocol.h"
-/* tdoa_solve provided by shared/downlink/tdoa_solver.c (compiled separately) */
-int tdoa_solve(const dl_anchor_entry_t *anchors,
-               const uint64_t *toa_dtu,
-               uint8_t num_anchors,
-               float *x_cm_out, float *y_cm_out, float *z_cm_out,
-               float *rms_out);
+/* tdoa_solve is provided by shared/downlink/tdoa_solver.c (compiled
+ * separately); its prototype lives in downlink_protocol.h. */
 #include "gateway_protocol.h"
 #include "firmware_version.h"
 #include "../gw_ota/gw_ota.h"
@@ -200,6 +196,8 @@ static int16_t  s_solve_x_cm    = 0;
 static int16_t  s_solve_y_cm    = 0;
 static int16_t  s_solve_z_cm    = 0;
 static uint16_t s_solve_q       = TAG_REPORT_QUALITY_NONE;
+static uint16_t s_solve_rms_cm  = 0;
+static uint8_t  s_solve_flags   = 0;
 static uint32_t s_solve_ms      = 0;
 static uint8_t  s_report_seq    = 0;
 
@@ -212,24 +210,36 @@ static uint8_t  s_report_seq    = 0;
  * version, the UWB frame a sequence counter) — so a parser had to know
  * which link it was looking at, and the two could not be compared.
  *
- * Now ONE builder fills ONE 22-byte frame, and the very same bytes go out
+ * Now ONE builder fills ONE 24-byte frame, and the very same bytes go out
  * over the air and over the wire.  (The local frame also used to send
  * z = 0 while the radio frame sent the real height.)
+ *
+ * The frame grew to 24 bytes so that the flags byte and the residual sit
+ * BEFORE the two-byte tail pad: a DW3210 receiver corrupts the LAST two
+ * bytes of a frame, so the pad has to stay at the very end.
  *==========================================================================*/
 static void tag_build_pos_report(uint8_t *pkt)
 {
     int16_t  x, y, z;
     uint16_t q;
+    uint8_t  flags;
+    uint8_t  rms_mm;
 
     /* The payload: the last solution, or the "no solution" marker. */
     x = s_solve_x_cm; y = s_solve_y_cm; z = s_solve_z_cm;
     q = s_solve_q;
+    flags = s_solve_flags;
+    rms_mm = (s_solve_rms_cm > 255u) ? 255u : (uint8_t)s_solve_rms_cm;
     if (!s_solve_valid) {
         x = 0; y = 0; z = 0;
         q = TAG_REPORT_QUALITY_NONE;
+        flags = 0;
+        rms_mm = 0;
     } else if ((HAL_GetTick() - s_solve_ms) > 500u) {
         /* The solution is stale — the tag is alive but no longer solving. */
         q = TAG_REPORT_QUALITY_NONE;
+        flags = 0;
+        rms_mm = 0;
     }
 
     memset(pkt, 0, DL_POS_REPORT_LEN);
@@ -250,7 +260,11 @@ static void tag_build_pos_report(uint8_t *pkt)
     pkt[17] = (uint8_t)((q >> 8) & 0xFF);
     pkt[18] = (uint8_t)(FW_VERSION_U16 & 0xFF);
     pkt[19] = (uint8_t)((FW_VERSION_U16 >> 8) & 0xFF);
-    /* [20..21] pad */
+    pkt[20] = flags;
+    pkt[21] = rms_mm;
+    /* [22..23] pad — the last two bytes of a received frame are corrupted
+     * by a DW3210, so they carry nothing but the absorber. */
+    pkt[22] = 0xCC; pkt[23] = 0xDD;
 }
 static uint32_t s_n_report_tx   = 0;    /* reports actually transmitted      */
 static uint32_t s_n_report_skip = 0;    /* reports dropped (too late)        */
@@ -709,23 +723,79 @@ static void tag_solve_and_report(void)
     }
 
     float x_cm = 0, y_cm = 0, z_cm = 0, rms = 0;
+    uint8_t n_inlier = 0;
     int ret = tdoa_solve(anchors, toa_dtu, (uint8_t)n_valid,
-                         &x_cm, &y_cm, &z_cm, &rms);
-    if (ret != 0) return;
+                         &x_cm, &y_cm, &z_cm, &rms, &n_inlier);
+    if (ret < 0) return;
+
+    /* THE QUALITY SCALE.
+     *
+     * The score is a PRODUCT of two factors, both on 0..1000:
+     *
+     *     q_residual = 1000 * clamp(1 - rms_cm/50, 0, 1)
+     *     q_inliers  = 1000 * n_inlier / n_measurements
+     *     q          = q_residual * q_inliers / 1000
+     *
+     * so 1000 is the best possible fix and 0 is worthless.  A fix that is
+     * geometrically tight but rests on two of six measurements does not
+     * score well.
+     *
+     * Before this was pinned down the tag sent the residual in MILLIMETRES
+     * under the name "quality", so a big number meant a BAD fix -- while
+     * the host read the same number as "higher is better" and therefore
+     * threw the good fixes away and kept the bad ones.  One scale, one
+     * meaning, from here on.
+     *
+     * n_measurements = n_valid - 1: every anchor but the reference one
+     * produces a TDOA measurement. */
+    {
+        float q_r, q_n, q;
+        int n_meas = (int)n_valid - 1;
+
+        q_r = 1000.0f * (1.0f - rms / (float)DL_POS_RMS_ZERO_CM);
+        if (q_r < 0.0f) q_r = 0.0f;
+        if (q_r > 1000.0f) q_r = 1000.0f;
+
+        if (n_meas > 0) {
+            q_n = 1000.0f * (float)n_inlier / (float)n_meas;
+        } else {
+            q_n = 0.0f;
+        }
+        if (q_n > 1000.0f) q_n = 1000.0f;
+
+        q = q_r * q_n / 1000.0f;
+        if (q < 0.0f) q = 0.0f;
+        if (q > 1000.0f) q = 1000.0f;
+
+        s_solve_q = (uint16_t)q;
+    }
 
     /* Hand the solution to the UWB uplink: the report goes out once per
      * TDMA round, in the guard time of slot 0. */
     s_solve_x_cm  = (int16_t)x_cm;
     s_solve_y_cm  = (int16_t)y_cm;
     s_solve_z_cm  = (int16_t)z_cm;
-    s_solve_q     = (uint16_t)(rms / 100.0f * 1000.0f);
+    s_solve_rms_cm = (uint16_t)((rms > 0.0f) ? rms : 0.0f);
+    /* The flags say what the numbers mean.  Z_VALID is the honest answer
+     * to "was the height measured, or is it just the plane of the
+     * anchors?" -- with coplanar anchors it is the latter, and the flag
+     * says so instead of the consumer having to guess. */
+    s_solve_flags = DL_POS_FLAG_SOLVE_VALID;
+    if (ret == 1) {
+        /* A 3D solve that carried real vertical information. */
+        s_solve_flags |= DL_POS_FLAG_Z_VALID | DL_POS_FLAG_3D_SOLVED;
+    }
     s_solve_valid = true;
     s_solve_ms    = HAL_GetTick();
 
 #if TAG_DEBUG_OUTPUT
-    /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=qm */
+    /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=<0..1000>,ZV=<0|1>,R=<residual m>
+     *
+     * Q is the SCORE (bigger is better), R is the residual in metres, and
+     * ZV says whether the height was measured at all.  Z must be ignored
+     * when ZV = 0 -- it is then the height of the anchor plane. */
     {
-        char out[80]; int pos = 0;
+        char out[96]; int pos = 0;
         out[pos++] = 'P'; out[pos++] = ',';
         uint8_t seq = (uint8_t)(HAL_GetTick() & 0xFF);
         out[pos++] = hex[(seq >> 4) & 0xF];
@@ -742,13 +812,18 @@ static void tag_solve_and_report(void)
         p = sprintf(tmp, "%.2f", z_cm / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = ','; out[pos++] = 'Q'; out[pos++] = '=';
-        p = sprintf(tmp, "%.2f", rms / 100.0f);
+        p = sprintf(tmp, "%u", (unsigned)s_solve_q);
+        for (k = 0; k < p; k++) out[pos++] = tmp[k];
+        out[pos++] = ','; out[pos++] = 'Z'; out[pos++] = 'V'; out[pos++] = '=';
+        out[pos++] = (s_solve_flags & DL_POS_FLAG_Z_VALID) ? '1' : '0';
+        out[pos++] = ','; out[pos++] = 'R'; out[pos++] = '=';
+        p = sprintf(tmp, "%.3f", rms / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = '\r'; out[pos++] = '\n'; out[pos] = 0;
         test_run_info((unsigned char *)out);
     }
 #else
-    /* P2-3: the local UART carries the SAME 22-byte report as the radio.
+    /* P2-3: the local UART carries the SAME 24-byte report as the radio.
      * One format, one parser — and the height is no longer dropped. */
     {
         uint8_t tx[DL_POS_REPORT_LEN];

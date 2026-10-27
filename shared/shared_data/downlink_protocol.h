@@ -338,7 +338,7 @@ extern "C" {
 #define DL_FB_CONFIDENCE_IDX       24u
 
 /*============================================================================
- * Tag Position Report (22 bytes — unchanged for host compatibility)
+ * Tag Position Report (24 bytes)
  *   [0-1]   frame type 0x41 0x88
  *   [2]     sequence (per tag, incremented per report)
  *   [3-4]   source EUI64 tag 0xCA 0xDE
@@ -348,9 +348,41 @@ extern "C" {
  *   [10-11] int16 x_cm (solved by the tag)
  *   [12-13] int16 y_cm
  *   [14-15] int16 z_cm
- *   [16-17] uint16 quality (0..1000 = 0.0..1.0; 65535 = no solution)
+ *   [16-17] uint16 quality (0..1000, HIGHER IS BETTER; 65535 = no solution)
  *   [18-19] uint16 fw_version
- *   [20-21] pad (DW3210 RX corruption)
+ *   [20]    uint8 flags   (see DL_POS_FLAG_* below)
+ *   [21]    uint8 rms_mm  (the residual in millimetres, 255 = saturated)
+ *   [22-23] pad 0xCC 0xDD (DW3210 RX corruption)
+ *
+ * THE QUALITY SCALE
+ * ------------------
+ * quality is a SCORE, not a residual: 1000 is the best possible fix and 0
+ * is worthless.  It is the product of two factors,
+ *
+ *     q = q_residual * q_inliers / 1000
+ *     q_residual = 1000 * clamp(1 - rms_cm/50, 0, 1)
+ *     q_inliers  = 1000 * n_inlier / n_measurements
+ *
+ * so a fix that is geometrically tight but rests on two out of six
+ * measurements does not score well.  65535 is the "no solution" marker and
+ * is NOT a quality value.
+ *
+ * (Before this was pinned down, the tag sent the residual in millimetres
+ * under the name "quality" -- so a BIG number meant a BAD fix -- while the
+ * host read it as "higher is better".  The host therefore threw away the
+ * good fixes and kept the bad ones.  One scale, one meaning, from here on.)
+ *
+ * THE FLAGS
+ * ---------
+ * DL_POS_FLAG_Z_VALID is the honest answer to "is this height measured?":
+ * with coplanar anchors the vertical direction carries no information at
+ * all, and the solver then reports the plane of the anchors as the height.
+ * That number is NOT a measurement and must not be used as one; the flag
+ * says so.
+ *
+ * The frame grew from 22 to 24 bytes so that the flags and the residual
+ * sit BEFORE the trailing pad.  A DW3210 receiver corrupts the LAST TWO
+ * BYTES of a received frame, so the pad has to stay at the very end.
  *
  * The tag is a pure receiver in the TDMA grid.  Its report goes out in the
  * GUARD TIME OF SLOT 0: slot 0 belongs to the Root alone, so the interval
@@ -372,11 +404,29 @@ extern "C" {
  * accuracy of the position at all — the delayed TX exists only to place the
  * frame inside the guard window.
  *==========================================================================*/
-#define DL_POS_REPORT_LEN          22u
+#define DL_POS_REPORT_LEN          24u
 #define TAG_REPORT_DELAY_US       2200u  /* 2.2 ms after the Root's beacon   */
 #define TAG_REPORT_JITTER_US      2000u  /* ALOHA jitter between tags        */
 #define TAG_REPORT_QUALITY_NONE  65535u  /* "no solution" marker             */
 #define DL_MAX_ANCHORS             8u     /* Backward-compat for tdoa_solver.c */
+
+/* The flags byte of the position report ([20]). */
+#define DL_POS_FLAG_Z_VALID      0x01u  /* the height was measured, not the
+                                         * anchor plane (i.e. the anchors
+                                         * were NOT coplanar and the 3D solve
+                                         * carried real vertical information) */
+#define DL_POS_FLAG_SOLVE_VALID  0x02u  /* the position is a fresh solution
+                                         * (not the "no solution" marker)   */
+#define DL_POS_FLAG_3D_SOLVED    0x04u  /* the solve ran in 3D at all       */
+#define DL_POS_FLAG_ALL          0x07u
+
+/* The quality scale of the position report ([16-17]). */
+#define DL_POS_QUALITY_MAX      1000u   /* the best possible fix            */
+#define DL_POS_QUALITY_NONE     65535u  /* "no solution" (same as TAG_REPORT_QUALITY_NONE) */
+#define DL_POS_RMS_MM_MAX        255u   /* the residual byte saturates here */
+
+/* The residual at which the residual factor of the quality reaches zero. */
+#define DL_POS_RMS_ZERO_CM        50u
 
 /*============================================================================
  * Per-anchor position entry (7 bytes, int16 cm — full field range)
@@ -424,12 +474,21 @@ static inline void unpack_anchor_entry(const uint8_t *buf, dl_anchor_entry_t *a)
 
 /*============================================================================
  * TDOA solver — improved Gauss-Newton with outlier rejection
+ *
+ * Returns  1 = solved and the height carries information,
+ *          0 = solved but the height carries none (coplanar anchors),
+ *         <0 = no solution (singular matrix, too few anchors).
+ *
+ * n_inlier_out receives the number of surviving TDOA measurements and may
+ * be NULL.  The height must NOT be read as a measured one when the return
+ * value is 0 — it is then the plane of the anchors, a placeholder.
  *============================================================================*/
 int tdoa_solve(const dl_anchor_entry_t *anchors,
                const uint64_t *toa_dtu,
                uint8_t num_anchors,
                float *x_cm_out, float *y_cm_out, float *z_cm_out,
-               float *rms_out);
+               float *rms_out,
+               uint8_t *n_inlier_out);
 
 /*============================================================================
  * Anchor runtime state (set via AT+COORD from host, broadcast in TimeSync)

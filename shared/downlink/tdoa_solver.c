@@ -33,9 +33,50 @@ extern void test_run_info(unsigned char *data);
 
 /* P2-10: when every anchor stands at the same height the vertical direction
  * carries no information at all: the 3D normal equations are singular in z
- * and the solver would only be fitting noise.  Below this spread the
- * network is treated as a horizontal plane and the solve is done in 2D. */
-#define SAME_PLANE_TOL_CM  1.0f
+ * and the solver would only be fitting noise.
+ *
+ * The old test was a HEIGHT SPREAD ("are all the anchors within 1 cm of the
+ * same height?").  That test was meaningless: 1 cm of spread still leaves
+ * the z column of the TDOA Jacobian almost empty, so the height error is
+ * amplified by the ratio of the horizontal extent to the height spread --
+ * with 1 cm of spread over 20 m that is a factor of 2000, and a 5 cm
+ * residual would put the height kilometres away.  A spread threshold cannot
+ * express that.
+ *
+ * The test used now is the GEOMETRIC ONE: how much of the information in
+ * the normal matrix sits in the vertical direction.  z_info is the share
+ * of the trace of H that belongs to the z column,
+ *
+ *      z_info = H[2][2] / (H[0][0] + H[1][1] + H[2][2])
+ *
+ * With coplanar anchors the z column collapses and z_info goes to zero.
+ * With a metre of height spread over 20 m of floor it is still tiny, and
+ * the height error is amplified by ~20 -- a 5 cm residual becomes 1 m of
+ * height, which is useless.
+ *
+ * The threshold is the share below which the height stops being worth
+ * anything: at z_info = 0.02 the vertical direction carries 1/50 of the
+ * information, so the height error is ~50x the residual -- 5 cm of
+ * residual, 2.5 m of height.  Below the threshold the network is solved
+ * in the horizontal plane and the height is reported as NOT VALID, so the
+ * caller can tell "the height is the anchor plane" from "the height was
+ * measured". */
+#define Z_INFO_MIN  0.02f
+
+/*============================================================================
+ * z_result_usable — may this 3D result be used?
+ *
+ * A 3D fit is only worth keeping when the vertical direction carries
+ * enough information to be worth the error amplification it causes.  The
+ * share of the normal matrix that sits in z is the measure of that; a
+ * result below the threshold is discarded and the horizontal solve takes
+ * over (the multi-start already has that attempt lined up).
+ *==========================================================================*/
+static int z_result_usable(int try_2d, float z_info)
+{
+    if (try_2d) return 1;
+    return (z_info >= Z_INFO_MIN) ? 1 : 0;
+}
 
 /*============================================================================
  * solve_3x3 — Cramer's rule for H * x = g  (H is 3x3, g and x are 3x1)
@@ -81,23 +122,16 @@ static int solve_3x3(float H[3][3], const float g[3], float x[3])
 }
 
 /*============================================================================
- * tdoa_solve — Gauss-Newton multilateration
- *
- *   anchors[]   : N anchor positions (id, x_cm, y_cm, z_cm)
- *   toa_dtu[]   : N TOA timestamps in DWT time units (toa_dtu[0] = beacon)
- *   num_anchors : total anchors (N ≥ 3 for 2D, N ≥ 4 for 3D)
- *   x/y/z_cm_out: output position in cm
- *   rms_out     : final RMS residual in cm
- *
- *   Returns 0 on success, -1 on singular matrix, -2 on too few anchors.
- *============================================================================*/
-/*============================================================================
  * gn_solve — ONE Gauss-Newton run, started from a given seed
  *
  *   anchors[]   : N anchor positions (id, x_cm, y_cm, z_cm)
  *   tdoa_cm[]   : N-1 TDOA values in cm, relative to anchor 0
  *   use_2d      : solve in the horizontal plane only (z is not solved for)
  *   x0/y0/z0    : the seed of the iteration
+ *   n_used_out  : number of surviving TDOA measurements (may be NULL)
+ *   z_info_out  : the share of the normal matrix that belongs to the
+ *                 vertical direction, i.e. how much the height was
+ *                 actually determined by the measurements (may be NULL)
  *
  *   Returns 0 on success, -1 on a singular matrix.
  *============================================================================*/
@@ -107,12 +141,18 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
                     int use_2d,
                     float x0, float y0, float z0,
                     float *x_out, float *y_out, float *z_out,
-                    float *rms_out)
+                    float *rms_out,
+                    uint8_t *n_used_out, float *z_info_out)
 {
     float r[DL_MAX_ANCHORS];
     float x = x0, y = y0, z = z0;
     int iter, k;
     uint8_t n = num_anchors;
+    /* The state of the LAST iteration: how many anchors survived the
+     * outlier rejection, and how much information the vertical direction
+     * carried. */
+    uint8_t last_used = 0;
+    float  last_z_info = 0.0f;
 
     /* Outlier tracking: each measurement's weight (0 = rejected) */
     float weight[DL_MAX_ANCHORS];
@@ -184,6 +224,14 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
         H[1][0] = H[0][1];
         H[2][0] = H[0][2];
         H[2][1] = H[1][2];
+
+        /* How much of the normal matrix belongs to the vertical direction,
+         * and how many anchors are still in the fit.  See Z_INFO_MIN. */
+        {
+            float tr = H[0][0] + H[1][1] + H[2][2];
+            last_z_info = (tr > 0.0f) ? (H[2][2] / tr) : 0.0f;
+            last_used   = used_count;
+        }
 
         float denom = (float)(used_count > 0 ? used_count - 1 : 1);
         rms = sqrtf(rms / denom);
@@ -285,6 +333,12 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
     *y_out = y;
     *z_out = z;
     *rms_out  = prev_rms;
+    /* The count is the number of surviving TDOA MEASUREMENTS (anchor k
+     * against the reference anchor 0).  The reference itself produces no
+     * measurement, so it is not counted -- the caller can compare this
+     * against (num_anchors - 1) to get the inlier ratio. */
+    if (n_used_out)  *n_used_out  = last_used;
+    if (z_info_out)  *z_info_out  = last_z_info;
     return 0;
 }
 
@@ -296,8 +350,16 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
  *   num_anchors : total anchors (N ≥ 3 for 2D, N ≥ 4 for 3D)
  *   x/y/z_cm_out: output position in cm
  *   rms_out     : final RMS residual in cm
+ *   n_inlier_out: number of surviving TDOA measurements (may be NULL)
  *
- *   Returns 0 on success, -1 on singular matrix, -2 on too few anchors.
+ *   Returns  1 on success AND the height carries information,
+ *            0 on success but the height carries NO information
+ *              (coplanar anchors, or fewer than 5 anchors for a 3D fit),
+ *           -1 on singular matrix, -2 on too few anchors.
+ *
+ *   The caller MUST NOT read the height as a measured one when the return
+ *   value is 0 -- in that case the height is the plane of the anchors and
+ *   is only a placeholder.
  *
  *   P2-11: the seed decides whether the iteration finds the right minimum.
  *   The tag moves a few centimetres between two rounds, so the PREVIOUS
@@ -317,7 +379,8 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
                const uint64_t *toa_dtu,
                uint8_t num_anchors,
                float *x_cm_out, float *y_cm_out, float *z_cm_out,
-               float *rms_out)
+               float *rms_out,
+               uint8_t *n_inlier_out)
 {
     float tdoa_cm[DL_MAX_ANCHORS];
     float x = 0.0f, y = 0.0f, z = 0.0f;
@@ -325,6 +388,7 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
     int k;
     uint8_t n = num_anchors;
     int use_2d = 0;
+    int z_valid = 0;
 
     if (n < 2)
         return -2;
@@ -366,18 +430,10 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
      *    it over-determined and the least-squares fit stable. */
     if (n < 5)
         use_2d = 1;
-    {
-        float zmin = (float)anchors[0].z_cm;
-        float zmax = zmin;
-        for (k = 1; k < (int)n; k++)
-        {
-            float az = (float)anchors[k].z_cm;
-            if (az < zmin) zmin = az;
-            if (az > zmax) zmax = az;
-        }
-        if (zmax - zmin <= SAME_PLANE_TOL_CM)
-            use_2d = 1;
-    }
+    /* The vertical direction is NOT tested here any more: a 3D attempt is
+     * made and its result is judged on the information the vertical
+     * direction actually carried (Z_INFO_MIN, z_result_usable).  A spread
+     * test cannot express that -- see the comment on Z_INFO_MIN. */
 
     /* 4. Multi-start: the previous solution and the centroid.
      *
@@ -393,6 +449,7 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
         int used_2d = use_2d;
         int attempts = use_2d ? 1 : 2;
         int attempt;
+        uint8_t bn = 0;
 
         for (attempt = 0; attempt < attempts && !have; attempt++)
         {
@@ -401,24 +458,44 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
             if (s_prev_valid)
             {
                 float tx, ty, tz, tr;
+                uint8_t tu; float tzi;
+                /* In the horizontal solve the height is FIXED at the anchor
+                 * plane, so it is seeded with cz and not with the previous
+                 * height: the residuals and the reported height then agree.
+                 * (Before this the solve ran with the seed's height and
+                 * only the REPORTED height was replaced afterwards, so the
+                 * position that came out did not satisfy the height that
+                 * was published with it.) */
+                float sz = try_2d ? cz : s_prev_z_cm;
                 if (gn_solve(anchors, tdoa_cm, n, try_2d,
-                             s_prev_x_cm, s_prev_y_cm, s_prev_z_cm,
-                             &tx, &ty, &tz, &tr) == 0)
+                             s_prev_x_cm, s_prev_y_cm, sz,
+                             &tx, &ty, &tz, &tr, &tu, &tzi) == 0
+                    && z_result_usable(try_2d, tzi))
                 {
-                    bx = tx; by = ty; bz = tz; br = tr; have = 1; used_2d = try_2d;
+                    bx = tx; by = ty; bz = tz; br = tr; bn = tu;
+                    have = 1; used_2d = try_2d;
                 }
             }
             {
                 float tx, ty, tz, tr;
+                uint8_t tu; float tzi;
                 if (gn_solve(anchors, tdoa_cm, n, try_2d, cx, cy, cz,
-                             &tx, &ty, &tz, &tr) == 0)
+                             &tx, &ty, &tz, &tr, &tu, &tzi) == 0
+                    && z_result_usable(try_2d, tzi))
                 {
-                    if (!have || tr < br) { bx = tx; by = ty; bz = tz; br = tr; have = 1; used_2d = try_2d; }
+                    if (!have || tr < br)
+                    {
+                        bx = tx; by = ty; bz = tz; br = tr; bn = tu;
+                        have = 1; used_2d = try_2d;
+                    }
                 }
             }
         }
         if (!have)
             return -1;
+
+        /* The height is meaningful only if the solve was a 3D one. */
+        z_valid = used_2d ? 0 : 1;
 
         x = bx; y = by; z = bz;
 
@@ -426,14 +503,20 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
         s_prev_x_cm = bx; s_prev_y_cm = by; s_prev_z_cm = bz; s_prev_valid = 1;
 
         /* In the horizontal-plane solve the height carries no information:
-         * report the plane of the anchors, not the seed. */
+         * the plane of the anchors.  The solve ran with that very height
+         * as its seed, so the published x/y really do belong to it. */
         if (used_2d) z = cz;
 
         *rms_out = br;
+        if (n_inlier_out) *n_inlier_out = bn;
     }
 
     *x_cm_out = x;
     *y_cm_out = y;
     *z_cm_out = z;
-    return 0;
+    /* 1 = solved and the height is meaningful, 0 = solved but the height
+     * carries no information (coplanar anchors, or too few anchors for a
+     * 3D fit).  The caller must NOT read a height in the second case as
+     * a measured one. */
+    return z_valid ? 1 : 0;
 }
