@@ -804,7 +804,7 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
 {
     uint8_t func = frame[9];
     uint16_t src_addr = (uint16_t)(frame[7] | (frame[8] << 8));
-    char out[48];
+    char out[80];
     int pos;
     (void)len;  /* unused — frame length checked by caller */
 
@@ -877,6 +877,18 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         int16_t y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
         int16_t z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
         uint16_t q = (uint16_t)(frame[GW_HDR_LEN+6] | (frame[GW_HDR_LEN+7] << 8));
+        /* The flags and the residual live at bytes 20 and 21 of the report
+         * (the two-byte tail pad sits at 22-23).  A report from an older
+         * tag is only 22 bytes long, so both are only read when the frame
+         * is long enough -- otherwise they stay "unknown". */
+        uint8_t  pos_flags = 0;
+        uint8_t  pos_rms_mm = 0;
+        int      have_extra = 0;
+        if (len >= (uint16_t)(GW_HDR_LEN + 12)) {
+            pos_flags  = frame[GW_HDR_LEN + 10];
+            pos_rms_mm = frame[GW_HDR_LEN + 11];
+            have_extra = 1;
+        }
         /* Mark tag online + extract firmware version */
         {
             char uid[8];
@@ -893,7 +905,12 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
                 gateway_device_version(uid, fw);
             }
         }
-        /* +POS,<UID>,<X.XX>,<Y.YY>,<Z.ZZ>,<Q> — coords in meters */
+        /* +POS,<UID>,<X.XX>,<Y.YY>,<Z.ZZ>,<Q>[,<FLAGS>,<RMS_MM>]
+         *
+         * The coords are in meters and the quality is the 0..1000 SCORE
+         * (bigger is better; 65535 means "no solution").  The flags and the
+         * residual are APPENDED at the end, so a parser that only knows the
+         * old six fields still reads the old line correctly. */
         out[0] = '+'; out[1] = 'P'; out[2] = 'O'; out[3] = 'S'; out[4] = ',';
         pos = 5;
         pos += fmt_hex4(&out[pos], src_addr);
@@ -905,6 +922,12 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         pos += fmt_coord(&out[pos], (int)z);
         out[pos++] = ',';
         pos += fmt_dec(&out[pos], (int)q);
+        if (have_extra) {
+            out[pos++] = ',';
+            pos += fmt_dec(&out[pos], (int)pos_flags);
+            out[pos++] = ',';
+            pos += fmt_dec(&out[pos], (int)pos_rms_mm);
+        }
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
     }
