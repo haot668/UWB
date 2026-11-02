@@ -42,10 +42,26 @@ uint32_t sw_rng_get(void)
     return lfsr_seed;
 }
 
+/* P1-8: the timeout of the debug UART.
+ *
+ * HAL_UART_Transmit() is BLOCKING: it spins until the last byte has left
+ * the shift register, and it keeps spinning until the timeout when the
+ * UART stalls (the host stopped reading, the cable is broken, the
+ * peripheral is wedged).
+ *
+ * With 100 ms of timeout such a stall froze the whole main loop for a
+ * tenth of a second PER LINE — and the tag prints a line every 50 ms, so
+ * the loop never got a chance to recover.  20 ms is enough for the
+ * longest line (the 288-byte TSUM summary needs 3.1 ms at 921600 baud)
+ * and bounds the damage of a stuck UART to a fifth of that.
+ *
+ * The real fix would be an interrupt-driven (or DMA) transmitter, so
+ * that printing never blocks the radio loop at all — but that is a
+ * restructure of the debug path, not a flow blocker. */
 void test_run_info(unsigned char *data)
 {
-    HAL_UART_Transmit(&huart2, data, strlen((const char *)data), 100);
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 100);
+    HAL_UART_Transmit(&huart2, data, strlen((const char *)data), 20);
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 20);
 }
 
 int main(void)

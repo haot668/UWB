@@ -434,7 +434,10 @@ __INLINE uint32_t port_CheckEXT_IRQ(void)
  * */
 void uart_tx_str(const char *str)
 {
-    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 1000);
+    /* P1-8: 1000 ms of blocking here.  These helpers are not called
+     * anywhere in the project, but should one of them ever be used, it
+     * must not be able to freeze the main loop for a second. */
+    HAL_UART_Transmit(&huart2, (uint8_t *)str, strlen(str), 20);
 }
 
 /* @fn      uart_tx_data
@@ -442,7 +445,8 @@ void uart_tx_str(const char *str)
  * */
 void uart_tx_data(uint8_t *data, uint16_t len)
 {
-    HAL_UART_Transmit(&huart2, data, len, 1000);
+    /* P1-8: see uart_tx_str. */
+    HAL_UART_Transmit(&huart2, data, len, 20);
 }
 
 /****************************************************************************//**
