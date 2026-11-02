@@ -608,6 +608,13 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
  *============================================================================*/
 void dl_set_anchor_coord(uint16_t rank, int16_t x_cm, int16_t y_cm, int16_t z_cm);
 void dl_get_anchor_coord(uint16_t rank, dl_anchor_entry_t *out);
+/* Change the beacon interval (AT+RATE).  The anchor implements it, the
+ * gateway only provides the linkage stub — the prototype has to be HERE,
+ * because the gateway calls it from the command handler long before the
+ * stub is defined; without it the compiler takes an implicit "int
+ * dl_set_beacon_interval()" and the later "void ... (uint16_t)" definition
+ * is a hard error ("conflicting types"). */
+void dl_set_beacon_interval(uint16_t ms);
 
 #ifdef __cplusplus
 }

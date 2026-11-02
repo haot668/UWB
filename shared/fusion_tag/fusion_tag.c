@@ -17,6 +17,8 @@
  * --------------------------------------------------------------------------- */
 #include <deca_device_api.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <deca_regs.h>
 #include <deca_spi.h>
 #include <port.h>
