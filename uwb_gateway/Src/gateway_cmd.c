@@ -3000,7 +3000,19 @@ int fusion_gateway(void)
         return -1;
     }
 
-    dwt_configure(&gw_config);
+    /* dwt_configure() auto-calibrates the PLL itself, so the return value
+     * says whether it actually locked.  It used to be ignored: a PLL that
+     * never locked leaves the chip on FOSC, whose drift is far outside the
+     * 20 ppm budget the slot compensation assumes, and the resulting
+     * position error looks like a solver bug.  The state is reported at
+     * boot so the operator can see it. */
+    int cfg_err = dwt_configure(&gw_config);
+    int pll_locked = (dwt_read8bitoffsetreg(SYS_STATUS_ID, 0)
+                      & SYS_STATUS_CP_LOCK_BIT_MASK) ? 1 : 0;
+    if (cfg_err != DWT_SUCCESS)
+        test_run_info((unsigned char *)"CFG ERR\r\n");
+    test_run_info((unsigned char *)(pll_locked ? "PLL: LOCKED\r\n"
+                                               : "PLL: NOT LOCKED (FOSC)\r\n"));
     dwt_configuretxrf(&txconfig_options);
     dwt_setrxantennadelay(RX_ANT_DLY);
     dwt_settxantennadelay(TX_ANT_DLY);

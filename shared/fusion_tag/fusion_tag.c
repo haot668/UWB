@@ -1411,7 +1411,19 @@ int fusion_tag(void)
         test_run_info((unsigned char *)"INIT FAIL\r\n");
         return -1;
     }
-    dwt_configure(&config);
+    /* dwt_configure() auto-calibrates the PLL itself (deca_device.c), so
+     * it does not need an OTP-burned bias_tune.  Its return value used to
+     * be ignored, which hid a PLL that never locked: the chip then runs
+     * on FOSC, whose drift is far outside the 20 ppm budget the slot
+     * compensation assumes, and the resulting error is easily mistaken
+     * for a solver bug.  The state is reported at boot instead. */
+    int cfg_err = dwt_configure(&config);
+    int pll_locked = (dwt_read8bitoffsetreg(SYS_STATUS_ID, 0)
+                      & SYS_STATUS_CP_LOCK_BIT_MASK) ? 1 : 0;
+    if (cfg_err != DWT_SUCCESS)
+        test_run_info((unsigned char *)"CFG ERR\r\n");
+    test_run_info((unsigned char *)(pll_locked ? "PLL: LOCKED\r\n"
+                                               : "PLL: NOT LOCKED (FOSC)\r\n"));
     dwt_configuretxrf(&txconfig_options);
     dwt_setrxantennadelay(RX_ANT_DLY);
     dwt_settxantennadelay(TX_ANT_DLY);

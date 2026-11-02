@@ -2875,8 +2875,18 @@ static int anchor_init(void)
 
 /*============================================================================
  * Force PLL calibration and switch to IDLE_PLL state.
- * DW3000 stays in IDLE_RC after reset because OTP bias_tune is not burned.
- * Non-fatal: TX/RX timestamps use FOSC and work without PLL lock.
+ *
+ * UNUSED — kept for reference only.  The boot path relies on the PLL
+ * auto-calibration that dwt_configure() performs (it clears CP_LOCK,
+ * switches the chip to IDLE_PLL and waits for the lock bit); it does NOT
+ * need an OTP-burned bias_tune.  The claim that "the DW3000 stays in
+ * IDLE_RC after reset because OTP bias_tune is not burned" was wrong for
+ * this path.
+ *
+ * The boot banner now prints whether the PLL actually locked, because a
+ * chip left on FOSC drifts far outside the 20 ppm budget the slot
+ * compensation assumes — that shows up as a position error, not as a
+ * timing error, so it has to be visible.
  *============================================================================*/
 static int ensure_pll_locked(void)
 {
@@ -2944,11 +2954,28 @@ int fusion_anchor(void)
         return -1;
     }
 
-    dwt_configure(&config);
+    /* dwt_configure() auto-calibrates the PLL itself (deca_device.c: it
+     * clears CP_LOCK, switches to IDLE_PLL and waits for the lock bit),
+     * so it does NOT need an OTP-burned bias_tune — the earlier comment
+     * here claiming otherwise was wrong.
+     *
+     * Its return value was ignored, which meant a PLL that failed to
+     * lock was silently left on FOSC.  A crystal running on FOSC drifts
+     * far outside the 20 ppm budget that the slot compensation assumes,
+     * and the resulting position error looks like a solver bug rather
+     * than a clock bug.  So the state is now reported at boot: the
+     * operator can see "PLL: NOT LOCKED" and know that the timing
+     * numbers are not to be trusted. */
+    int cfg_err = dwt_configure(&config);
+    int pll_locked = (dwt_read8bitoffsetreg(SYS_STATUS_ID, 0)
+                      & SYS_STATUS_CP_LOCK_BIT_MASK) ? 1 : 0;
+    if (cfg_err != DWT_SUCCESS)
+        DBG_PRINT("CFG ERR\r\n");
+    DBG_PRINT(pll_locked ? "PLL: LOCKED\r\n" : "PLL: NOT LOCKED (FOSC)\r\n");
 
-    /* Note: manual PLL calibration (ensure_pll_locked) requires OTP-burned bias_tune
-     * which this chip lacks. dwt_initialise() already handles bring-up.
-     * TX/RX timestamps work in IDLE_RC (FOSC clock) regardless of PLL lock. */
+    /* Note: manual PLL calibration (ensure_pll_locked) requires OTP-burned
+     * bias_tune which this chip lacks, so it is not used here.  The
+     * auto-calibration inside dwt_configure() does not need it. */
 
     dwt_configuretxrf(&txconfig_options);
     dwt_setrxantennadelay(RX_ANT_DLY);
