@@ -209,6 +209,25 @@ static uint64_t s_sys_time_ext = 0;
 /* Participant roster received with NETWORK_START (P1-1). */
 static uint16_t s_roster[NET_MAX_PARTICIPANTS];
 static uint8_t  s_roster_n = 0;
+/* Am I one of the participants the operator picked?
+ *
+ * NETWORK_START is a BROADCAST, so every anchor in the room receives it —
+ * including the ones the operator did NOT tick in the host dialog.  Such an
+ * anchor must not join the grid (it would contribute a beacon with the
+ * coordinates it never had), but it must keep talking so the host still
+ * sees it as an online device.  This flag is the switch between the two
+ * behaviours. */
+static uint8_t  s_roster_member = 0;
+
+/* Does this anchor have a CONFIGURED coordinate?
+ *
+ * The coordinate comes from the host (AT+COORD) and is NOT persisted in
+ * flash — the flash save is a stub (the 32 KB Keil limit), so after a
+ * reboot the anchor is back at (0,0,0).  The Tag has to be able to tell
+ * that apart from a real coordinate, because the TDOA solve is a DIFFERENCE
+ * of distances: an anchor without one contributes the distance to the
+ * ORIGIN and drags the whole solution towards (0,0). */
+static uint8_t  s_coord_valid = 0;
 
 /*============================================================================
  * DS-TWR state
@@ -669,10 +688,21 @@ static uint8_t find_my_slot(uint16_t my_rank)
  * i.e. off by a multiple of 6.25 ms (a multiple of ~2 km of path).
  *
  * The table is therefore built from the roster: slot 0 = the Root, then the
- * roster members in the roster's order.  Anchors that are heard but are NOT
- * in the roster are APPENDED at the end, so an anchor that joined without
- * being listed still gets a slot — appended, so it never shifts the slots
- * of the roster members.
+ * roster members in the roster's order.
+ *
+ * THE ROSTER IS THE WHOLE LIST — nothing is appended.
+ *
+ * An anchor that is HEARD but NOT LISTED used to be appended at the end, so
+ * it got a slot and joined the grid.  That was wrong: the operator picked
+ * the members in the host dialog, and an anchor that was not picked still
+ * received the NETWORK_START broadcast (it is a broadcast!) — so it landed
+ * in the grid with a slot, and the Tag included it in the TDOA with the
+ * coordinates (0,0,0) it never had.  One extra anchor was enough to pull
+ * the whole solution towards the origin.
+ *
+ * An anchor that is not in the roster now gets NO slot: it stays off the
+ * grid, keeps broadcasting off-grid beacons with slot = 255, and the Tag
+ * excludes it (it skips every anchor whose slot is unknown).
  *
  * Returns false when the roster cannot be used (empty) — the caller then
  * keeps the neighbour-based table.
@@ -699,16 +729,8 @@ static bool tdma_build_table_from_roster(void)
         if (!dup) ranks[count++] = r;
     }
 
-    /* Anchors we hear that are not in the roster — appended, never inserted,
-     * so the slots of the roster members stay where they are. */
-    for (i = 0; i < ANCHOR_MAX_NEIGHBORS && count < ANCHOR_MAX_SLOTS; i++) {
-        if (!g_anchor.neighbors[i].initialized) continue;
-        uint16_t r = g_anchor.neighbors[i].neighbor_rank;
-        if (r == 0 || r == root) continue;
-        bool dup = false;
-        for (j = 0; j < count; j++) { if (ranks[j] == r) { dup = true; break; } }
-        if (!dup) ranks[count++] = r;
-    }
+    /* NOTHING is appended here: an anchor that is heard but not listed gets
+     * no slot at all (see the comment above). */
 
     for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
         g_anchor.slot_owners[i] = (i < count) ? ranks[i] : 0;
@@ -1203,6 +1225,11 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pkt[DL_TS_COORD_IDX + 3] = (uint8_t)(y >> 8);
     pkt[DL_TS_COORD_IDX + 4] = (uint8_t)(z & 0xFF);
     pkt[DL_TS_COORD_IDX + 5] = (uint8_t)(z >> 8);
+    /* Say whether these coordinates are the CONFIGURED ones.  The Tag's
+     * solve is a difference of distances, so an anchor without a coordinate
+     * contributes the distance to the ORIGIN and drags the whole solution
+     * towards (0,0) — the Tag must be able to tell that case apart. */
+    if (s_coord_valid) pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_COORD_VALID;
     /* Legacy filler at [50-51].  It does NOT absorb anything: the DW3210
      * corrupts the LAST two bytes of the frame, which are now the
      * 0xCC 0xDD tail pad at [63-64]. */
@@ -1738,6 +1765,20 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
         s_roster_n = n;
     }
 
+    /* Am I one of the participants the operator picked?
+     *
+     * NETWORK_START is a BROADCAST, so every anchor in the room gets it —
+     * including the ones the operator did NOT tick in the host dialog.  The
+     * roster is the operator's selection, and it is the ONLY thing that
+     * defines the network's membership. */
+    s_roster_member = 0;
+    {
+        int i;
+        for (i = 0; i < (int)s_roster_n; i++) {
+            if (s_roster[i] == g_anchor.rank) { s_roster_member = 1; break; }
+        }
+    }
+
     s_net_root_rank = designated_root;
 
     /* Restart the TDMA grid from scratch (P0-3): the Root's beacon defines
@@ -1748,6 +1789,31 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
     g_tdma_ref.root_cycle_id = 0;
     g_tdma_ref.root_tx_ts = 0;
     g_tdma_ref.root_local_ts = 0;
+
+    if (g_anchor.rank != designated_root && !s_roster_member) {
+        /* ── NOT one of the picked participants ────────────────────────────
+         * The operator did not tick this anchor in the host dialog, so it
+         * must not join the grid.  It keeps broadcasting OFF-GRID beacons
+         * (slot = 255, immediate TX) every 500 ms, so it stays visible as
+         * an online device, and the Tag excludes it from the TDOA solve —
+         * it skips every anchor whose slot is unknown.
+         *
+         * It also does NOT answer the NETWORK_ACK: the gateway counts the
+         * answers to report "who is still missing", and an anchor that was
+         * never asked for must not appear there. */
+        g_anchor.cs_level = 1;
+        g_anchor.parent_rank = designated_root;
+        anchor_clear_slot("NOT_IN_ROSTER");
+        s_net_slot_idx = 255;
+        s_net_state = NET_RUNNING;
+        s_aloha_mode = 1;        /* off-grid beacons, slot = 255 */
+        s_aloha_sent_ms = 0;
+        s_net_start_ms = HAL_GetTick();
+        g_anchor.run_state = STATE_SYNC;
+        { char dbg[80]; sprintf(dbg, "NET_START→OFFGRID (not picked, roster=%u)\r\n",
+            (unsigned)s_roster_n); DBG_PRINT(dbg); }
+        return;
+    }
 
     if (g_anchor.rank == designated_root) {
         /* I am the Root — start immediately */
@@ -2503,6 +2569,11 @@ static void anchor_handle_coord_write(uint16_t src_uid, const uint8_t *payload, 
     g_anchor.my_pos = (dl_anchor_entry_t){
         .id = g_anchor.rank, .x_cm = x_cm, .y_cm = y_cm, .z_cm = z_cm
     };
+    /* The coordinate is now a CONFIGURED one — from here on the beacon may
+     * claim it (COORD_VALID), and the Tag may use this anchor in its
+     * solve.  The flash save may still fail (it is a stub), so the flag is
+     * NOT derived from it. */
+    s_coord_valid = 1;
     gateway_flash_save_coord(x_cm, y_cm, z_cm);
 
     /* ACK to gateway */
@@ -2599,7 +2670,10 @@ static void anchor_process_rx(uint8_t *rx_buf, uint32_t frame_len)
      * anchor_rx_timesync() length check (DL_TIMESYNC_MIN_LEN). */
     if (func == FUNC_NETWORK_START && src == GW_MASTER_ADDR) {
         anchor_handle_network_start(rx_buf, frame_len);
-        anchor_send_network_ack();
+        /* Only the anchors the operator picked answer: the gateway counts
+         * the answers to report who is still missing, so an anchor that was
+         * never asked for must not show up there. */
+        if (s_roster_member) anchor_send_network_ack();
         return;
     }
 
