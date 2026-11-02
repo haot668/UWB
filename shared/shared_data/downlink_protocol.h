@@ -198,7 +198,7 @@ extern "C" {
  *   [9]     func             (0xEE)
  *   [10-14] tx_timestamp40   (40-bit, THIS frame's TX instant)
  *   [15]    flags             (bit0 = TX_TS_PRECISE, bit1 = TX_ERR_VALID,
- *                             bit2 = TX_OFFGRID)                 <-- P0-2
+ *                             bit2 = TX_OFFGRID, bit3 = COORD_VALID) <-- P0-2
  *   [16-17] reserved
  *   [18]    slot             (own TDMA slot, 255 = unassigned/ALOHA)
  *   [19-26] parent_eui64     (8 bytes, 0 if cs_level=0)
@@ -346,6 +346,25 @@ extern "C" {
                                            * meaningless — receivers must drop the
                                            * frame from the TDOA pairing instead of
                                            * poisoning the average with it.        */
+#define DL_TS_FLAG_COORD_VALID    0x08u  /* the coordinates in this frame are the
+                                           * CONFIGURED ones — the anchor really has
+                                           * a position, it is not the (0,0,0) of an
+                                           * anchor that was never configured.
+                                           *
+                                           * The Tag's TDOA solve is a DIFFERENCE of
+                                           * distances to the anchors, so an anchor
+                                           * without a coordinate contributes the
+                                           * distance to the ORIGIN — one bogus
+                                           * anchor is enough to pull the whole
+                                           * solution towards (0,0).  The Tag
+                                           * therefore admits only the anchors that
+                                           * set this bit to the solve.
+                                           *
+                                           * The bit is CLEAR after a reboot until
+                                           * the host writes the coordinate again
+                                           * (the flash persistence of the
+                                           * coordinate is a stub — see the F9/F10
+                                           * item of the review). */
 
 /*============================================================================
  * TWR correction frame (Root → broadcast, variable length)
