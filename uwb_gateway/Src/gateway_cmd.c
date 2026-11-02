@@ -278,6 +278,15 @@ typedef struct
      * COORD_VALID flag) and from the coordinate read-back. */
     uint8_t  coord_known;
     uint8_t  coord_valid;
+    /* P1-7: the sequence of the position reports of a tag.
+     * The tag counts the ROUNDS and publishes the number in byte 2 of the
+     * report; a round whose report could not be sent leaves a hole in that
+     * number, and the hole is exactly the loss. */
+    uint8_t  pos_seq_last;
+    uint8_t  pos_seq_valid;
+    uint8_t  pos_degraded;   /* the previous report was a degraded one   */
+    uint32_t pos_rx;         /* the reports received                     */
+    uint32_t pos_lost;       /* the reports that never arrived           */
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
@@ -312,6 +321,12 @@ static int      gw_net_present_valid = 0;
  * The gateway hears every beacon of the grid, so it knows this without
  * any extra uplink.  The count is reported to the host as +NETGRID. */
 static uint16_t gw_net_on_grid = 0;
+
+/* P1-7: the biggest hole in the tag's round counter that is still counted
+ * as lost reports.  The counter is 8 bit, so a hole of 64 rounds (3.2 s)
+ * is already implausible as a burst of losses -- it means the tag
+ * RESTARTED (its counter starts over) and nothing was lost. */
+#define GW_POS_MAX_GAP  64
 
 /*============================================================================
  * NETSTART broadcast — NON-BLOCKING state machine (P0-1)
@@ -1144,6 +1159,7 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
     }
     else if (func == FUNC_DL_POS_REPORT)
     {
+        char uid[8];
         int16_t x = (int16_t)(frame[GW_HDR_LEN]     | (frame[GW_HDR_LEN+1] << 8));
         int16_t y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
         int16_t z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
@@ -1162,7 +1178,6 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         }
         /* Mark tag online + extract firmware version */
         {
-            char uid[8];
             uid[0] = gw_hex[(src_addr >> 12) & 0xF]; uid[1] = gw_hex[(src_addr >>  8) & 0xF];
             uid[2] = gw_hex[(src_addr >>  4) & 0xF]; uid[3] = gw_hex[ src_addr        & 0xF];
             uid[4] = '\0';
@@ -1199,8 +1214,71 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
             out[pos++] = ',';
             pos += fmt_dec(&out[pos], (int)pos_rms_mm);
         }
+        /* P1-7: the round counter of the tag, APPENDED at the end so that
+         * a parser that only knows the old fields still reads the old line
+         * correctly. */
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], (int)frame[2]);
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
+
+        /* P1-7: the reports that never arrived.
+         *
+         * Byte 2 of the report carries the round counter of the tag (see
+         * tag_build_pos_report).  A round in which the report could not be
+         * sent leaves a hole in that counter -- and the hole is exactly the
+         * loss the operator has to see.  Until now the gateway threw the
+         * byte away, so a tag that was silently dropping half of its
+         * reports looked exactly like one that worked.
+         *
+         * The counter is 8 bit and wraps, so the distance is taken modulo
+         * 256.  Two cases are NOT losses:
+         *
+         *  - a DEGRADED report (the tag is alive but has no network): the
+         *    tag slows down on purpose, so its holes are deliberate;
+         *  - a hole bigger than GW_POS_MAX_GAP rounds: that is the tag
+         *    restarting (its counter starts over), not a burst of losses.
+         */
+        {
+            uint8_t  seq = frame[2];
+            gw_dev_t *d  = gw_find_dev(uid);
+            if (d) {
+                int gap = 0;
+                if (d->pos_seq_valid) {
+                    gap = (int)(uint8_t)(seq - d->pos_seq_last);
+                    if (gap == 0) {
+                        /* the same frame twice — not a new round */
+                        d->pos_degraded =
+                            (pos_flags & DL_POS_FLAG_DEGRADED) ? 1 : 0;
+                    }
+                }
+                if (!(d->pos_seq_valid && gap == 0)) {
+                    d->pos_seq_valid = 1;
+                    d->pos_seq_last  = seq;
+                    d->pos_rx++;
+                    if (gap > 1 && gap <= GW_POS_MAX_GAP
+                        && !(pos_flags & DL_POS_FLAG_DEGRADED)
+                        && !d->pos_degraded) {
+                        d->pos_lost += (uint32_t)(gap - 1);
+                        {
+                            char mo[48]; int mp = 0;
+                            mo[mp++]='+'; mo[mp++]='P'; mo[mp++]='O';
+                            mo[mp++]='S'; mo[mp++]='M'; mo[mp++]='I';
+                            mo[mp++]='S'; mo[mp++]='S'; mo[mp++]=',';
+                            mp += fmt_hex4(&mo[mp], src_addr);
+                            mo[mp++]=',';
+                            mp += fmt_dec(&mo[mp], gap - 1);
+                            mo[mp++]=',';
+                            mp += fmt_dec(&mo[mp], (int)d->pos_lost);
+                            mo[mp++]='\r'; mo[mp++]='\n'; mo[mp]='\0';
+                            test_run_info((unsigned char *)mo);
+                        }
+                    }
+                    d->pos_degraded =
+                        (pos_flags & DL_POS_FLAG_DEGRADED) ? 1 : 0;
+                }
+            }
+        }
     }
     else if (func == FUNC_NETWORK_ACK)
     {

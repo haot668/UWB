@@ -240,6 +240,8 @@ def parse_line(line: str):
         handle_netgrid(parts)
     elif head == "+POS" and len(parts) >= 6:
         handle_pos(parts)
+    elif head == "+POSMISS" and len(parts) >= 3:
+        handle_posmiss(parts)
     elif head == "+COORDSTAT" and len(parts) >= 3:
         handle_coordstat(parts)
     elif head == "+NOCOORD" and len(parts) >= 2:
@@ -1110,6 +1112,28 @@ def _check_root_coverage():
             f"请把 Root 换到覆盖更好的基站后重新组网。{hint}",
             parent=root)
 
+def handle_posmiss(parts):
+    """+POSMISS,<uid>,<lost_this_gap>,<total_lost> -- the reports of a
+    tag that never arrived.
+
+    The tag counts the rounds it solves in and publishes the number with
+    every report (byte 2 of the frame).  A round whose report could not be
+    sent leaves a hole in that number, and the hole IS the loss.  The
+    gateway used to throw the number away, so a tag that was silently
+    dropping half of its reports looked exactly like a working one.
+    """
+    uid = parts[1].strip()
+    try:
+        lost = int(parts[2].strip())
+        total = int(parts[3].strip()) if len(parts) > 3 else lost
+    except (ValueError, IndexError):
+        return
+    d = S.devices.get(uid)
+    if d is not None:
+        d["pos_lost"] = total
+    set_status(f"标签 {get_label(uid)} 丢失 {lost} 个上报（累计 {total} 个）", "warning")
+
+
 def handle_pos(parts):
     uid = parts[1].strip()
     x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
@@ -1118,9 +1142,14 @@ def handle_pos(parts):
     # gateway only adds them when the tag sent the extended report).
     flags  = int(parts[6]) if len(parts) > 6 else 0
     rms_mm = int(parts[7]) if len(parts) > 7 else 0
+    # P1-7: the round counter of the tag (byte 2 of the report).  A hole
+    # in it is a report that never arrived -- the gateway counts those.
+    seq = int(parts[8]) if len(parts) > 8 else None
     if uid not in S.devices:
         S.devices[uid] = {"trail": [], "type": "TAG"}
     d = S.devices[uid]
+    if seq is not None:
+        d["seq"] = seq
 
     # --- The ID space is shared by anchors and tags -------------------------
     # Both are a CRC16 over the 96-bit STM32 UID, rendered as 4 hex digits,
