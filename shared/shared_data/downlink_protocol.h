@@ -531,7 +531,15 @@ extern "C" {
 #define DL_POS_FLAG_SOLVE_VALID  0x02u  /* the position is a fresh solution
                                          * (not the "no solution" marker)   */
 #define DL_POS_FLAG_3D_SOLVED    0x04u  /* the solve ran in 3D at all       */
-#define DL_POS_FLAG_ALL          0x07u
+#define DL_POS_FLAG_DEGRADED     0x08u  /* the tag is alive but has NO
+                                         * network: the Root is down, so
+                                         * there is no solve and no TDOA
+                                         * reference.  The report goes out
+                                         * at a reduced rate, so the gaps in
+                                         * the sequence number are DELIBERATE
+                                         * and must not be counted as lost
+                                         * frames by the consumer.         */
+#define DL_POS_FLAG_ALL          0x0Fu
 
 /* The quality scale of the position report ([16-17]). */
 #define DL_POS_QUALITY_MAX      1000u   /* the best possible fix            */

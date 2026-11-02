@@ -242,10 +242,19 @@ static uint16_t s_solve_rms_cm  = 0;
 static uint8_t  s_solve_flags   = 0;
 static uint32_t s_solve_ms      = 0;
 static uint8_t  s_report_seq    = 0;
-/* Force the next report to carry the "no solution" marker, even when the
- * last solution is still fresh.  Used by the degraded report (the Root is
- * down, so the tag cannot solve any more). */
-static uint8_t  s_report_no_fix = 0;
+/* P1-6: the published frame.
+ *
+ * ONE builder fills this buffer once per round, and BOTH outputs are
+ * rendered from these bytes: the ASCII line on the local UART and the
+ * frame that goes on the air.  The TX path builds nothing any more -- it
+ * sends what was published.
+ *
+ * Until now the radio frame and the UART line carried two INDEPENDENT
+ * sequence numbers (the frame took a counter that the builder
+ * incremented, the line took the low byte of the millisecond tick), so
+ * a jump in the radio sequence could not be told apart from the two
+ * chains simply disagreeing with each other. */
+static uint8_t  s_report_buf[DL_POS_REPORT_LEN];
 
 /*============================================================================
  * tag_build_pos_report — THE position report, one format for both outputs
@@ -276,7 +285,22 @@ static void tag_build_pos_report(uint8_t *pkt)
     q = s_solve_q;
     flags = s_solve_flags;
     rms_mm = (s_solve_rms_cm > 255u) ? 255u : (uint8_t)s_solve_rms_cm;
-    if (!s_solve_valid || s_report_no_fix) {
+
+    /* The Root down means there is no solve any more: the TDOA is
+     * referenced to the Root's beacon, so without it the tag cannot
+     * produce a position.  The report says so right away instead of
+     * repeating a stale fix for another 500 ms.
+     *
+     * The DEGRADED flag says "this report comes from a tag that is alive
+     * but has no network".  The consumer must not read the gaps in the
+     * sequence number as lost frames: while it is degraded the tag
+     * deliberately slows down. */
+    if (s_root_seen && (HAL_GetTick() - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
+        x = 0; y = 0; z = 0;
+        q = TAG_REPORT_QUALITY_NONE;
+        flags = DL_POS_FLAG_DEGRADED;
+        rms_mm = 0;
+    } else if (!s_solve_valid) {
         x = 0; y = 0; z = 0;
         q = TAG_REPORT_QUALITY_NONE;
         flags = 0;
@@ -290,7 +314,12 @@ static void tag_build_pos_report(uint8_t *pkt)
 
     memset(pkt, 0, DL_POS_REPORT_LEN);
     pkt[0] = 0x41; pkt[1] = 0x88;
-    pkt[2] = s_report_seq++;
+    /* P1-6: the counter is incremented once per ROUND (in
+     * tag_report_publish), NOT here -- the builder may run again without
+     * a round having passed.  A gap in the sequence therefore means
+     * "this round did not go out", which is exactly the loss that the
+     * gateway counts. */
+    pkt[2] = s_report_seq;
     pkt[3] = 0xCA; pkt[4] = 0xDE;
     pkt[5] = 0xFF; pkt[6] = 0xFF;                 /* broadcast */
     pkt[7] = (uint8_t)(s_tag_id & 0xFF);
@@ -384,7 +413,7 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
  * factor below. */
 #define TAG_NET_READY_ANCHORS 3
 
-static void tag_solve_and_report(void)
+static void tag_solve(void)
 {
     int i;
     uint32_t now_ms = HAL_GetTick();
@@ -910,22 +939,57 @@ static void tag_solve_and_report(void)
     s_solve_valid = true;
     s_solve_ms    = HAL_GetTick();
 
+}
+
+/*============================================================================
+ * tag_report_publish — the report of this round, once
+ *
+ * P1-6: ONE sequence counter, ONE frame, TWO outputs.
+ *
+ * The counter is incremented here, the frame is built here, and the ASCII
+ * line is rendered FROM that frame -- so the line the robot reads and the
+ * frame the gateway relays carry the same bytes and the same sequence
+ * number, and the two can be compared with each other for the first time.
+ *
+ * The counter counts ROUNDS, not transmissions.  A round in which the
+ * frame could not be sent (the guard window was closed) leaves a gap in
+ * the sequence -- and that gap is exactly the loss.
+ *==========================================================================*/
+static void tag_report_publish(void)
+{
+    s_report_seq++;
+    tag_build_pos_report(s_report_buf);
+
 #if TAG_DEBUG_OUTPUT
     /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=<0..1000>,ZV=<0|1>,R=<residual m>,M=<2D|3D>
      *
      * Q is the SCORE (bigger is better), R is the residual in metres, ZV
      * says whether the height was measured at all and M says whether the
      * solve ran in 2D or in 3D.  Z must be ignored when ZV = 0 -- it is then
-     * the height of the anchor plane. */
+     * the height of the anchor plane.
+     *
+     * Every field is read back OUT OF THE PUBLISHED FRAME, so the line and
+     * the frame on the air can never tell different stories. */
     {
         char out[96]; int pos = 0;
+        uint8_t  seq    = s_report_buf[2];
+        int16_t  x_cm   = (int16_t)(uint16_t)(s_report_buf[10] |
+                            ((uint16_t)s_report_buf[11] << 8));
+        int16_t  y_cm   = (int16_t)(uint16_t)(s_report_buf[12] |
+                            ((uint16_t)s_report_buf[13] << 8));
+        int16_t  z_cm   = (int16_t)(uint16_t)(s_report_buf[14] |
+                            ((uint16_t)s_report_buf[15] << 8));
+        uint16_t q      = (uint16_t)(s_report_buf[16] |
+                            ((uint16_t)s_report_buf[17] << 8));
+        uint8_t  fl     = s_report_buf[20];
+        uint8_t  rms_mm = s_report_buf[21];
+        int p; char tmp[16];
+        int k;
+
         out[pos++] = 'P'; out[pos++] = ',';
-        uint8_t seq = (uint8_t)(HAL_GetTick() & 0xFF);
         out[pos++] = hex[(seq >> 4) & 0xF];
         out[pos++] = hex[seq & 0xF];
         out[pos++] = ','; out[pos++] = 'X'; out[pos++] = '=';
-        int p; char tmp[16];
-        int k;
         p = sprintf(tmp, "%.2f", x_cm / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = ','; out[pos++] = 'Y'; out[pos++] = '=';
@@ -935,21 +999,21 @@ static void tag_solve_and_report(void)
         p = sprintf(tmp, "%.2f", z_cm / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = ','; out[pos++] = 'Q'; out[pos++] = '=';
-        p = sprintf(tmp, "%u", (unsigned)s_solve_q);
+        p = sprintf(tmp, "%u", (unsigned)q);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = ','; out[pos++] = 'Z'; out[pos++] = 'V'; out[pos++] = '=';
-        out[pos++] = (s_solve_flags & DL_POS_FLAG_Z_VALID) ? '1' : '0';
+        out[pos++] = (fl & DL_POS_FLAG_Z_VALID) ? '1' : '0';
         out[pos++] = ','; out[pos++] = 'R'; out[pos++] = '=';
-        p = sprintf(tmp, "%.3f", rms / 100.0f);
+        p = sprintf(tmp, "%.3f", rms_mm / 1000.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
         /* M: the mode of the estimate.  "2D" means the height carries no
          * information (coplanar anchors, or too few anchors for a 3D fit)
-         * — the Z above is then the height of the anchor plane, NOT a
+         * -- the Z above is then the height of the anchor plane, NOT a
          * measurement, and ZV=0 says the same thing.  With three anchors the
          * solve is always 2D and exactly determined, so the quality is
          * discounted accordingly. */
         out[pos++] = ','; out[pos++] = 'M'; out[pos++] = '=';
-        if (s_solve_flags & DL_POS_FLAG_3D_SOLVED) {
+        if (fl & DL_POS_FLAG_3D_SOLVED) {
             out[pos++] = '3'; out[pos++] = 'D';
         } else {
             out[pos++] = '2'; out[pos++] = 'D';
@@ -959,13 +1023,23 @@ static void tag_solve_and_report(void)
     }
 #else
     /* P2-3: the local UART carries the SAME 24-byte report as the radio.
-     * One format, one parser — and the height is no longer dropped. */
-    {
-        uint8_t tx[DL_POS_REPORT_LEN];
-        tag_build_pos_report(tx);
-        HAL_UART_Transmit(&huart2, tx, DL_POS_REPORT_LEN, 10);
-    }
+     * One format, one parser -- and the height is no longer dropped. */
+    HAL_UART_Transmit(&huart2, s_report_buf, DL_POS_REPORT_LEN, 10);
 #endif
+}
+
+/*============================================================================
+ * tag_solve_and_report — solve, then publish
+ *
+ * The publication is OUTSIDE the solve on purpose: a round in which the
+ * solve could not run at all (not enough anchors yet) still publishes a
+ * frame -- one that carries the "no solution" marker.  The tag stays
+ * visible, and the sequence counter keeps counting rounds.
+ *==========================================================================*/
+static void tag_solve_and_report(void)
+{
+    tag_solve();
+    tag_report_publish();
 }
 
 /*============================================================================
@@ -1496,7 +1570,6 @@ static uint16_t tag_compute_id(void)
  *==========================================================================*/
 static void tag_tx_pos_report(uint64_t root_rx)
 {
-    uint8_t  pkt[DL_POS_REPORT_LEN];
     uint64_t now, target, slot1;
     uint32_t delay_us;
 
@@ -1531,14 +1604,14 @@ static void tag_tx_pos_report(uint64_t root_rx)
         target = 0;
     }
 
-    /* P2-3: the same builder as the local UART path — one format. */
-    tag_build_pos_report(pkt);
+    /* P1-6: the frame of this round was already built and published --
+     * these are the same bytes the local UART line was rendered from. */
 
     /* Quiet the radio before the TX, exactly like the anchors do. */
     port_DisableEXT_IRQ();
     dwt_forcetrxoff();
     port_rf_switch_tx();
-    dwt_writetxdata(DL_POS_REPORT_LEN, pkt, 0);
+    dwt_writetxdata(DL_POS_REPORT_LEN, s_report_buf, 0);
     dwt_writetxfctrl(DL_POS_REPORT_LEN, 0, 0);
 
     bool tx_started = false;
@@ -1602,16 +1675,13 @@ static void tag_tx_pos_report(uint64_t root_rx)
  *==========================================================================*/
 static void tag_tx_pos_report_degraded(void)
 {
-    uint8_t pkt[DL_POS_REPORT_LEN];
-
-    s_report_no_fix = 1;
-    tag_build_pos_report(pkt);
-    s_report_no_fix = 0;
-
+    /* P1-6: the published frame of this round.  The builder already
+     * marked it "no solution" (the Root is down), so there is nothing to
+     * build here any more. */
     port_DisableEXT_IRQ();
     dwt_forcetrxoff();
     port_rf_switch_tx();
-    dwt_writetxdata(DL_POS_REPORT_LEN, pkt, 0);
+    dwt_writetxdata(DL_POS_REPORT_LEN, s_report_buf, 0);
     dwt_writetxfctrl(DL_POS_REPORT_LEN, 0, 0);
     dwt_starttx(DWT_START_TX_IMMEDIATE);
     { uint32_t dl = HAL_GetTick() + 10u;
