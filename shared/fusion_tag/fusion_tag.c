@@ -205,6 +205,23 @@ static uint16_t s_root_rank      = 0;
 static double   s_root_rate      = 1.0;    /* (our clock)/(Root's clock)       */
 static uint8_t  s_root_rate_valid = 0;
 
+/* The Root is the reference of everything: it owns slot 0, it defines the
+ * round origin, and the tag's report goes out in the guard time that
+ * follows ITS beacon.  So a tag that stops hearing the Root cannot solve
+ * and cannot report — it just disappears, which on the bench is
+ * indistinguishable from a tag that is switched off.
+ *
+ * These two keep track of the Root's last beacon so that the tag can say
+ * what is wrong instead of going silent. */
+static uint32_t s_root_last_rx_ms = 0;
+static uint8_t  s_root_seen       = 0;
+
+/* How long the Root may stay silent before the tag calls it a failure, and
+ * how often the degraded "I am alive but I have no position" report goes
+ * out while the Root is down. */
+#define TAG_ROOT_TIMEOUT_MS       2000u
+#define TAG_DEGRADED_REPORT_MS     500u
+
 /*============================================================================
  * Position report — the tag's UWB uplink (see DL_POS_REPORT_LEN)
  *
@@ -223,6 +240,10 @@ static uint16_t s_solve_rms_cm  = 0;
 static uint8_t  s_solve_flags   = 0;
 static uint32_t s_solve_ms      = 0;
 static uint8_t  s_report_seq    = 0;
+/* Force the next report to carry the "no solution" marker, even when the
+ * last solution is still fresh.  Used by the degraded report (the Root is
+ * down, so the tag cannot solve any more). */
+static uint8_t  s_report_no_fix = 0;
 
 /*============================================================================
  * tag_build_pos_report — THE position report, one format for both outputs
@@ -253,7 +274,7 @@ static void tag_build_pos_report(uint8_t *pkt)
     q = s_solve_q;
     flags = s_solve_flags;
     rms_mm = (s_solve_rms_cm > 255u) ? 255u : (uint8_t)s_solve_rms_cm;
-    if (!s_solve_valid) {
+    if (!s_solve_valid || s_report_no_fix) {
         x = 0; y = 0; z = 0;
         q = TAG_REPORT_QUALITY_NONE;
         flags = 0;
@@ -387,6 +408,29 @@ static void tag_solve_and_report(void)
         if (age_ms > TAG_TRACKER_FRESH_MS) continue;  /* measurement too stale */
         active_idx[n_active++] = i;
     }
+    /* F4: THE ROOT IS SILENT.
+     *
+     * Everything the tag does hangs on the Root's beacon: the round origin,
+     * the slot spacing, the reference of the TDOA and the guard time the
+     * report goes out in.  When the Root stops sending, the tag has nothing
+     * to say and — without this diagnostic — says NOTHING AT ALL, which on
+     * the bench is indistinguishable from a dead tag.
+     *
+     * So say it: once a second, as long as the Root stays silent. */
+    if (s_root_seen) {
+        uint32_t root_age = now_ms - s_root_last_rx_ms;
+        if (root_age > TAG_ROOT_TIMEOUT_MS) {
+            static uint32_t s_last_noroot_ms;
+            if ((now_ms - s_last_noroot_ms) >= 1000u) {
+                s_last_noroot_ms = now_ms;
+                { char dbg[80];
+                  sprintf(dbg, "NO ROOT FRAME age=%ums n_act=%d\r\n",
+                          (unsigned)root_age, n_active);
+                  TAG_DIAG_SOLVE(dbg); }
+            }
+        }
+    }
+
     if (n_active < 3) {
         { char dbg[72]; int pos = 0;
           pos += sprintf(dbg + pos, "TSUM n_act=%d SKIP need 3 anchors", n_active);
@@ -1250,6 +1294,9 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * that the slot compensation needs (see the TDOA block). */
     if (frame_len >= DL_TS_LEVEL_IDX + 1 && rx_buf[DL_TS_LEVEL_IDX] == 0) {
         s_root_rank = src_rank;
+        /* The Root is alive — remember when it was heard last. */
+        s_root_last_rx_ms = HAL_GetTick();
+        s_root_seen = 1;
 
         /* P1-4: the Root's clock rate on its own channel (see
          * s_rate_buf).  Updated on every Root frame, outlier or not. */
@@ -1535,6 +1582,51 @@ static void tag_tx_pos_report(uint64_t root_rx)
 }
 
 /*============================================================================
+ * The DEGRADED report — "I am alive, but I have no position"
+ *
+ * The normal report goes out in the guard time of slot 0, i.e. right after
+ * the ROOT's beacon.  When the Root is down there is no guard time any
+ * more: the tag sends a report right after any OTHER anchor's beacon, at a
+ * low rate (TAG_DEGRADED_REPORT_MS).
+ *
+ * The frame carries the "no solution" marker (quality = 65535), so the host
+ * shows the tag as an online device WITHOUT a position instead of dropping
+ * it.  A tag that vanishes from the map cannot be told apart from a tag
+ * that is switched off, and the operator has to see WHICH of the two it is.
+ *
+ * The report is sent right AFTER a beacon was received, so it does not
+ * overlap the beacon that was just received, and the next anchor's beacon
+ * is 6.25 ms away — far beyond the ~0.5 ms of air time.
+ *==========================================================================*/
+static void tag_tx_pos_report_degraded(void)
+{
+    uint8_t pkt[DL_POS_REPORT_LEN];
+
+    s_report_no_fix = 1;
+    tag_build_pos_report(pkt);
+    s_report_no_fix = 0;
+
+    port_DisableEXT_IRQ();
+    dwt_forcetrxoff();
+    port_rf_switch_tx();
+    dwt_writetxdata(DL_POS_REPORT_LEN, pkt, 0);
+    dwt_writetxfctrl(DL_POS_REPORT_LEN, 0, 0);
+    dwt_starttx(DWT_START_TX_IMMEDIATE);
+    { uint32_t dl = HAL_GetTick() + 10u;
+      while ((dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS_BIT_MASK) == 0) {
+          if (HAL_GetTick() > dl) break;
+      }
+      dwt_write32bitreg(SYS_STATUS_ID,
+                        SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
+    }
+    s_n_report_tx++;
+
+    port_rf_switch_rx();
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    port_EnableEXT_IRQ();
+}
+
+/*============================================================================
  * Tag main loop (continuous RX + periodic solve)
  *============================================================================*/
 int fusion_tag(void)
@@ -1648,6 +1740,23 @@ int fusion_tag(void)
                     && rx_buf[DL_TS_SLOT_IDX] == 0
                     && rx_buf[DL_TS_LEVEL_IDX] == 0) {
                     tag_tx_pos_report(rx_hw_ts);
+                } else if (s_root_seen) {
+                    /* F4: THE ROOT IS DOWN.
+                     *
+                     * The report normally rides in the guard time that
+                     * follows the Root's beacon — without the Root there
+                     * is no guard time and no reference, so the tag cannot
+                     * solve.  But it must NOT go silent: it sends a
+                     * degraded report (no solution) at a low rate, so the
+                     * host shows it as an online device without a position
+                     * instead of dropping it from the map. */
+                    uint32_t now2 = HAL_GetTick();
+                    static uint32_t s_last_deg_ms = 0;
+                    if ((now2 - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS
+                        && (now2 - s_last_deg_ms) >= TAG_DEGRADED_REPORT_MS) {
+                        s_last_deg_ms = now2;
+                        tag_tx_pos_report_degraded();
+                    }
                 }
             }
             dwt_rxenable(DWT_START_RX_IMMEDIATE);
