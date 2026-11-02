@@ -43,6 +43,13 @@ static const char gw_hex[] = "0123456789ABCDEF";
 /* Forward declaration — called from command handlers defined before it */
 static void gateway_rx_flush(void);
 
+/* Forward declaration — the definition sits further down with the other
+ * formatting helpers, but the NETSTART handler above already uses it.
+ * Without the prototype the compiler takes the first use as an implicit
+ * "extern int fmt_coord()" and the later "static" definition is a hard
+ * error ("static declaration follows non-static declaration"). */
+static int fmt_coord(char *buf, int val_cm);
+
 /* Write 4-digit uppercase hex to buf, return bytes written */
 static int fmt_hex4(char *buf, uint16_t val)
 {

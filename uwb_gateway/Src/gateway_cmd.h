@@ -73,6 +73,10 @@ int gateway_ota_arq_on_ack(uint16_t seq, uint8_t status);
 /* Broadcast OTA: poll multi-ACK collection (called every 1ms from sniffer loop). */
 void gateway_bcast_ota_poll(void);
 
+/* Broadcast OTA: handle an ACK frame (called from gateway_handle_uwb_rx).
+ * Returns 1 if this ACK was processed (seq match), 0 if stale. */
+int gateway_bcast_ota_on_ack(uint16_t seq, uint8_t status, uint16_t src_addr);
+
 /* Format 16-bit value as 4-digit hex string (from fusion_anchor.c) */
 extern char *fmt_uid4(char *buf, uint16_t val);
 

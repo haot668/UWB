@@ -9,6 +9,7 @@
 #include <main.h>
 #include <stm32l4xx_hal.h>
 #include <port.h>
+#include <stdio.h>
 #include "examples_defines.h"
 #include <example_selection.h>
 

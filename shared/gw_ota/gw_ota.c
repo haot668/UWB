@@ -26,6 +26,7 @@
 #include <stm32l4xx_hal.h>
 #include <gateway_protocol.h>
 #include <shared_defines.h>
+#include "gw_ota.h"
 
 /*============================================================================
  * Flash staging area
