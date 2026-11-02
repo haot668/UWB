@@ -126,6 +126,15 @@ typedef struct {
     uint16_t           cycle_id;         /* TDMA cycle id carried in the beacon (P0-4) */
     uint8_t            slot;             /* TDMA slot index (255=unknown) */
     uint64_t           last_rx_ts;       /* Raw RX local timestamp for TDOA */
+    /* The sender's departure error for the last beacon: how much earlier
+     * than the grid instant it aimed at its beacon really left the antenna
+     * (the DX_TIME truncation) plus its device TX delay.  Subtracted from
+     * the slot-compensated TOA, so the anchor's own transmission error
+     * does not land in the TDOA.  It is a DEVIATION, not an instant, so it
+     * is free of the sender's clock offset and can be applied to any
+     * anchor. */
+    int32_t            tx_err;           /* DTU, the sender's own clock         */
+    uint8_t            tx_err_valid;     /* the beacon carried a usable value   */
     uint32_t           clock_reject_count; /* clock updates refused as outliers */
 
     /* ── P1-2: multi-cycle average of the TDOA against the Root ─────────
@@ -566,8 +575,16 @@ static void tag_solve_and_report(void)
         } else {
             /* The reference is not the Root: the absolute TOAs have to be
              * used (no averaging possible). */
-            toa_dtu[0] = (uint64_t)((int64_t)s_trackers[ref_idx].last_rx_ts
-                                    - (int64_t)ref_slot * slot_dtu_eff);
+            /* The departure error is taken off here as well, so that the
+             * reference anchor and the others are on the same footing. */
+            {
+                int64_t ref_toa = (int64_t)s_trackers[ref_idx].last_rx_ts
+                                - (int64_t)ref_slot * slot_dtu_eff;
+                if (s_trackers[ref_idx].tx_err_valid) {
+                    ref_toa -= (int64_t)s_trackers[ref_idx].tx_err;
+                }
+                toa_dtu[0] = (uint64_t)ref_toa;
+            }
             anchors[0] = s_trackers[ref_idx].pos;
             valid_idx[0] = ref_idx;
 
@@ -579,6 +596,9 @@ static void tag_solve_and_report(void)
                 uint8_t k_slot = s_trackers[idx].slot;
                 uint64_t rx_k = s_trackers[idx].last_rx_ts;
                 int64_t toa_equiv = (int64_t)rx_k - (int64_t)k_slot * slot_dtu_eff;
+                if (s_trackers[idx].tx_err_valid) {
+                    toa_equiv -= (int64_t)s_trackers[idx].tx_err;
+                }
                 int64_t tdoa_dtu = toa_equiv - (int64_t)toa_dtu[0];
 
                 if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
@@ -984,14 +1004,33 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     uint8_t ts_flags   = (frame_len >= DL_TS_FLAGS_IDX + 1)
                        ? rx_buf[DL_TS_FLAGS_IDX] : 0;
     uint8_t ts_precise = (ts_flags & DL_TS_FLAG_TX_TS_PRECISE) ? 1 : 0;
-    if (!ts_precise) {
+    /* The frame did not go out on the grid (immediate/ALOHA frame, or the
+     * delayed TX failed and fell back to immediate).  Its departure error
+     * is meaningless and it must not be paired into the TDOA.  Such a frame
+     * normally has no PRECISE flag either — this is the belt to that
+     * braces. */
+    uint8_t ts_offgrid = (ts_flags & DL_TS_FLAG_TX_OFFGRID) ? 1 : 0;
+    if (!ts_precise || ts_offgrid) {
         static uint32_t s_n_imprecise;
         if ((s_n_imprecise++ % 20) == 0) {
-            char dbg[48];
-            sprintf(dbg, "TS_IMPRECISE R=%u dropped\r\n", src_rank);
+            char dbg[56];
+            sprintf(dbg, "TS_IMPRECISE R=%u dropped%s\r\n", src_rank,
+                    ts_offgrid ? " (offgrid)" : "");
             TAG_DIAG_SOLVE(dbg);
         }
         return;
+    }
+
+    /* The sender's departure error for THIS frame (int16, sender's DTU).
+     * Only the new 67-byte frame carries it, and only when the sender says
+     * the value is usable. */
+    int32_t ts_tx_err = 0;
+    uint8_t ts_tx_err_valid = 0;
+    if (frame_len >= DL_TIMESYNC_LEN
+        && (ts_flags & DL_TS_FLAG_TX_ERR_VALID)) {
+        ts_tx_err = (int32_t)(int16_t)((uint16_t)rx_buf[DL_TS_TX_ERR_IDX]
+                        | ((uint16_t)rx_buf[DL_TS_TX_ERR_IDX + 1] << 8));
+        ts_tx_err_valid = 1;
     }
 
     /* Diagnostic: print RX timestamp diff between consecutive frames.
@@ -1027,6 +1066,10 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * counter is needed (P1-11). */
     /* Record raw RX timestamp for TDOA */
     s_trackers[tracker_slot].last_rx_ts = rx_local;
+    /* … and the sender's departure error, which is subtracted from the
+     * slot-compensated TOA (see the TDOA block below). */
+    s_trackers[tracker_slot].tx_err       = ts_tx_err;
+    s_trackers[tracker_slot].tx_err_valid = ts_tx_err_valid;
     /* Parse TDMA slot index from beacon */
     s_trackers[tracker_slot].slot = rx_buf[DL_TS_SLOT_IDX];
     /* P0-4: TDMA cycle id of this beacon */
@@ -1192,6 +1235,24 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         if (t->slot != 255 && s_root_rate_valid) {
             int64_t slot_eff = (int64_t)((double)DTU_PER_SLOT * s_root_rate);
             int64_t toa_eq   = (int64_t)rx_local - (int64_t)t->slot * slot_eff;
+            /* Remove the anchor's own departure error.
+             *
+             * The beacon did not leave the antenna at the grid instant the
+             * anchor aimed at: the DX_TIME register can only express
+             * multiples of 256 DTU, so the programmed instant is the grid
+             * instant FLOORED (the beacon leaves up to 255 DTU = 1.2 m of
+             * path early), and the device TX delay adds on top of that.
+             * The anchor publishes both in tx_err, per frame, and it is a
+             * DEVIATION from the sender's own grid — so it carries no
+             * clock offset and can be applied to any anchor.  (A raw TX
+             * timestamp could not be: it lives in the sender's clock, whose
+             * offset absorbs the Root→child propagation delay.)
+             *
+             * What this does NOT fix is the anchor's grid PLACEMENT error
+             * (how far its grid origin sits from the Root's) — that is a
+             * per-anchor constant and the Root's self-calibration deals
+             * with it. */
+            if (t->tx_err_valid) toa_eq -= (int64_t)t->tx_err;
             if (is_root) {
                 s_root_toa_eq    = toa_eq;
                 s_root_toa_cycle = t->cycle_id;
