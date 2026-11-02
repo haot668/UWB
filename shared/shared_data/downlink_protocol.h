@@ -493,7 +493,9 @@ extern "C" {
  *     report = root_rx_local + TAG_REPORT_DELAY_US + ALOHA jitter
  *
  * with DELAY + JITTER < DL_SLOT_DTU_US (6.25 ms), so the report always lands
- * inside slot 0's guard and never disturbs an anchor's reception.
+ * inside slot 0's guard and never disturbs an anchor's reception.  With
+ * DELAY = 2.2 ms and JITTER = 3.5 ms the last report leaves 0.55 ms of
+ * margin before the next anchor's beacon.
  *
  * The position in the report is solved BY THE TAG; the gateway only relays
  * it.  The precision of the TX instant therefore does not affect the
@@ -502,7 +504,22 @@ extern "C" {
  *==========================================================================*/
 #define DL_POS_REPORT_LEN          24u
 #define TAG_REPORT_DELAY_US       2200u  /* 2.2 ms after the Root's beacon   */
-#define TAG_REPORT_JITTER_US      2000u  /* ALOHA jitter between tags        */
+/* The ALOHA jitter spreads the reports of the tags that share the guard
+ * time of slot 0.  The window used to be 2.0 ms, i.e. the reports of N tags
+ * were crammed into 2 ms of a 4.25 ms window — with more than a handful of
+ * tags the collisions were the rule, and a collided report is lost AND
+ * corrupts the reception of the anchor that is speaking at that moment.
+ *
+ * The window is now 3.5 ms: the report goes out 2.2 .. 5.7 ms after the
+ * Root's beacon, which still leaves 0.55 ms of margin before the next
+ * anchor's beacon at 6.25 ms — enough for the delayed TX to be programmed
+ * (~300 us of SPI writes) and for the frame itself (~0.5 ms) to be on the
+ * air.
+ *
+ * This is the cheap half of the fix.  The proper one is a per-tag uplink
+ * schedule (each tag gets its own slot inside the guard time), which is
+ * out of scope for now. */
+#define TAG_REPORT_JITTER_US      3500u  /* ALOHA jitter between tags        */
 #define TAG_REPORT_QUALITY_NONE  65535u  /* "no solution" marker             */
 #define DL_MAX_ANCHORS             8u     /* Backward-compat for tdoa_solver.c */
 
