@@ -64,7 +64,11 @@ void clock_sync_init(AnchorClockSync *s,
  * The array is sorted in place. */
 static double cs_median(double *v, uint32_t n)
 {
-    for (uint32_t i = 1; i < n; i++) {
+    /* C89 style: the loop variable is declared outside the for-statement.
+     * The Keil compiler builds this file without --c99, and a declaration in
+     * the for-initialiser is a hard error there (armcc #254). */
+    uint32_t i;
+    for (i = 1; i < n; i++) {
         double x = v[i];
         uint32_t j = i;
         while (j > 0 && v[j - 1] > x) { v[j] = v[j - 1]; j--; }
@@ -81,7 +85,8 @@ static double cs_mad(const double *v, uint32_t n, double med)
 {
     if (n == 0) return 0.0;
     double d[CS_RATE_WINDOW_SAMPLES];
-    for (uint32_t i = 0; i < n; i++) d[i] = fabs(v[i] - med);
+    uint32_t i;
+    for (i = 0; i < n; i++) d[i] = fabs(v[i] - med);
     return cs_median(d, n);
 }
 
@@ -166,7 +171,8 @@ static bool cs_gate_check(AnchorClockSync *s,
     /* Interval rates of the samples already in the window. */
     double ir[CS_RATE_WINDOW_SAMPLES];
     uint32_t m = 0;
-    for (uint32_t k = 0; k + 1u < n; k++) {
+    uint32_t k;                      /* C89: declared outside the for */
+    for (k = 0; k + 1u < n; k++) {
         uint8_t i0 = (uint8_t)((oldest + k) % CS_RATE_WINDOW_SAMPLES);
         uint8_t i1 = (uint8_t)((i0 + 1u) % CS_RATE_WINDOW_SAMPLES);
         uint64_t d_tx = (s->rate_tx[i1] - s->rate_tx[i0]) & 0xFFFFFFFFFFULL;
