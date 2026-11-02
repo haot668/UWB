@@ -503,23 +503,28 @@ extern "C" {
  * frame inside the guard window.
  *==========================================================================*/
 #define DL_POS_REPORT_LEN          24u
-#define TAG_REPORT_DELAY_US       2200u  /* 2.2 ms after the Root's beacon   */
+#define TAG_REPORT_DELAY_US       3000u  /* 3.0 ms after the guard start      */
 /* The ALOHA jitter spreads the reports of the tags that share the guard
  * time of slot 0.  The window used to be 2.0 ms, i.e. the reports of N tags
  * were crammed into 2 ms of a 4.25 ms window — with more than a handful of
  * tags the collisions were the rule, and a collided report is lost AND
  * corrupts the reception of the anchor that is speaking at that moment.
  *
- * The window is now 3.5 ms: the report goes out 2.2 .. 5.7 ms after the
- * Root's beacon, which still leaves 0.55 ms of margin before the next
- * anchor's beacon at 6.25 ms — enough for the delayed TX to be programmed
- * (~300 us of SPI writes) and for the frame itself (~0.5 ms) to be on the
- * air.
+ * P1-5: the window was too narrow.  With DELAY = 2.2 ms and JITTER =
+ * 3.5 ms the last report left only 0.55 ms before the next anchor's
+ * beacon -- barely enough to program the delayed TX (~300 us of SPI
+ * writes), so reports were dropped or had to be sent immediately, in the
+ * middle of the guard time.
+ *
+ * The window is now 3.0 .. 4.2 ms (DELAY = 3.0 ms, JITTER = 1.2 ms),
+ * which leaves 2.05 ms of margin before the next anchor's beacon at
+ * 6.25 ms: room for the delayed TX to be programmed, for a retry, and
+ * for the frame itself to be on the air.
  *
  * This is the cheap half of the fix.  The proper one is a per-tag uplink
  * schedule (each tag gets its own slot inside the guard time), which is
  * out of scope for now. */
-#define TAG_REPORT_JITTER_US      3500u  /* ALOHA jitter between tags        */
+#define TAG_REPORT_JITTER_US      1200u  /* ALOHA jitter between tags        */
 #define TAG_REPORT_QUALITY_NONE  65535u  /* "no solution" marker             */
 #define DL_MAX_ANCHORS             8u     /* Backward-compat for tdoa_solver.c */
 

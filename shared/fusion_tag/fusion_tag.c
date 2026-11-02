@@ -218,6 +218,45 @@ static uint8_t  s_root_rate_valid = 0;
 static uint32_t s_root_last_rx_ms = 0;
 static uint8_t  s_root_seen       = 0;
 
+/* P1-3: the age of the last frame of ANY kind, next to the age of the
+ * Root's last beacon.  "The Root is silent" and "the whole network is
+ * silent" are two different faults, and the operator has to be able to
+ * tell them apart -- so the two are tracked separately. */
+static uint32_t s_any_last_rx_ms = 0;
+static uint8_t  s_any_seen       = 0;
+
+/*============================================================================
+ * The uplink grid (P1-1)
+ *
+ * The report has to go out in the guard time of slot 0 -- the interval
+ * after the ROOT's beacon in which no anchor transmits, whatever the
+ * anchor count is.  The report used to be triggered BY the Root's beacon,
+ * so a single lost beacon silenced the tag for a whole round: on the
+ * bench, a tag that drops one beacon is indistinguishable from a dead
+ * tag.
+ *
+ * The tag therefore keeps its OWN round grid, phase-locked to the Root's
+ * beacons: the beacon corrects the phase, and the grid fills the hole
+ * when a beacon is lost.  The extrapolation runs in the tag's device-time
+ * domain, so the rate error (20 ppm) over one round is 1 us -- nothing
+ * next to the 6.25 ms slot.
+ *
+ *   s_guard_hw       the guard start (device time) the NEXT uplink uses
+ *   s_uplink_ms      the local tick of the next uplink
+ *   s_last_tick_ms the local tick of the last grid tick
+ *==========================================================================*/
+static uint64_t s_guard_hw       = 0;
+static uint32_t s_uplink_ms      = 0;
+static uint32_t s_last_tick_ms = 0;
+static uint8_t  s_uplink_on      = 0;
+
+/* The uplink tick fires 1 .. 2 ms after the Root's beacon: early enough
+ * that the delayed TX can still be programmed (~300 us of SPI writes),
+ * late enough that the beacon is already known. */
+#define TAG_UPLINK_LEAD_MS       1u
+/* One round in the tag's device-time domain (50 ms). */
+#define TAG_UPLINK_ROUND_DEV     (50000ULL * UUS_TO_DWT_TIME)
+
 /* How long the Root may stay silent before the tag calls it a failure, and
  * how often the degraded "I am alive but I have no position" report goes
  * out while the Root is down. */
@@ -344,6 +383,11 @@ static void tag_build_pos_report(uint8_t *pkt)
 static uint32_t s_n_report_tx   = 0;    /* reports actually transmitted      */
 static uint32_t s_n_report_skip = 0;    /* reports dropped (too late)        */
 
+/* P1-4: how often a refused delayed TX is retried, and how much earlier
+ * the retry goes out. */
+#define TAG_TX_RETRIES        2
+#define TAG_TX_RETRY_STEP_US  200u
+
 /* P1-4: independent Root-rate estimator.
  *
  * The Root's clock rate is needed to express a slot duration in OUR clock
@@ -448,16 +492,30 @@ static void tag_solve(void)
      * the bench is indistinguishable from a dead tag.
      *
      * So say it: once a second, as long as the Root stays silent. */
-    if (s_root_seen) {
+    {
+        /* P1-2 / P1-3: the age of the last Root beacon AND the age of the
+         * last frame of any kind.
+         *
+         * The Root's age is reported even when the Root has NEVER been
+         * heard: until now the diagnostic only appeared after a Root
+         * beacon had been seen, so a tag that never joined the network
+         * said nothing at all and looked exactly like a dead tag. */
+        static uint32_t s_last_diag_ms;
         uint32_t root_age = now_ms - s_root_last_rx_ms;
-        if (root_age > TAG_ROOT_TIMEOUT_MS) {
-            static uint32_t s_last_noroot_ms;
-            if ((now_ms - s_last_noroot_ms) >= 1000u) {
-                s_last_noroot_ms = now_ms;
-                { char dbg[80];
-                  sprintf(dbg, "NO ROOT FRAME age=%ums n_act=%d\r\n",
-                          (unsigned)root_age, n_active);
-                  TAG_DIAG_SOLVE(dbg); }
+        uint32_t any_age  = now_ms - s_any_last_rx_ms;
+        if ((now_ms - s_last_diag_ms) >= 1000u) {
+            s_last_diag_ms = now_ms;
+            if (root_age > TAG_ROOT_TIMEOUT_MS) {
+                char dbg[80];
+                sprintf(dbg, "NO ROOT FRAME age=%ums n_act=%d\r\n",
+                        (unsigned)root_age, n_active);
+                TAG_DIAG_SOLVE(dbg);
+            }
+            if (s_any_seen && any_age > TAG_ROOT_TIMEOUT_MS) {
+                char dbg[80];
+                sprintf(dbg, "NO NETWORK FRAME age=%ums\r\n",
+                        (unsigned)any_age);
+                TAG_DIAG_SOLVE(dbg);
             }
         }
     }
@@ -1554,21 +1612,25 @@ static uint16_t tag_compute_id(void)
 /*============================================================================
  * Report the solved position to the gateway over UWB.
  *
- * Called right after the ROOT's beacon (slot 0) was received: root_rx is
- * the instant the beacon arrived at the tag, i.e. the round origin in the
- * tag's own clock.  The frame is transmitted with a DELAYED TX at
+ * The report goes out in the guard time of slot 0 -- the one interval of
+ * the round in which no anchor transmits, whatever the anchor count is.
+ * The frame is transmitted with a DELAYED TX at
  *
- *     root_rx + TAG_REPORT_DELAY_US + ALOHA jitter
+ *     guard_hw + TAG_REPORT_DELAY_US + ALOHA jitter
  *
- * which lies inside slot 0's guard time (< 6.25 ms) — the one interval of
- * the round in which no anchor transmits.  The jitter is an ALOHA offset so
- * that several tags do not always land on the same microsecond.
+ * which lies inside slot 0's guard time (< 6.25 ms).  The jitter is an
+ * ALOHA offset so that several tags do not always land on the same
+ * microsecond.
+ *
+ * guard_hw is the guard start of the round the report belongs to: the
+ * instant the Root's beacon arrived at the tag, or -- when that beacon
+ * was lost -- the extrapolation of it (see the uplink grid below).
  *
  * The TX instant does NOT influence the accuracy of the reported position:
  * the tag has already solved the TDOA itself and ships the result.  The
  * delayed TX exists only to place the frame inside the guard window.
  *==========================================================================*/
-static void tag_tx_pos_report(uint64_t root_rx)
+static void tag_tx_pos_report(uint64_t guard_hw)
 {
     uint64_t now, target, slot1;
     uint32_t delay_us;
@@ -1584,14 +1646,14 @@ static void tag_tx_pos_report(uint64_t root_rx)
     delay_us = TAG_REPORT_DELAY_US + (s_jitter % TAG_REPORT_JITTER_US);
 
     now    = tag_now_sys_ext();
-    target = root_rx + (uint64_t)delay_us * UUS_TO_DWT_TIME;
+    target = guard_hw + (uint64_t)delay_us * UUS_TO_DWT_TIME;
 
     /* Slot 1's beacon arrives at root_rx + 6.25 ms.  A report after that
      * would land ON an anchor's transmission: it would spoil that anchor's
      * reception AND corrupt the tag's own TDOA for that anchor.  Losing one
      * report is far cheaper than corrupting a measurement, so the report is
      * simply skipped. */
-    slot1 = root_rx + (uint64_t)DL_SLOT_DTU_US * UUS_TO_DWT_TIME;
+    slot1 = guard_hw + (uint64_t)DL_SLOT_DTU_US * UUS_TO_DWT_TIME;
     if (now + (200ULL * UUS_TO_DWT_TIME) > slot1) {
         s_n_report_skip++;
         return;
@@ -1617,15 +1679,33 @@ static void tag_tx_pos_report(uint64_t root_rx)
     bool tx_started = false;
     if (target != 0) {
         /* DX_TIME holds the device time bits [39:8] — mask to 40 bits first
-         * (the device time counter is 40 bit) and then shift. */
-        dwt_setdelayedtrxtime((uint32_t)((target & 0xFFFFFFFFFFULL) >> 8));
-        if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
-            tx_started = true;
-        } else {
-            /* The delayed TX was refused (late programming / HPDWARN) — fall
-             * back to an immediate TX, but only while the guard window is
-             * still open; a report that lands on slot 1's beacon would
-             * corrupt a measurement, which is worse than a lost report. */
+         * (the device time counter is 40 bit) and then shift.
+         *
+         * P1-4: the delayed TX is refused when the instant is too close
+         * (or when HPDWARN says the battery is low).  The window is 2.05 ms
+         * wide now, so there is room for a retry with an EARLIER instant:
+         * the frame then goes out a little sooner, which is still well
+         * inside the guard time, and the ALOHA spread only shrinks by the
+         * step. */
+        uint64_t t = target;
+        int attempt;
+        for (attempt = 0; attempt < TAG_TX_RETRIES; attempt++) {
+            dwt_setdelayedtrxtime((uint32_t)((t & 0xFFFFFFFFFFULL) >> 8));
+            if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS) {
+                tx_started = true;
+                break;
+            }
+            /* The next try goes out earlier -- and only while it can
+             * still be programmed at all. */
+            if (t <= (uint64_t)TAG_TX_RETRY_STEP_US * UUS_TO_DWT_TIME) break;
+            t -= (uint64_t)TAG_TX_RETRY_STEP_US * UUS_TO_DWT_TIME;
+            if (t < now + (400ULL * UUS_TO_DWT_TIME)) break;
+        }
+        if (!tx_started) {
+            /* The delayed TX was refused -- fall back to an immediate TX,
+             * but only while the guard window is still open; a report that
+             * lands on slot 1's beacon would corrupt a measurement, which
+             * is worse than a lost report. */
             uint64_t n2 = tag_now_sys_ext();
             if (n2 + (200ULL * UUS_TO_DWT_TIME) < slot1) {
                 dwt_starttx(DWT_START_TX_IMMEDIATE);
@@ -1654,6 +1734,74 @@ static void tag_tx_pos_report(uint64_t root_rx)
     port_rf_switch_rx();
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
     port_EnableEXT_IRQ();
+}
+
+/*============================================================================
+ * The uplink grid — one report per round, Root or no Root
+ *
+ * tag_uplink_on_root_beacon() is called when the Root's beacon arrives:
+ * the beacon is the ground truth of the grid, so it corrects the phase
+ * and the guard start.  tag_uplink_poll() then fires the report once per
+ * round, whether or not the beacon arrived.
+ *
+ * The guard start of the next uplink is s_guard_hw -- corrected by the
+ * last Root beacon -- and it stays there until the next beacon corrects
+ * it again.  The extrapolation of a lost beacon is the 50 ms round of
+ * the tag's own clock.
+ *==========================================================================*/
+static void tag_uplink_on_root_beacon(uint64_t hw_ts)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (!s_uplink_on) {
+        /* The first Root beacon: the grid starts here. */
+        s_uplink_on  = 1;
+        s_guard_hw   = hw_ts;
+        s_uplink_ms  = now + TAG_UPLINK_LEAD_MS;
+        s_last_tick_ms = 0;
+        return;
+    }
+
+    if ((uint32_t)(now - s_last_tick_ms) > (DL_SOLVE_INTERVAL_MS / 2u)) {
+        /* The uplink of this round has NOT happened yet: this beacon is
+         * the guard start of the round that the next uplink serves. */
+        s_guard_hw  = hw_ts;
+        s_uplink_ms = now + TAG_UPLINK_LEAD_MS;
+    } else {
+        /* The uplink of this round already happened: the next uplink
+         * serves the NEXT round, so the guard moves on by a round.  The
+         * tick keeps its phase (it is one round after the last uplink). */
+        s_guard_hw  = hw_ts + TAG_UPLINK_ROUND_DEV;
+        s_uplink_ms = s_last_tick_ms + DL_SOLVE_INTERVAL_MS;
+    }
+}
+
+/* One uplink per round.  Returns immediately when it is not time yet. */
+static void tag_uplink_poll(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (!s_uplink_on) return;
+    if ((int32_t)(now - s_uplink_ms) < 0) return;
+
+    s_uplink_ms      += DL_SOLVE_INTERVAL_MS;
+    s_last_tick_ms  = now;
+
+    /* The Root is the reference of the guard time.  Without it the grid
+     * is an extrapolation of a grid that no longer exists: the anchors
+     * fall back to their ALOHA slot negotiation after a few seconds and
+     * the extrapolation would drop the report on top of an anchor's
+     * slot -- spoiling that anchor's reception.
+     *
+     * So the degraded path takes over: the report goes out right after a
+     * received beacon, which is always in the gap between two slots.
+     * The tag stays visible on the map without a position. */
+    if (!s_root_seen ||
+        (uint32_t)(now - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
+        return;
+    }
+
+    tag_tx_pos_report(s_guard_hw);
 }
 
 /*============================================================================
@@ -1777,6 +1925,12 @@ int fusion_tag(void)
                 tag_solve_and_report();
             }
 
+            /* P1-1: the uplink grid -- one report per round, whether or
+             * not the Root's beacon arrived.  Without this the report was
+             * triggered by the beacon itself, and one lost beacon silenced
+             * the tag for a whole round. */
+            tag_uplink_poll();
+
             uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
             if (status & SYS_STATUS_ALL_RX_ERR) {
                 dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
@@ -1792,6 +1946,11 @@ int fusion_tag(void)
             }
             uint8_t rx_buf[128];
             dwt_readrxdata(rx_buf, frame_len, 0);
+            /* P1-3: the age of the last frame of ANY kind -- the tag has
+             * to be able to tell "the Root is silent" from "the whole
+             * network is silent". */
+            s_any_last_rx_ms = HAL_GetTick();
+            s_any_seen = 1;
             /* Read RX HW timestamp BEFORE re-enabling RX, while RX_TIME
              * latch still holds the timestamp for the received frame.
              * tag_rx_ts_ext() puts it on the extended 64-bit local timeline
@@ -1811,17 +1970,29 @@ int fusion_tag(void)
                 if (frame_len >= DL_TIMESYNC_MIN_LEN
                     && rx_buf[DL_TS_SLOT_IDX] == 0
                     && rx_buf[DL_TS_LEVEL_IDX] == 0) {
-                    tag_tx_pos_report(rx_hw_ts);
-                } else if (s_root_seen) {
+                    /* The Root's beacon: the ground truth of the grid.
+                     *
+                     * P1-1: the report itself does NOT go out from here --
+                     * it goes out from the uplink grid, so that one lost
+                     * beacon does not silence the tag for a round.  The
+                     * beacon only corrects the phase and the guard start. */
+                    tag_uplink_on_root_beacon(rx_hw_ts);
+                } else {
                     /* F4: THE ROOT IS DOWN.
                      *
-                     * The report normally rides in the guard time that
-                     * follows the Root's beacon — without the Root there
-                     * is no guard time and no reference, so the tag cannot
-                     * solve.  But it must NOT go silent: it sends a
-                     * degraded report (no solution) at a low rate, so the
-                     * host shows it as an online device without a position
-                     * instead of dropping it from the map. */
+                     * The report normally rides in the guard time of slot
+                     * 0; without the Root there is no grid to extrapolate
+                     * (the anchors fall back to their ALOHA negotiation
+                     * after a few seconds).  So the degraded report goes
+                     * out right AFTER a received beacon -- that interval
+                     * is the gap between two anchor slots, so it is safe.
+                     *
+                     * The old code required s_root_seen: a tag that never
+                     * heard the Root at all stayed COMPLETELY silent, and
+                     * on the bench that is indistinguishable from a dead
+                     * tag.  Now the degraded report goes out whenever the
+                     * Root has been silent for too long -- including when
+                     * it was never heard at all. */
                     uint32_t now2 = HAL_GetTick();
                     static uint32_t s_last_deg_ms = 0;
                     if ((now2 - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS
