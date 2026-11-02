@@ -189,7 +189,7 @@ extern "C" {
 #define DL_SCAN_TIMEOUT_MS          5000u  /* 5-second scan period on boot          */
 
 /*============================================================================
- * TimeSync frame layout (65 bytes total, including the 10-byte header)
+ * TimeSync frame layout (67 bytes total, including the 10-byte header)
  *   [0-1]   frame_ctrl       (0x41, 0x88)
  *   [2]     seq8
  *   [3-4]   pan_id           (0xCA, 0xDE)
@@ -197,7 +197,8 @@ extern "C" {
  *   [7-8]   source_addr      (anchor rank, LSB MSB)
  *   [9]     func             (0xEE)
  *   [10-14] tx_timestamp40   (40-bit, THIS frame's TX instant)
- *   [15]    flags             (bit0 = TX_TS_PRECISE)              <-- P0-2
+ *   [15]    flags             (bit0 = TX_TS_PRECISE, bit1 = TX_ERR_VALID,
+ *                             bit2 = TX_OFFGRID)                 <-- P0-2
  *   [16-17] reserved
  *   [18]    slot             (own TDMA slot, 255 = unassigned/ALOHA)
  *   [19-26] parent_eui64     (8 bytes, 0 if cs_level=0)
@@ -209,7 +210,10 @@ extern "C" {
  *   [56-60] rx_ref_ts40      (40-bit, RX instant of the frame this
  *                             beacon used as its clock reference) <-- DS-TWR
  *   [61-62] rx_ref_cycle     (uint16, cycle id of that frame)     <-- DS-TWR
- *   [63-64] tail pad 0xCC 0xDD — the absorber for the DW3210 RX
+ *   [63-64] tx_err           (int16, LE) — this frame's TX departure
+ *                             error, in the SENDER's device time units
+ *                             (DTU).  See "TX DEPARTURE ERROR" below.
+ *   [65-66] tail pad 0xCC 0xDD — the absorber for the DW3210 RX
  *                             last-2-byte corruption.  It has to be
  *                             exactly at the END of the frame: a
  *                             DW3210 receiver corrupts the LAST two
@@ -230,6 +234,38 @@ extern "C" {
  *   TDOA, which collapses the solution towards the centroid.
  *   Note the pad at [50-51] does NOT protect anything: the corruption is
  *   at the end of the frame, not 12 bytes before it.
+ *
+ * TX DEPARTURE ERROR (tx_err, [63-64]):
+ *   The instant an anchor's beacon actually leaves the antenna is NOT the
+ *   instant it programmed.  Two effects add up:
+ *
+ *   (1) DX_TIME GRANULARITY.  dwt_setdelayedtrxtime() writes device time
+ *       bits [39:8] only, so the programmed instant is FLOORED to a
+ *       multiple of 256 DTU (4 ns).  The beacon therefore leaves up to
+ *       255 DTU (1.2 m of path!) EARLIER than the grid instant the anchor
+ *       aimed at.  The error is -(P & 0xFF) and it is different for every
+ *       frame and for every anchor.
+ *   (2) DEVICE TX DELAY.  Between the programmed instant and the antenna
+ *       there is a fixed pipeline delay δ (a few hundred ns).  Each anchor
+ *       has its own δ; the anchor calibrates its own (K_dev) and pulls its
+ *       own grid target back by δ̂, so what is left is the residual
+ *       δ − δ̂ (a few DTU).
+ *
+ *   tx_err carries (1) + (2) for THIS frame, in the SENDER's DTU, so the
+ *   Tag can remove them from the TDOA observable:
+ *
+ *       toa_eq = rx_local − slot × slot_eff − tx_err
+ *
+ *   WHY AN int16 AND NOT A RAW TIMESTAMP: a measured TX stamp lives in the
+ *   SENDER's clock, whose offset absorbs the Root→child propagation delay
+ *   (tens of metres).  Two anchors' raw stamps therefore CANNOT be
+ *   differenced.  What CAN be published across anchors is a small
+ *   DEVIATION from the anchor's own grid — a duration, not an instant — and
+ *   that is clock-domain free.
+ *
+ *   WHAT tx_err DOES NOT FIX: the error of the anchor's grid PLACEMENT
+ *   (how far its own grid origin sits from the Root's grid).  That is a
+ *   per-anchor constant and is handled by the Root's self-calibration.
  *
  * P0-1: cs_level and slot used to share byte 18 — writing the slot
  *       overwrote the level, so every frame looked like level == slot.
@@ -266,7 +302,7 @@ extern "C" {
  *       correction back (FUNC_TWR_CORR), so the child can place its own
  *       beacon exactly on the Root's grid.
  *============================================================================*/
-#define DL_TIMESYNC_LEN            65u
+#define DL_TIMESYNC_LEN            67u
 /* The SHORTEST beacon a receiver still accepts.  A beacon sent by an old
  * firmware (63 bytes, no tail pad) is still parsed — it just has a
  * corrupted rx_ref_cycle, so the DS-TWR drops that link and everything
@@ -274,12 +310,16 @@ extern "C" {
  * of going dark.  All frame_len checks are LOWER bounds and use this,
  * never DL_TIMESYNC_LEN. */
 #define DL_TIMESYNC_MIN_LEN        63u
-#define DL_TS_TAIL_PAD_IDX         63u    /* 2 pad bytes 0xCC 0xDD — the DW3210
+#define DL_TS_TAIL_PAD_IDX         65u    /* 2 pad bytes 0xCC 0xDD — the DW3210
                                            * corrupts the LAST two bytes of an
                                            * SPI read, so the absorber has to
                                            * be the last thing in the frame. */
 #define DL_TS_TX_TS_IDX           10u    /* 5-byte TX timestamp (lower 40 bits)    */
-#define DL_TS_FLAGS_IDX           15u    /* bit0 = TX_TS_PRECISE                    */
+#define DL_TS_FLAGS_IDX           15u    /* bit0 = TX_TS_PRECISE
+                                           * bit1 = TX_ERR_VALID
+                                           * bit2 = TX_OFFGRID                    */
+#define DL_TS_TX_ERR_IDX          63u    /* int16 LE: this frame's TX departure
+                                           * error in the sender's DTU             */
 #define DL_TS_SLOT_IDX            18u    /* own TDMA slot (255 = unassigned)        */
 #define DL_TS_PARENT_EUI_IDX      19u    /* 8-byte EUI64                             */
 #define DL_TS_LEVEL_IDX           27u    /* cs_level (P0-1: was DL_TS_CS_LEVEL_IDX) */
@@ -299,6 +339,13 @@ extern "C" {
 
 /* TimeSync frame flags */
 #define DL_TS_FLAG_TX_TS_PRECISE  0x01u  /* tx_timestamp40 is exact (delayed TX)    */
+#define DL_TS_FLAG_TX_ERR_VALID   0x02u  /* tx_err carries a usable departure error */
+#define DL_TS_FLAG_TX_OFFGRID     0x04u  /* this frame did NOT go out on the grid:
+                                           * the delayed TX failed (or the frame was
+                                           * an immediate/ALOHA one).  Its tx_err is
+                                           * meaningless — receivers must drop the
+                                           * frame from the TDOA pairing instead of
+                                           * poisoning the average with it.        */
 
 /*============================================================================
  * TWR correction frame (Root → broadcast, variable length)
