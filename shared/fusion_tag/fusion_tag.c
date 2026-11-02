@@ -78,7 +78,15 @@ extern UART_HandleTypeDef huart2;
  * millisecond — and the counters keep running either way, so switching the
  * level does not change the sampling.
  */
-#define TAG_DIAG_LEVEL  0
+/* The bench build needs level 2: with level 0 the tag prints nothing but the
+ * P,... line, so "no beacons received", "beacons received but the TDOA is
+ * zero" and "the solve never ran" all look the same on the bench.
+ *
+ * The level is guarded so that a release build can turn it off from the
+ * compiler command line (-DTAG_DIAG_LEVEL=0) without editing the source. */
+#ifndef TAG_DIAG_LEVEL
+#define TAG_DIAG_LEVEL  2
+#endif
 
 #if TAG_DIAG_LEVEL >= 1
 #define TAG_DIAG_SOLVE(buf)  test_run_info((unsigned char *)(buf))
@@ -135,6 +143,12 @@ typedef struct {
      * anchor. */
     int32_t            tx_err;           /* DTU, the sender's own clock         */
     uint8_t            tx_err_valid;     /* the beacon carried a usable value   */
+    /* The anchor's coordinates are the CONFIGURED ones (the beacon said so
+     * with COORD_VALID).  An anchor whose coordinate was never written has
+     * (0,0,0), and the TDOA solve is a difference of distances — so such an
+     * anchor would contribute the distance to the ORIGIN and drag the whole
+     * solution towards (0,0).  It is therefore EXCLUDED from the solve. */
+    uint8_t            coord_valid;
     uint32_t           clock_reject_count; /* clock updates refused as outliers */
 
     /* ── P1-2: multi-cycle average of the TDOA against the Root ─────────
@@ -334,11 +348,18 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
  * Pairwise TDOA computation and solve trigger
  *============================================================================*/
 /* P1-4: how many anchors with a KNOWN slot make the network "ready" for a
- * position.  Three is the geometric minimum — two TDOAs for two unknowns,
- * exactly determined and without any redundancy, so a single noisy
- * measurement moves the answer.  Four is what a usable network has.  Lower
- * it to 3 for a deliberately small deployment. */
-#define TAG_NET_READY_ANCHORS 4
+ * position.
+ *
+ * THREE is the geometric minimum — two TDOAs for two unknowns — and it is
+ * what the host allows as well (NET_MIN_PARTICIPANTS = 3 in uwb_host.py).
+ * The two thresholds have to agree: with the firmware asking for four and
+ * the host letting three through, a three-anchor network would be accepted
+ * by the operator and then never produce a position.
+ *
+ * A three-anchor network is EXACTLY DETERMINED (no redundancy), so the
+ * solve is a 2D estimate and its quality is discounted — see the quality
+ * factor below. */
+#define TAG_NET_READY_ANCHORS 3
 
 static void tag_solve_and_report(void)
 {
@@ -439,13 +460,29 @@ static void tag_solve_and_report(void)
     dl_anchor_entry_t anchors[DL_MAX_TRACKED_ANCHORS];
     int valid_idx[DL_MAX_TRACKED_ANCHORS];  /* tracker index for each valid anchor */
 
-    /* Select anchors with known slot (skip slot=255) */
+    /* Select the anchors that can take part in the solve: they need a known
+     * slot (otherwise their beacon cannot be placed on the grid) AND a
+     * CONFIGURED coordinate (otherwise they contribute the distance to the
+     * ORIGIN and drag the solution towards (0,0)).
+     *
+     * An anchor that is excluded stays in the table — the operator has to
+     * SEE which anchor is the one without a coordinate — it just does not
+     * enter the geometry. */
     int sel_idx[DL_MAX_TRACKED_ANCHORS];
     int n_sel = 0;
+    int n_nocoord = 0;
     for (i = 0; i < n_active; i++) {
         int idx = active_idx[i];
-        if (s_trackers[idx].slot != 255) {
-            sel_idx[n_sel++] = idx;
+        if (s_trackers[idx].slot == 255) continue;
+        if (!s_trackers[idx].coord_valid) { n_nocoord++; continue; }
+        sel_idx[n_sel++] = idx;
+    }
+    if (n_nocoord) {
+        static uint32_t s_n_nocoord_ctr;
+        if ((s_n_nocoord_ctr++ % 20u) == 0u) {
+            char dbg[64];
+            sprintf(dbg, "NO_COORD n=%d excluded from the solve\r\n", n_nocoord);
+            TAG_DIAG_SOLVE(dbg);
         }
     }
 
@@ -697,6 +734,7 @@ static void tag_solve_and_report(void)
           (unsigned)s_n_cycle_mismatch,
           (unsigned)s_trackers[ref_idx].cycle_id,
           s_trackers[ref_idx].rank);
+      if (n_nocoord) pos += sprintf(dbg + pos, " nocoord=%d", n_nocoord);
       if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
       pos += sprintf(dbg + pos, " avg=%d\r\n", use_avg ? 1 : 0);
       TAG_DIAG_SOLVE(dbg); }
@@ -736,8 +774,9 @@ static void tag_solve_and_report(void)
             int sl = s_trackers[sel_idx[i2]].slot;
             if (sl < wait_slot) wait_slot = sl;   /* the lowest slot = the Root */
         }
-        { char dbg[64];
-          sprintf(dbg, "WAIT NET n=%d slot=%d\r\n", n_sel, wait_slot);
+        { char dbg[72];
+          sprintf(dbg, "WAIT NET n=%d/%d slot=%d nocoord=%d\r\n",
+                  n_sel, TAG_NET_READY_ANCHORS, wait_slot, n_nocoord);
           TAG_DIAG_SOLVE(dbg); }
         return;
     }
@@ -754,7 +793,8 @@ static void tag_solve_and_report(void)
      *
      *     q_residual = 1000 * clamp(1 - rms_cm/50, 0, 1)
      *     q_inliers  = 1000 * n_inlier / n_measurements
-     *     q          = q_residual * q_inliers / 1000
+     *     q_redund   = 500 (2 measurements) / 750 (3) / 1000 (4 or more)
+     *     q          = q_residual * q_inliers * q_redund / 1000000
      *
      * so 1000 is the best possible fix and 0 is worthless.  A fix that is
      * geometrically tight but rests on two of six measurements does not
@@ -769,7 +809,7 @@ static void tag_solve_and_report(void)
      * n_measurements = n_valid - 1: every anchor but the reference one
      * produces a TDOA measurement. */
     {
-        float q_r, q_n, q;
+        float q_r, q_n, q_red, q;
         int n_meas = (int)n_valid - 1;
 
         q_r = 1000.0f * (1.0f - rms / (float)DL_POS_RMS_ZERO_CM);
@@ -783,7 +823,23 @@ static void tag_solve_and_report(void)
         }
         if (q_n > 1000.0f) q_n = 1000.0f;
 
-        q = q_r * q_n / 1000.0f;
+        /* REDUNDANCY — the third factor.
+         *
+         * A three-anchor network is EXACTLY DETERMINED: two TDOAs for two
+         * unknowns, with nothing left over to detect a bad measurement.  A
+         * noisy TDOA is then fitted EXACTLY — the residual stays near zero
+         * while the position is off by a metre (measured on the host
+         * simulation: 5 cm of TDOA noise -> 94 cm of position error).  The
+         * residual factor cannot see that, because the fit is exact.
+         *
+         * So the redundancy is scored on its own and the quality is scaled
+         * down with it.  Two measurements = 500 (no redundancy at all),
+         * three = 750 (one redundancy), four or more = 1000. */
+        q_red = 1000.0f;
+        if (n_meas <= 2)      q_red = 500.0f;
+        else if (n_meas == 3) q_red = 750.0f;
+
+        q = q_r * q_n * q_red / 1000000.0f;
         if (q < 0.0f) q = 0.0f;
         if (q > 1000.0f) q = 1000.0f;
 
@@ -809,11 +865,12 @@ static void tag_solve_and_report(void)
     s_solve_ms    = HAL_GetTick();
 
 #if TAG_DEBUG_OUTPUT
-    /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=<0..1000>,ZV=<0|1>,R=<residual m>
+    /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=<0..1000>,ZV=<0|1>,R=<residual m>,M=<2D|3D>
      *
-     * Q is the SCORE (bigger is better), R is the residual in metres, and
-     * ZV says whether the height was measured at all.  Z must be ignored
-     * when ZV = 0 -- it is then the height of the anchor plane. */
+     * Q is the SCORE (bigger is better), R is the residual in metres, ZV
+     * says whether the height was measured at all and M says whether the
+     * solve ran in 2D or in 3D.  Z must be ignored when ZV = 0 -- it is then
+     * the height of the anchor plane. */
     {
         char out[96]; int pos = 0;
         out[pos++] = 'P'; out[pos++] = ',';
@@ -839,6 +896,18 @@ static void tag_solve_and_report(void)
         out[pos++] = ','; out[pos++] = 'R'; out[pos++] = '=';
         p = sprintf(tmp, "%.3f", rms / 100.0f);
         for (k = 0; k < p; k++) out[pos++] = tmp[k];
+        /* M: the mode of the estimate.  "2D" means the height carries no
+         * information (coplanar anchors, or too few anchors for a 3D fit)
+         * — the Z above is then the height of the anchor plane, NOT a
+         * measurement, and ZV=0 says the same thing.  With three anchors the
+         * solve is always 2D and exactly determined, so the quality is
+         * discounted accordingly. */
+        out[pos++] = ','; out[pos++] = 'M'; out[pos++] = '=';
+        if (s_solve_flags & DL_POS_FLAG_3D_SOLVED) {
+            out[pos++] = '3'; out[pos++] = 'D';
+        } else {
+            out[pos++] = '2'; out[pos++] = 'D';
+        }
         out[pos++] = '\r'; out[pos++] = '\n'; out[pos] = 0;
         test_run_info((unsigned char *)out);
     }
@@ -889,6 +958,7 @@ static int alloc_tracker_slot(uint16_t rank)
             s_trackers[i].last_seen_ms = 0;
             s_trackers[i].quality = 0.0f;
             s_trackers[i].tdoa_valid = 0;
+            s_trackers[i].coord_valid = 0;
             s_trackers[i].desynced = 0;
             s_trackers[i].desync_count = 0;
             clock_sync_init(&s_trackers[i].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
@@ -917,6 +987,7 @@ static int alloc_tracker_slot(uint16_t rank)
     s_trackers[worst].quality = 0.0f;
     s_trackers[worst].tdoa_now   = 0;
     s_trackers[worst].tdoa_valid = 0;
+    s_trackers[worst].coord_valid = 0;
     s_trackers[worst].tdoa_avg   = 0;
     s_trackers[worst].tdoa_n     = 0;
     s_trackers[worst].sc_valid   = 0;
@@ -1072,6 +1143,12 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     s_trackers[tracker_slot].tx_err_valid = ts_tx_err_valid;
     /* Parse TDMA slot index from beacon */
     s_trackers[tracker_slot].slot = rx_buf[DL_TS_SLOT_IDX];
+    /* Does the anchor have a CONFIGURED coordinate?  The anchor says so with
+     * a flag bit; an anchor without one is kept in the table (it is a real
+     * anchor, and the operator has to SEE that it is the one that has no
+     * coordinate) but it is EXCLUDED from the solve. */
+    s_trackers[tracker_slot].coord_valid =
+        (ts_flags & DL_TS_FLAG_COORD_VALID) ? 1 : 0;
     /* P0-4: TDMA cycle id of this beacon */
     s_trackers[tracker_slot].cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
                                 | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
