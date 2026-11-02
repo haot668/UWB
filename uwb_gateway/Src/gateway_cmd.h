@@ -77,6 +77,11 @@ void gateway_bcast_ota_poll(void);
  * Returns 1 if this ACK was processed (seq match), 0 if stale. */
 int gateway_bcast_ota_on_ack(uint16_t seq, uint8_t status, uint16_t src_addr);
 
+/* P0-1: the NETSTART broadcast runs as a state machine in the main loop,
+ * so forming a network does not block the radio or the UART for 2 s.
+ * Armed by AT+NETSTART=, driven by this poll, reported when it is done. */
+void gateway_netstart_poll(void);
+
 /* Format 16-bit value as 4-digit hex string (from fusion_anchor.c) */
 extern char *fmt_uid4(char *buf, uint16_t val);
 

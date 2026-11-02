@@ -305,6 +305,132 @@ static int      gw_net_present_valid = 0;
  * any extra uplink.  The count is reported to the host as +NETGRID. */
 static uint16_t gw_net_on_grid = 0;
 
+/*============================================================================
+ * NETSTART broadcast — NON-BLOCKING state machine (P0-1)
+ *===========================================================================*/
+/* The old implementation ran the NETWORK_START burst INSIDE the AT command
+ * handler: 100 rounds of "send one frame, poll the radio for 20 ms" — about
+ * 2 s during which the gateway did nothing else at all.  Two things broke:
+ *
+ *   1) Every frame that was not a FUNC_NETWORK_ACK was read from the radio
+ *      and THROWN AWAY by that loop.  The tag's position reports arrive
+ *      exactly in that window, so every time the operator formed a network
+ *      the tag lost ~2 s of positions (100 reports at 50 Hz).
+ *   2) The UART was not served for those 2 s, so the host's commands
+ *      queued up behind the burst.
+ *
+ * The burst is now a state machine that lives in the main loop:
+ *   - the AT handler only ARMS it and returns immediately,
+ *   - the main loop sends one frame every 20 ms and goes back to serving
+ *     the radio and the UART in between,
+ *   - the ACKs arrive through the ORDINARY receive path
+ *     (gateway_handle_uwb_rx), so nothing is discarded any more.
+ */
+#define GW_NETSTART_BURST_MS    2000u   /* how long the burst runs        */
+#define GW_NETSTART_PERIOD_MS   20u     /* one broadcast every 20 ms     */
+
+static struct {
+    int      active;                          /* burst running?              */
+    uint32_t t0_ms;                           /* when it was armed           */
+    uint32_t last_tx_ms;                      /* last broadcast              */
+    uint8_t  payload[FUNC_NETWORK_START_MAX];
+    uint8_t  plen;
+    uint16_t ack_ranks[GW_MAX_DEVICES];       /* who answered (unique)       */
+    int      ack_count;
+} gw_ns;
+
+/* Record a NETWORK_ACK.  Returns 1 if this anchor was not counted before. */
+static int gw_ns_add_ack(uint16_t rank)
+{
+    int k;
+    for (k = 0; k < gw_ns.ack_count; k++)
+        if (gw_ns.ack_ranks[k] == rank) return 0;
+    if (gw_ns.ack_count < GW_MAX_DEVICES)
+        gw_ns.ack_ranks[gw_ns.ack_count++] = rank;
+    return 1;
+}
+
+/* Send the broadcast frames of an armed NETSTART and, when the burst window
+ * is over, report the result.  Called from the gateway main loop -- never
+ * from the AT handler, so the burst blocks nothing. */
+void gateway_netstart_poll(void)
+{
+    uint32_t now;
+
+    if (!gw_ns.active) return;
+    now = HAL_GetTick();
+
+    /* One broadcast every GW_NETSTART_PERIOD_MS. */
+    if (now - gw_ns.last_tx_ms >= GW_NETSTART_PERIOD_MS) {
+        gw_ns.last_tx_ms = now;
+        gateway_send_uwb_ack(0xFFFFu, FUNC_NETWORK_START, gw_ns.payload, gw_ns.plen);
+    }
+
+    /* The burst window is over -> report the result. */
+    if (now - gw_ns.t0_ms < GW_NETSTART_BURST_MS) return;
+
+    gw_ns.active = 0;
+    {
+        int ack_count = gw_ns.ack_count;
+        uint16_t *ack_ranks = gw_ns.ack_ranks;
+        char out[128]; int pos = 0;
+
+        if (ack_count == 0) {
+            /* Nobody answered at all: the host must be able to tell
+             * "command sent but no anchor heard it" from "success". */
+            out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
+            out[pos++]='S'; out[pos++]='T'; out[pos++]='A'; out[pos++]='R';
+            out[pos++]='T'; out[pos++]='_'; out[pos++]='E'; out[pos++]='R';
+            out[pos++]='R';
+            out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+        } else {
+            uint16_t missing[NET_MAX_PARTICIPANTS];
+            int miss_n = 0, i2, j2;
+            for (i2 = 0; i2 < gw_net_roster_n; i2++) {
+                int acked = 0;
+                for (j2 = 0; j2 < ack_count; j2++)
+                    if (ack_ranks[j2] == gw_net_roster[i2]) { acked = 1; break; }
+                if (!acked) missing[miss_n++] = gw_net_roster[i2];
+            }
+            out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
+            out[pos++]='S'; out[pos++]='T'; out[pos++]='A'; out[pos++]='R';
+            out[pos++]='T'; out[pos++]='_'; out[pos++]='O'; out[pos++]='K';
+            out[pos++]=',';
+            pos += fmt_dec(&out[pos], ack_count);
+            out[pos++]=',';
+            pos += fmt_dec(&out[pos], (int)gw_net_root);
+            out[pos++]=',';
+            pos += fmt_dec(&out[pos], miss_n);
+            for (i2 = 0; i2 < miss_n; i2++) {
+                out[pos++]=',';
+                pos += fmt_dec(&out[pos], (int)missing[i2]);
+            }
+            out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+        }
+        test_run_info((unsigned char *)out);
+
+        /* The grid state right now.  The ACK count above says who HEARD
+         * the broadcast; this says who is actually ON THE GRID.  Right
+         * after the burst that is normally nobody -- the anchors still
+         * have to get their slot confirmed by the Root -- and the host must
+         * not read that as a formed network.  The line is repeated
+         * whenever the count changes (from the beacons). */
+        {
+            char g0[32]; int gp = 0, k, up = 0;
+            for (k = 0; k < gw_net_roster_n; k++)
+                if (gw_net_on_grid & (uint16_t)(1u << k)) up++;
+            g0[gp++]='+'; g0[gp++]='N'; g0[gp++]='E'; g0[gp++]='T';
+            g0[gp++]='G'; g0[gp++]='R'; g0[gp++]='I'; g0[gp++]='D';
+            g0[gp++]=',';
+            gp += fmt_dec(&g0[gp], up);
+            g0[gp++]=',';
+            gp += fmt_dec(&g0[gp], gw_net_roster_n);
+            g0[gp++]='\r'; g0[gp++]='\n'; g0[gp]='\0';
+            test_run_info((unsigned char *)g0);
+        }
+    }
+}
+
 /* The index of a rank in the roster, or -1. */
 static int gw_net_roster_index(uint16_t rank)
 {
@@ -1000,6 +1126,58 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         }
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
+    }
+    else if (func == FUNC_NETWORK_ACK)
+    {
+        /* An anchor acknowledges the NETWORK_START broadcast.
+         *
+         * P0-1: this used to be handled INSIDE the blocking 2 s burst loop,
+         * which discarded every other frame that arrived in the meantime --
+         * including the tag's position reports.  It is now part of the
+         * ordinary receive path, so nothing is lost any more.
+         *
+         * Parse: [10-11]=root_rank, [12]=cs_level, [13]=slot_idx,
+         *         [14]=n_neighbors */
+        uint16_t ack_root;
+        uint8_t  cs_level;
+        uint8_t  slot_idx;
+        uint8_t  n_neigh;
+        uint16_t src_rank;
+        if (len < (uint16_t)(DL_TS_NETACK_NNEIGH_IDX + 1)) return;
+        ack_root = (uint16_t)(frame[DL_TS_NETACK_ROOT_IDX] |
+                   ((uint16_t)frame[DL_TS_NETACK_ROOT_IDX + 1] << 8));
+        cs_level = frame[DL_TS_NETACK_LEVEL_IDX];
+        slot_idx = frame[DL_TS_NETACK_SLOT_IDX];
+        n_neigh  = frame[DL_TS_NETACK_NNEIGH_IDX];
+        src_rank = (uint16_t)(frame[7] | ((uint16_t)frame[8] << 8));
+        (void)ack_root; (void)cs_level; (void)slot_idx;
+
+        /* Count each anchor only once, even though it ACKs on every
+         * broadcast of the burst. */
+        if (gw_ns.active && gw_ns_add_ack(src_rank)) {
+            char auid[8];
+            auid[0] = gw_hex[(src_rank >> 12) & 0xF];
+            auid[1] = gw_hex[(src_rank >>  8) & 0xF];
+            auid[2] = gw_hex[(src_rank >>  4) & 0xF];
+            auid[3] = gw_hex[ src_rank        & 0xF];
+            auid[4] = '\0';
+            gateway_device_seen(auid, "ANCHOR", src_rank);
+            /* P1-1: report how many anchors this one hears.  The Root's
+             * neighbour count is its coverage -- a Root that hears almost
+             * nobody cannot complete the network, so the host can suggest
+             * a better Root. */
+            {
+                char nout[32]; int np = 0;
+                nout[np++]='+'; nout[np++]='N'; nout[np++]='E';
+                nout[np++]='T'; nout[np++]='N'; nout[np++]='B';
+                nout[np++]='R'; nout[np++]=',';
+                np += fmt_dec(&nout[np], (int)src_rank);
+                nout[np++]=',';
+                np += fmt_dec(&nout[np], (int)n_neigh);
+                nout[np]='\0';
+                test_run_info((unsigned char *)nout);
+            }
+        }
     }
     else if (func == FUNC_OTA_ACK)
     {
@@ -2731,154 +2909,34 @@ void gateway_poll_uart(void)
                 payload[plen++] = (uint8_t)((roster[i] >> 8) & 0xFF);
             }
 
-            /* Broadcast to all anchors (0xFFFF) via UWB.
-             * P1-3: the burst must outlast the anchor-side timing — the
+            /* P0-1: ARM the broadcast instead of running it here.
+             *
+             * The burst used to be a blocking loop right here: 100 x 20 ms
+             * of "TX one frame, poll the radio" during which the gateway
+             * served neither the UART nor the tag's position reports --
+             * every frame that was not a NETWORK_ACK was thrown away.
+             * Now the handler only arms the state machine and returns; the
+             * main loop sends the frames (one every 20 ms) and the ACKs
+             * arrive through the ordinary receive path.
+             *
+             * P1-3: the burst must outlast the anchor-side timing -- the
              * anchor de-bounces repeated NETWORK_START for 800 ms, answers
              * with an ALOHA beacon every 500 ms and needs up to 3 s to
-             * confirm its slot.  A 300 ms burst therefore missed most
-             * anchors; 100 × 20 ms = 2 s covers all of it. */
-            int ack_count = 0;
-            uint16_t ack_ranks[GW_MAX_DEVICES];
-            int burst;
-            for (burst = 0; burst < 100; burst++) {
-                gateway_send_uwb_ack(0xFFFFu, FUNC_NETWORK_START, payload, (uint8_t)plen);
-                {
-                    uint32_t dl = HAL_GetTick() + 20u;
-                    port_DisableEXT_IRQ();
-                    while (HAL_GetTick() < dl) {
-                        uint32_t st = dwt_read32bitreg(SYS_STATUS_ID);
-                        if (st & SYS_STATUS_ALL_RX_ERR) {
-                            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
-                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                            Sleep(1); continue;
-                        }
-                        if (st & SYS_STATUS_RXFCG_BIT_MASK) {
-                            uint32_t fl = dwt_read32bitreg(RX_FINFO_ID) & RXFLEN_MASK;
-                            if (fl >= GW_HDR_LEN && fl <= 32) {
-                                uint8_t rb[32]; dwt_readrxdata(rb, fl, 0);
-                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-                                if (rb[9] == FUNC_NETWORK_ACK) {
-                                    /* Got NETWORK_ACK from an anchor.
-                                     * Parse: [10-11]=root_rank, [12]=cs_level,
-                                     *         [13]=slot_idx, [14]=n_neighbors */
-                                    uint16_t ack_root = (uint16_t)(rb[DL_TS_NETACK_ROOT_IDX] |
-                                                    ((uint16_t)rb[DL_TS_NETACK_ROOT_IDX+1] << 8));
-                                    uint8_t cs_level  = rb[DL_TS_NETACK_LEVEL_IDX];
-                                    uint8_t slot_idx  = rb[DL_TS_NETACK_SLOT_IDX];
-                                    uint8_t n_neigh   = rb[DL_TS_NETACK_NNEIGH_IDX];
-                                    uint16_t src_rank = (uint16_t)(rb[7] | ((uint16_t)rb[8] << 8));
-                                    (void)ack_root; (void)cs_level; (void)slot_idx; (void)n_neigh;
-                                    /* Register the anchor as online (P1-4) and count
-                                     * each anchor only once, even though it ACKs on
-                                     * every broadcast burst. */
-                                    {
-                                        char auid[8];
-                                        int dup = 0, k;
-                                        for (k = 0; k < ack_count; k++) {
-                                            if (ack_ranks[k] == src_rank) { dup = 1; break; }
-                                        }
-                                        if (!dup && ack_count < GW_MAX_DEVICES) {
-                                            ack_ranks[ack_count++] = src_rank;
-                                            auid[0] = gw_hex[(src_rank >> 12) & 0xF];
-                                            auid[1] = gw_hex[(src_rank >>  8) & 0xF];
-                                            auid[2] = gw_hex[(src_rank >>  4) & 0xF];
-                                            auid[3] = gw_hex[ src_rank        & 0xF];
-                                            auid[4] = '\0';
-                                            gateway_device_seen(auid, "ANCHOR", src_rank);
-                                            /* P1-1: report how many anchors this one
-                                             * hears.  The Root's neighbour count is
-                                             * its coverage — a Root that hears
-                                             * almost nobody cannot complete the
-                                             * network, so the host can suggest a
-                                             * better Root. */
-                                            {
-                                                char nout[32]; int np = 0;
-                                                nout[np++]='+'; nout[np++]='N'; nout[np++]='E';
-                                                nout[np++]='T'; nout[np++]='N'; nout[np++]='B';
-                                                nout[np++]='R'; nout[np++]=',';
-                                                np += fmt_dec(&nout[np], (int)src_rank);
-                                                nout[np++]=',';
-                                                np += fmt_dec(&nout[np], (int)n_neigh);
-                                                nout[np]='\0';
-                                                test_run_info((unsigned char *)nout);
-                                            }
-                                        }
-                                    }
-                                    /* Don't break — keep collecting ACKs from other anchors */
-                                }
-                            } else {
-                                dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG_BIT_MASK);
-                            }
-                            dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                        }
-                        Sleep(1);
-                    }
-                    EXTI->PR1 = (1u << 12);
-                    port_EnableEXT_IRQ();
-                }
-            }
-
-            /* Report result: +NETSTART_OK,<ack_count>,<root_rank>,<miss_cnt>,<r1>,...
-             * The missing list holds the roster members that never answered
-             * the NETWORK_START — the host must warn about them and keep them
-             * out of the TDOA solve set.  If nobody answered at all, emit
-             * +NETSTART_ERR so the host can tell "command sent but no anchor
-             * heard it" from "success". */
+             * confirm its slot.  100 x 20 ms = 2 s covers all of it. */
             {
-                char out[128]; int pos = 0;
-                if (ack_count == 0) {
-                    out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
-                    out[pos++]='S'; out[pos++]='T'; out[pos++]='A'; out[pos++]='R';
-                    out[pos++]='T'; out[pos++]='_'; out[pos++]='E'; out[pos++]='R';
-                    out[pos++]='R';
-                    out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
-                } else {
-                    uint16_t missing[NET_MAX_PARTICIPANTS];
-                    int miss_n = 0, i2, j2;
-                    for (i2 = 0; i2 < roster_n; i2++) {
-                        int acked = 0;
-                        for (j2 = 0; j2 < ack_count; j2++)
-                            if (ack_ranks[j2] == roster[i2]) { acked = 1; break; }
-                        if (!acked) missing[miss_n++] = roster[i2];
-                    }
-                    out[pos++]='+'; out[pos++]='N'; out[pos++]='E'; out[pos++]='T';
-                    out[pos++]='S'; out[pos++]='T'; out[pos++]='A'; out[pos++]='R';
-                    out[pos++]='T'; out[pos++]='_'; out[pos++]='O'; out[pos++]='K';
-                    out[pos++]=',';
-                    pos += fmt_dec(&out[pos], ack_count);
-                    out[pos++]=',';
-                    pos += fmt_dec(&out[pos], (int)root_rank);
-                    out[pos++]=',';
-                    pos += fmt_dec(&out[pos], miss_n);
-                    for (i2 = 0; i2 < miss_n; i2++) {
-                        out[pos++]=',';
-                        pos += fmt_dec(&out[pos], (int)missing[i2]);
-                    }
-                    out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
-                }
-                test_run_info((unsigned char *)out);
-                /* The grid state right now.  The ACK count above says who
-                 * HEARD the broadcast; this says who is actually ON THE
-                 * GRID.  Right after the burst that is normally nobody --
-                 * the anchors still have to get their slot confirmed by
-                 * the Root -- and the host must not read that as a formed
-                 * network.  The line is repeated whenever the count
-                 * changes (from the beacons). */
-                {
-                    char g0[32]; int gp = 0, k, up = 0;
-                    for (k = 0; k < gw_net_roster_n; k++)
-                        if (gw_net_on_grid & (uint16_t)(1u << k)) up++;
-                    g0[gp++]='+'; g0[gp++]='N'; g0[gp++]='E'; g0[gp++]='T';
-                    g0[gp++]='G'; g0[gp++]='R'; g0[gp++]='I'; g0[gp++]='D';
-                    g0[gp++]=',';
-                    gp += fmt_dec(&g0[gp], up);
-                    g0[gp++]=',';
-                    gp += fmt_dec(&g0[gp], gw_net_roster_n);
-                    g0[gp++]='\r'; g0[gp++]='\n'; g0[gp]='\0';
-                    test_run_info((unsigned char *)g0);
-                }
+                int k;
+                gw_ns.active     = 1;
+                gw_ns.t0_ms      = HAL_GetTick();
+                gw_ns.last_tx_ms = 0;      /* send the first one right now */
+                gw_ns.plen       = (uint8_t)plen;
+                gw_ns.ack_count  = 0;
+                for (k = 0; k < (int)sizeof(payload); k++) gw_ns.payload[k] = payload[k];
             }
-            gateway_rx_flush();
+            gateway_netstart_poll();
+            /* No gateway_rx_flush() here any more: the flush existed to
+             * clean up after the inline ACK polling of the old blocking
+             * burst.  The radio is left alone now -- the burst needs the
+             * ACKs, and every other frame is wanted too. */
         }
     }
     else if (strncmp(cmd, "AT+STOP", 7) == 0)
@@ -3070,6 +3128,10 @@ int fusion_gateway(void)
         gateway_ota_arq_poll();
         gateway_bcast_ota_poll();
         gateway_check_timeout();
+        /* P0-1: the NETSTART broadcast runs here, not inside the AT
+         * handler -- one frame every 20 ms, and the radio and the UART are
+         * served in between. */
+        gateway_netstart_poll();
 
         /* Heartbeat: LED toggle every ~5s */
         if (++loop_ctr >= 5000) {
