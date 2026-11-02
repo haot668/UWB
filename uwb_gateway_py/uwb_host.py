@@ -541,8 +541,16 @@ def anchor_net_state(d):
     "root" — the Root of the running network (the clock source)
     "run"  — a member that is on the grid
     "wait" — a member of the roster that is not (yet) on the grid
+    "idle" — an anchor that is NOT part of any network
     "off"  — offline
-    ""     — no network formed, or not a member of one
+    ""     — not an anchor at all (a tag or the gateway)
+
+    "idle" used to be "" — and "" fell through to the same branch as
+    "run", so an anchor that had never joined a network was drawn on the
+    map exactly like a member that is on the grid.  With a green circle
+    around the Root and blue circles around the members, an idle anchor
+    that looked like a member was a way of telling the operator that a
+    network was covering more ground than it really did.
 
     An anchor without a coordinate has no place on the map at all — it is
     not drawn, because there is nowhere truthful to draw it.  The device
@@ -560,7 +568,8 @@ def anchor_net_state(d):
         return "off"
     roster = getattr(S, "net_roster", []) or []
     if not roster or rank not in roster:
-        return ""
+        # Online, but not a member of any network.
+        return "idle"
     if d.get("net_state") == 3:
         return "root" if rank == getattr(S, "net_root_rank", 0) else "run"
     return "wait"
@@ -3180,6 +3189,9 @@ def refresh_lists(force_rebuild=False):
                     info += "  ● 在网"
                 elif st == "wait":
                     info += "  ○ 等待确认"
+                elif st == "idle":
+                    # D: online, but it belongs to no network at all
+                    info += "  ○ 未组网"
                 elif st == "lost":
                     # P1-5: it was on the grid and fell off it
                     info += "  ⚠ 掉线"
@@ -4060,13 +4072,19 @@ def show_info(uid):
 
     if d.get("ax") is not None:
         lines.append(f"坐标:     {d['ax']:.3f}, {d['ay']:.3f}, {d['az']:.3f}")
+    # D: when the z column carries no information (coplanar anchors), the
+    # solver still returns a number — it is the height of the anchor plane.
+    # Printing it to three decimals claims a precision the solve does not
+    # have, so show "~" and say why.
+    z_valid = d.get("z_valid")
+    z_txt = "~" if z_valid is False else f"{d.get('z', 0):.3f}"
     if d.get("x") is not None:
-        lines.append(f"实时:    {d['x']:.3f}, {d['y']:.3f}, {d.get('z',0):.3f}")
+        lines.append(f"实时:    {d['x']:.3f}, {d['y']:.3f}, {z_txt}")
     if d.get("q") is not None:
         lines.append(f"质量: {d['q']}/1000")
         if d.get("rms_mm") is not None and d.get("q", QUALITY_NONE) < QUALITY_NONE:
             lines.append(f"残差: {d['rms_mm']} mm")
-        if d.get("z_valid") is False:
+        if z_valid is False:
             lines.append("高度: 无效（共面锚点，Z 仅为锚点平面）")
     if d.get("fw_ver"):
         lines.append(f"固件: {d['fw_ver']}")
@@ -4225,10 +4243,17 @@ def draw_anchor(c, uid, d):
     #   wait → amber  (in the roster, but not yet on the grid)
     net_st = anchor_net_state(d)
     map_label = f"A{rank:02d}"  # e.g. "A08" — rank shown on map icon
+    label_color = C["text"]
     if net_st == "root":
         map_label = f"R{rank:02d}"  # the Root is marked with an R
     elif net_st == "lost":
         map_label = f"A{rank:02d}!"  # P1-5: dropped out of the grid
+    elif net_st == "idle":
+        # D: an anchor that is online but belongs to no network.  It must
+        # not look like a member of the grid, so it gets its own label
+        # and a muted colour.
+        map_label = f"A{rank:02d}·未"
+        label_color = "#8b9096"
 
     # Colors
     if net_st == "root":
@@ -4243,6 +4268,12 @@ def draw_anchor(c, uid, d):
         body_fill = "#e6a800"
         body_stroke = "#9a6700"
         glow_color = "#f0b72f"
+    elif net_st == "idle":
+        # D: online but not on any grid — grey, and drawn hollow (dashed
+        # outline) so the eye reads it as "present but not participating".
+        body_fill = "#eef0f2"
+        body_stroke = "#8b9096"
+        glow_color = "#d0d7de"
     elif online:
         body_fill = C["anchor"]     # blue
         body_stroke = "#0550ae"     # darker blue border
@@ -4273,8 +4304,14 @@ def draw_anchor(c, uid, d):
 
     # --- Inner filled circle ---
     ir = max(1, r - 3 * icon_s)
-    c.create_oval(sx-ir, sy-ir, sx+ir, sy+ir,
-                  fill=body_fill, outline="")
+    if net_st == "idle":
+        # hollow + dashed: present, but not a member of any grid
+        c.create_oval(sx-ir, sy-ir, sx+ir, sy+ir,
+                      fill=body_fill, outline=body_stroke,
+                      width=max(1, 1.5*icon_s), dash=(3, 2))
+    else:
+        c.create_oval(sx-ir, sy-ir, sx+ir, sy+ir,
+                      fill=body_fill, outline="")
 
     # --- Center dot (highlight) ---
     cd = max(2, 3 * icon_s)
@@ -4282,7 +4319,7 @@ def draw_anchor(c, uid, d):
                   fill="#ffffff", outline="")
 
     # --- Ring accent ---
-    if online and net_st not in ("root", "wait", "lost"):
+    if online and net_st not in ("root", "wait", "lost", "idle"):
         ar = max(r // 2, 4 * icon_s) + icon_s
         c.create_oval(sx-ar, sy-ar, sx+ar, sy+ar,
                       fill="", outline=C["green"], width=max(1, 2*icon_s))
@@ -4290,7 +4327,7 @@ def draw_anchor(c, uid, d):
     # --- Label badge ---
     if S.show_labels:
         fs = max(7, int(8 * min(icon_s, 1.8)))
-        t = c.create_text(sx, sy+r+14*icon_s, text=map_label, fill=C["text"],
+        t = c.create_text(sx, sy+r+14*icon_s, text=map_label, fill=label_color,
                           font=("Segoe UI", fs, "bold"), anchor="n")
         bbox = c.bbox(t)
         if bbox:
