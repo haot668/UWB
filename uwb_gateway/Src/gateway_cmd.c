@@ -270,6 +270,14 @@ typedef struct
      * flips the type back and forth on every frame, so the report is
      * rate-limited to one per GW_DEVTYPE_PERIOD_MS. */
     uint32_t last_type_ms;
+    /* P0-2: does this anchor HAVE a coordinate?
+     *   coord_known = 0            -> nobody said yet (unknown)
+     *   coord_known = 1, valid = 0 -> the anchor says it has NONE
+     *   coord_known = 1, valid = 1 -> the anchor has one
+     * The gateway learns this from the anchor's own beacon (the
+     * COORD_VALID flag) and from the coordinate read-back. */
+    uint8_t  coord_known;
+    uint8_t  coord_valid;
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
@@ -409,6 +417,39 @@ void gateway_netstart_poll(void)
         }
         test_run_info((unsigned char *)out);
 
+        /* P0-2: warn about the roster members that are KNOWN to have no
+         * coordinate.  They do not break the solve -- the tag drops them
+         * from the TDOA set on its own, using the same flag -- but the
+         * operator has to know that the network runs with fewer anchors
+         * than the roster says. */
+        {
+            char nc[64]; int np = 0, k2, q, any = 0;
+            for (k2 = 0; k2 < gw_net_roster_n; k2++) {
+                for (q = 0; q < gw_dev_count; q++) {
+                    if (gw_devs[q].type == 'A' &&
+                        gw_devs[q].rank == gw_net_roster[k2] &&
+                        gw_devs[q].coord_known && !gw_devs[q].coord_valid) {
+                        if (!any) {
+                            nc[np++]='+'; nc[np++]='N'; nc[np++]='O';
+                            nc[np++]='C'; nc[np++]='O'; nc[np++]='O';
+                            nc[np++]='R'; nc[np++]='D'; nc[np++]=',';
+                            any = 1;
+                        }
+                        if (np < (int)sizeof(nc) - 8) {
+                            np += fmt_dec(&nc[np], (int)gw_net_roster[k2]);
+                            nc[np++] = ',';
+                        }
+                        break;
+                    }
+                }
+            }
+            if (any) {
+                if (np > 0 && nc[np-1] == ',') np--;
+                nc[np++]='\r'; nc[np++]='\n'; nc[np]='\0';
+                test_run_info((unsigned char *)nc);
+            }
+        }
+
         /* The grid state right now.  The ACK count above says who HEARD
          * the broadcast; this says who is actually ON THE GRID.  Right
          * after the burst that is normally nobody -- the anchors still
@@ -448,6 +489,40 @@ static gw_dev_t *gw_find_dev(const char *uid)
         if (strcmp(gw_devs[i].uid, uid) == 0) return &gw_devs[i];
     }
     return NULL;
+}
+
+/* P0-2: record the coordinate state of an anchor and tell the host when it
+ * changes.  "no coordinate" is exactly the condition the operator has to
+ * see before forming a network: an anchor without a coordinate is left out
+ * of the TDOA solve (the tag drops it on its own, using the same flag),
+ * so the network runs with fewer anchors than the roster says. */
+static void gw_set_coord_state(uint16_t rank, int valid)
+{
+    char uid[8];
+    gw_dev_t *d;
+
+    uid[0] = gw_hex[(rank >> 12) & 0xF];
+    uid[1] = gw_hex[(rank >>  8) & 0xF];
+    uid[2] = gw_hex[(rank >>  4) & 0xF];
+    uid[3] = gw_hex[ rank        & 0xF];
+    uid[4] = '\0';
+
+    d = gw_find_dev(uid);
+    if (!d) return;
+    if (d->coord_known && d->coord_valid == (uint8_t)valid) return;
+    d->coord_known = 1;
+    d->coord_valid = (uint8_t)valid;
+    {
+        char out[24]; int p2 = 0;
+        out[p2++]='+'; out[p2++]='C'; out[p2++]='O'; out[p2++]='O';
+        out[p2++]='R'; out[p2++]='D'; out[p2++]='S'; out[p2++]='T';
+        out[p2++]='A'; out[p2++]='T'; out[p2++]=',';
+        p2 += fmt_hex4(&out[p2], rank);
+        out[p2++]=',';
+        out[p2++] = valid ? '1' : '0';
+        out[p2]='\0';
+        test_run_info((unsigned char *)out);
+    }
 }
 
 void gateway_set_master_uid(const char *uid)
@@ -1229,6 +1304,13 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         uid[4] = '\0';
         gateway_device_seen(uid, "ANCHOR", src_addr);
 
+        /* P0-2: the beacon's flags byte says whether this anchor HAS a
+         * coordinate.  The gateway hears every beacon of the grid, so it
+         * knows the coordinate state of every anchor without asking. */
+        if (len >= (uint16_t)(DL_TS_FLAGS_IDX + 1))
+            gw_set_coord_state(src_addr,
+                (frame[DL_TS_FLAGS_IDX] & DL_TS_FLAG_COORD_VALID) ? 1 : 0);
+
         /* P1-5: derive the anchor's network state from the beacon it just
          * sent, and report it to the host.
          *
@@ -1537,7 +1619,14 @@ static void send_coord_ack(uint16_t uid, int x, int y, int z)
     pos += fmt_coord(&ack[pos], y);
     ack[pos++] = ',';
     pos += fmt_coord(&ack[pos], z);
+    /* P0-2: the write ACK is only sent after the anchor confirmed the
+     * write, so from here on the anchor HAS a coordinate.  The flag is
+     * appended so that the host sees the same shape as in the read
+     * response. */
+    ack[pos++] = ',';
+    ack[pos++] = '1';
     ack[pos] = '\0';
+    gw_set_coord_state(uid, 1);
     test_run_info((unsigned char *)ack);
 }
 
@@ -1655,6 +1744,7 @@ static void gateway_coord_read(const char *cmd)
     uint8_t payload[4];
     uint8_t resp[8];
     int ok = 0;
+    int cvalid = 1;      /* P0-2: does the anchor have a coordinate? */
 
     if (*p != '=') return;
     p++;
@@ -1692,6 +1782,14 @@ static void gateway_coord_read(const char *cmd)
                 resp[0] = ackbuf[10]; resp[1] = ackbuf[11];
                 resp[2] = ackbuf[12]; resp[3] = ackbuf[13];
                 resp[4] = ackbuf[14]; resp[5] = ackbuf[15];
+                /* P0-2: payload offset 6 (frame byte 16) is the flags
+                 * byte: bit0 = "the coordinate was CONFIGURED".  A frame
+                 * from an older firmware has 0xCC there instead of a flag
+                 * byte -- for that one the answer is taken at face value
+                 * (the behaviour before this flag existed). */
+                if (ackbuf[16] == 0x00)      cvalid = 0;
+                else                         cvalid = 1;
+                gw_set_coord_state(src_rank, cvalid);
                 ok = 1;
             }
         }
@@ -1713,6 +1811,10 @@ static void gateway_coord_read(const char *cmd)
         pos += fmt_coord(&ack[pos], fy);
         ack[pos++] = ',';
         pos += fmt_coord(&ack[pos], fz);
+        /* P0-2: the valid flag, APPENDED at the end so that a parser that
+         * only knows the old five fields still reads the old line. */
+        ack[pos++] = ',';
+        ack[pos++] = cvalid ? '1' : '0';
         ack[pos] = '\0';
         test_run_info((unsigned char *)ack);
     } else {

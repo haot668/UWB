@@ -240,6 +240,10 @@ def parse_line(line: str):
         handle_netgrid(parts)
     elif head == "+POS" and len(parts) >= 6:
         handle_pos(parts)
+    elif head == "+COORDSTAT" and len(parts) >= 3:
+        handle_coordstat(parts)
+    elif head == "+NOCOORD" and len(parts) >= 2:
+        handle_nocoord(parts)
     elif head == "+COORDAck" and len(parts) >= 5:
         handle_coord(parts)
     elif head == "+COORD" and len(parts) >= 5:
@@ -885,6 +889,17 @@ def handle_online(parts):
         # "✓已设坐标" for an anchor that was never configured.  Leave the
         # coordinates empty — the card then shows "⚠ 未设坐标".
         d["ax"], d["ay"], d["az"] = S.anchor_coords[uid]
+        # The host KNOWS the coordinate (it is in anchor_cfg.json), so the
+        # anchor counts as "configured" here.  Whether the ANCHOR still has
+        # it is a different question -- the anchor loses it on reboot (the
+        # flash save is a stub) -- and that is what the read-back before
+        # every network formation verifies, using the anchor's own
+        # "do I have a coordinate" flag.
+        #
+        # Without this the flag was only ever set by a live +COORD answer,
+        # so after a restart of the host every anchor showed "未设坐标" and
+        # the network formation refused to start.
+        d["coord_ok"] = True
     if dtype == "ANCHOR" and uid not in S.anchor_label:
         S.anchor_counter += 1
         S.anchor_label[uid] = f"A{S.anchor_counter:02d}"
@@ -1332,6 +1347,37 @@ def coord_batch_finish():
         cb(acked)
 
 
+def handle_coordstat(parts):
+    """The gateway learned from an anchor's beacon whether it has a
+    coordinate: +COORDSTAT,<uid>,<0|1>.
+
+    The flag comes from the anchor itself (the COORD_VALID bit in its
+    TimeSync beacon), so it is false for an anchor that was never written
+    and for one that lost its coordinate on reboot.
+    """
+    uid = parts[1].strip()
+    try:
+        valid = int(parts[2].strip()) != 0
+    except (ValueError, IndexError):
+        return
+    d = S.devices.get(uid)
+    if d is not None:
+        d["coord_ok"] = valid
+    if not valid:
+        set_status(f"基站 {get_label(uid)} 没有坐标 — 不会被算进 TDOA 解算", "warning")
+
+
+def handle_nocoord(parts):
+    """+NOCOORD,<rank>,<rank>... -- the roster members that are known to
+    have no coordinate.  The network still forms, but it runs with fewer
+    anchors than the roster says."""
+    ranks = [p.strip() for p in parts[1:] if p.strip()]
+    if not ranks:
+        return
+    txt = ", ".join(f"R{r}" for r in ranks)
+    set_status(f"组网启动 → 以下基站没有坐标: {txt}", "warning")
+
+
 def handle_coord(parts):
     """Handle a coordinate line from the gateway.
 
@@ -1342,6 +1388,34 @@ def handle_coord(parts):
     """
     uid = parts[1].strip()
     x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+
+    # P0-2: the gateway appends the anchor's "do I have a coordinate" flag.
+    # Without it a (0,0,0) answer is ambiguous -- a real coordinate at the
+    # origin, or an anchor that lost its coordinate on reboot (the flash
+    # save is still a stub).  An anchor without a coordinate is NOT in the
+    # TDOA solve set, so it must not look configured here either.
+    coord_valid = True
+    if len(parts) >= 6:
+        try:
+            coord_valid = int(parts[5].strip()) != 0
+        except (ValueError, IndexError):
+            coord_valid = True
+    if not coord_valid:
+        if uid in S.devices:
+            S.devices[uid]["coord_ok"] = False
+        chk0 = getattr(S, "_coord_check", None)
+        if chk0 and uid in chk0["pending"]:
+            # Same as "the anchor did not answer": the coordinate the
+            # operator expects is not on the anchor.
+            chk0["got"][uid] = None
+            chk0["pending"].discard(uid)
+            if not chk0["pending"]:
+                root.after(0, coord_check_finish)
+            else:
+                _coord_check_next()
+            return
+        set_status(f"基站 {get_label(uid)} 没有坐标 — 坐标回读返回「未配置」", "error")
+        return
 
     # P1-2: a read-back is in progress — record the answer and do NOT touch
     # the local model.  The whole point of the check is to COMPARE the two.
@@ -2718,7 +2792,10 @@ def build_settings():
             for uid, exp, got in diffs:
                 name = get_label(uid)
                 if got is None:
-                    lines.append(f"  {name} ({uid})：基站没有回答")
+                    # P0-2: "no answer" and "the anchor says it has no
+                    # coordinate" both end up here (got=None) -- the anchor
+                    # lost its coordinate on reboot, or never had one.
+                    lines.append(f"  {name} ({uid})：基站没有回答，或没有配置坐标")
                 else:
                     lines.append(
                         f"  {name} ({uid})：上位机 ({exp[0]:.2f}, {exp[1]:.2f}, {exp[2]:.2f}) m"

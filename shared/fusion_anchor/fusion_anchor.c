@@ -2611,7 +2611,7 @@ static void anchor_handle_coord_write(uint16_t src_uid, const uint8_t *payload, 
  * real (0,0,0) from a lost coordinate.) */
 static void anchor_handle_coord_read(uint16_t src_uid)
 {
-    uint8_t rep[19];
+    uint8_t rep[20];
     uint16_t x = (uint16_t)g_anchor.my_pos.x_cm;
     uint16_t y = (uint16_t)g_anchor.my_pos.y_cm;
     uint16_t z = (uint16_t)g_anchor.my_pos.z_cm;
@@ -2625,7 +2625,17 @@ static void anchor_handle_coord_read(uint16_t src_uid)
     rep[10] = (uint8_t)(x & 0xFF); rep[11] = (uint8_t)(x >> 8);
     rep[12] = (uint8_t)(y & 0xFF); rep[13] = (uint8_t)(y >> 8);
     rep[14] = (uint8_t)(z & 0xFF); rep[15] = (uint8_t)(z >> 8);
-    rep[16] = 0xCC; rep[17] = 0xDD; rep[18] = 0xEE;
+    /* P0-2: the flags byte says whether the coordinate was ever
+     * CONFIGURED.  Without it a (0,0,0) answer is ambiguous: it could be
+     * a real coordinate at the origin or an anchor that never received
+     * one -- and an anchor without a coordinate contributes a (0,0) point
+     * to the TDOA solve, which drags the answer towards the origin.
+     *
+     * The tail stays pad: a DW3210 corrupts the LAST TWO bytes of a
+     * received frame, so the absorber has to be the last thing in it. */
+    rep[16] = s_coord_valid ? GW_COORD_FLAG_VALID : 0x00;
+    rep[17] = 0xEE;
+    rep[18] = 0xCC; rep[19] = 0xDD;
 
     port_DisableEXT_IRQ();
     dwt_forcetrxoff();

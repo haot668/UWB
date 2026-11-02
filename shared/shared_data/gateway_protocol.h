@@ -32,6 +32,13 @@ extern "C" {
 #define FUNC_LIST_REQ     0xFDu  /* GW→Master: request online device list */
 #define FUNC_STOP_ACK     0xFEu  /* Master→GW: STOP received */
 
+/* P0-2: the COORD_REPORT carries a FLAGS byte (payload offset 6), so the
+ * reader can tell "the coordinate is (0,0,0)" from "this anchor never got
+ * a coordinate".  bit0 = 1: the coordinate was CONFIGURED — the anchor
+ * really has one.  An anchor without a coordinate contributes a (0,0)
+ * point to the TDOA solve, which drags the answer towards the origin. */
+#define GW_COORD_FLAG_VALID   0x01u
+
 /* Gateway UWB addressing */
 #define GW_MASTER_ADDR    0x8001u  /* unique addr — avoids collision with slave rank (0x0001) */
 #define GW_BCAST_ADDR     0xFFFFu
