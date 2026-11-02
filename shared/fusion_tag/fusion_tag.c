@@ -263,6 +263,19 @@ static uint8_t  s_uplink_on      = 0;
 #define TAG_ROOT_TIMEOUT_MS       2000u
 #define TAG_DEGRADED_REPORT_MS     500u
 
+/* P1-9: the LOCAL keepalive.
+ *
+ * The degraded report goes out right after a received beacon -- but if the
+ * WHOLE network is silent there is no beacon at all, and the tag then goes
+ * completely quiet.  The host cannot tell a tag that is switched off from
+ * a tag whose whole anchor network died, and a live tag that has vanished
+ * from the map is exactly the symptom this has to prevent.
+ *
+ * So the tag keeps its own timer: when NOTHING has gone out for this long,
+ * one degraded report is sent anyway.  Nothing else is on the air in that
+ * situation, so the TX cannot collide with a beacon. */
+#define TAG_ALIVE_KEEPALIVE_MS    1000u
+
 /*============================================================================
  * Position report — the tag's UWB uplink (see DL_POS_REPORT_LEN)
  *
@@ -382,6 +395,10 @@ static void tag_build_pos_report(uint8_t *pkt)
 }
 static uint32_t s_n_report_tx   = 0;    /* reports actually transmitted      */
 static uint32_t s_n_report_skip = 0;    /* reports dropped (too late)        */
+/* P1-9: the local tick of the last report that actually went OUT (normal
+ * or degraded).  The keepalive uses it to see "nothing went out for a
+ * whole second" -- the case in which the whole network is silent. */
+static uint32_t s_last_uplink_ms = 0;
 
 /* P1-4: how often a refused delayed TX is retried, and how much earlier
  * the retry goes out. */
@@ -1729,6 +1746,7 @@ static void tag_tx_pos_report(uint64_t guard_hw)
         dwt_write32bitreg(SYS_STATUS_ID,
                           SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
         s_n_report_tx++;
+        s_last_uplink_ms = HAL_GetTick();
     }
 
     port_rf_switch_rx();
@@ -1840,10 +1858,48 @@ static void tag_tx_pos_report_degraded(void)
                         SYS_STATUS_TXFRS_BIT_MASK | SYS_STATUS_HPDWARN_BIT_MASK);
     }
     s_n_report_tx++;
+    s_last_uplink_ms = HAL_GetTick();
 
     port_rf_switch_rx();
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
     port_EnableEXT_IRQ();
+}
+
+/*============================================================================
+ * The LOCAL keepalive (P1-9) — "I am alive, and the whole network is gone"
+ *
+ * The degraded report above is triggered by a RECEIVED beacon, so it only
+ * works while some anchor is still talking.  When EVERY anchor is gone
+ * there is no beacon to react to, and the tag goes completely silent: the
+ * host then sees a tag that has disappeared, which is indistinguishable
+ * from a tag that was switched off.
+ *
+ * So the tag watches its own output: if no report has gone out for
+ * TAG_ALIVE_KEEPALIVE_MS, one degraded report is sent anyway.
+ *
+ * Two things keep this from interfering with anything:
+ *
+ *  - it only fires while the Root is silent (the degraded state).  With the
+ *    Root alive the uplink grid sends a report every round and this never
+ *    triggers;
+ *  - in that state nothing else is transmitting, so the immediate TX cannot
+ *    land on an anchor's beacon.
+ *
+ * The frame is the published one (the builder marks it "no solution" while
+ * the Root is silent), so the gateway sees a DEGRADED report and does not
+ * count the deliberate slow-down as a loss.
+ *==========================================================================*/
+static void tag_keepalive_poll(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    /* The Root is alive -> the uplink grid takes care of the reports. */
+    if ((uint32_t)(now - s_root_last_rx_ms) <= TAG_ROOT_TIMEOUT_MS) return;
+
+    /* Something went out recently -> the tag is visible already. */
+    if ((uint32_t)(now - s_last_uplink_ms) < TAG_ALIVE_KEEPALIVE_MS) return;
+
+    tag_tx_pos_report_degraded();
 }
 
 /*============================================================================
@@ -1930,6 +1986,12 @@ int fusion_tag(void)
              * triggered by the beacon itself, and one lost beacon silenced
              * the tag for a whole round. */
             tag_uplink_poll();
+
+            /* P1-9: the local keepalive.  When the WHOLE network is silent
+             * there is no beacon to react to, so the degraded report would
+             * never go out and the tag would vanish from the map.  This
+             * timer is the last resort that keeps it visible. */
+            tag_keepalive_poll();
 
             uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
             if (status & SYS_STATUS_ALL_RX_ERR) {
