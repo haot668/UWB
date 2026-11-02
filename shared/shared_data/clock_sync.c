@@ -93,9 +93,9 @@ static double cs_mad(const double *v, uint32_t n, double med)
  *
  *      factor = (rx_newest - rx_oldest) / (tx_newest - tx_oldest)
  *
- * With 16 samples at 80 ms the span is 1.28 s, so a 1 ns timestamp jitter
- * gives a rate uncertainty of ~0.8 ppb (the old two-endpoint sliding
- * implementation degenerated to an 80 ms span and was 16x worse).
+ * With 16 samples at 50 ms the span is 0.80 s, so a 1 ns timestamp jitter
+ * gives a rate uncertainty of ~1.25 ppb (the old two-endpoint sliding
+ * implementation degenerated to a 50 ms span and was 16x worse).
  *
  * Returns 0.0 when the window does not hold enough samples yet. */
 static double cs_rate_measure(AnchorClockSync *s,
@@ -109,7 +109,7 @@ static double cs_rate_measure(AnchorClockSync *s,
     uint8_t oldest = (uint8_t)((s->rate_head + CS_RATE_WINDOW_SAMPLES - n)
                                 % CS_RATE_WINDOW_SAMPLES);
 
-    /* Δtx is a 40-bit modular difference; the window is ~1.3 s, far below
+    /* Δtx is a 40-bit modular difference; the window is ~0.8 s, far below
      * the 17.2 s wrap period, so the mask is exact. */
     uint64_t d_tx = (tx_remote - s->rate_tx[oldest]) & 0xFFFFFFFFFFULL;
     if (d_tx == 0) return 0.0;
@@ -143,7 +143,7 @@ static void cs_rate_push(AnchorClockSync *s, uint64_t tx_remote, uint64_t rx_loc
  * the two clocks and is therefore constant.  A frame with a corrupt
  * timestamp breaks it immediately (by microseconds), and because the rate
  * window only uses its two ENDPOINTS such a sample would poison the rate
- * for a whole window (1.28 s) — a rate error of hundreds of ppm, which
+ * for a whole window (0.80 s) — a rate error of hundreds of ppm, which
  * destroys the slot spacing.
  *
  * The test compares the CANDIDATE's interval rate with the MEDIAN of the
@@ -224,7 +224,7 @@ bool clock_sync_update(AnchorClockSync *s,
      * the change of the path length — essentially zero.  A frame with a
      * corrupt timestamp breaks it by microseconds, and because the rate
      * window only uses its two ENDPOINTS such a sample would poison the
-     * rate for a whole window (1.28 s) — a 780 ppm error, which destroys
+     * rate for a whole window (0.80 s) — a 780 ppm error, which destroys
      * the slot spacing.  The sample is therefore dropped BEFORE it can
      * enter the window. */
     bool gate_fail = cs_gate_check(s, tx_remote, rx_local);

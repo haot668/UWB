@@ -465,13 +465,18 @@ def _geom_warnings(items):
 #
 # The slot compensation multiplies the slot index by the slot period, so the
 # residual of a pair of anchors grows with their slot-index distance:
-#   (slot_k - slot_j) * 6.25 ms * 20 ppm = 3.75 cm per slot,
-# i.e. up to 26 cm over the full 7-slot span.  Which anchor sits in which
-# slot is decided by the order of the roster, and the operator used to get
-# that order by ticking the checkboxes — pure accident.  Anchors that stand
-# next to each other should be given neighbouring slots, so that the pair
-# that dominates the local accuracy of the solve keeps a small index
-# distance.  These are the rules the netstart dialog offers.
+#   (slot_k - slot_j) * 6.25 ms * df
+# With the clocks NOT synchronised (20 ppm) that is 125 ns = 37.5 m of
+# equivalent path per slot, i.e. up to 262 m over the full 7-slot span —
+# by far the largest error in the system.  With the clock sync working
+# (~1.5 ppb) the same span is down to 0.075 ns ≈ 2.2 cm.
+#
+# NOTE that the residual depends ONLY on the slot-index difference: which
+# anchor sits in which slot does not change it, so re-ordering the roster
+# cannot reduce it.  What re-ordering does is keep the anchors that stand
+# next to each other in neighbouring slots, so that the pair which dominates
+# the local accuracy of the solve keeps a small index distance.  These are
+# the rules the netstart dialog offers.
 SLOT_ORDER_MODES = (
     "按到 Root 距离",
     "按极角(绕 Root)",

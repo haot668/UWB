@@ -37,9 +37,9 @@ extern "C" {
  * microsecond one.  Everything that converts between cm and DTU must use the
  * constants below — never a bare number.
  *
- *   1 m   = 213.20 DTU        10 ms slot = 638,980,000 DTU
+ *   1 m   = 213.20 DTU        6.25 ms slot = 399,362,500 DTU
  *   1 cm  =   2.1320 DTU       40-bit wrap = 17.21 s
- *   20 cm =  42.64 DTU         80 ms cycle = 5,111,840,000 DTU
+ *   20 cm =  42.64 DTU         50 ms cycle = 3,194,900,000 DTU
  *---------------------------------------------------------------------------*/
 #define DTU_PER_CM_F     2.1320f      /* float: DTU per centimetre          */
 #define DTU_PER_M_F      213.20f      /* float: DTU per metre               */
@@ -47,6 +47,7 @@ extern "C" {
 
 /* Integer variants (x1000), for the places that must not use floating point. */
 #define DTU_PER_CM_MILLI 2132
+#define DTU_PER_M_MILLI  213200
 #define CM_PER_DTU_MILLI 469
 
 /* DTU -> cm, rounded.  dtu may be negative (differences). */

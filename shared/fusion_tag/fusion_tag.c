@@ -163,7 +163,7 @@ typedef struct {
  * 2000 DTU = 94 cm: a real grid jump is far larger, a static deployment
  * never comes close (the residual is the path change plus the factor
  * error over the baseline span). */
-#define TAG_SELFCHECK_BASELINE   16u   /* frames between re-baselining (1.3 s) */
+#define TAG_SELFCHECK_BASELINE   16u   /* frames between re-baselining (0.8 s) */
 #define TAG_DESYNC_DTU           2000LL
 #define TAG_DESYNC_LIMIT         3u    /* consecutive failures before exclusion */
 #define TAG_TOA_AVG_N            8u    /* rounds in the TDOA average (0.4 s)     */
@@ -407,7 +407,7 @@ static void tag_solve_and_report(void)
      * now comes from shared_defines.h (213.20 DTU/m, kept at 1/1000
      * resolution) and the cap is 150 m of path difference, which is still
      * two orders of magnitude below the cross-round error. */
-    #define TDOA_DTU_PER_M_MILLI  213200LL   /* 213.20 DTU per metre × 1000 */
+    #define TDOA_DTU_PER_M_MILLI  ((int64_t)DTU_PER_M_MILLI)  /* shared_defines.h */
     #define TDOA_MAX_PATH_M        150LL     /* ±150 m of path difference    */
     #define TDOA_MAX_DTU           ((TDOA_MAX_PATH_M * TDOA_DTU_PER_M_MILLI) / 1000LL)
 
@@ -417,7 +417,7 @@ static void tag_solve_and_report(void)
      * Our own crystal differs from the Root's by up to ±20 ppm, so 6.25 ms is
      * 6.25 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
      * clock).  Subtracting the nominal 6.25 ms instead would leave a
-     * per-anchor error of slot × 6.25 ms × 20 ppm = up to 875 ns ≈ 26 cm at
+     * per-anchor error of slot × 6.25 ms × 20 ppm = up to 875 ns ≈ 262 m at
      * slot 7 — far above the 0.67 ns the 20 cm target needs.  f is measured from the
      * Root's own beacon (its in-frame TX timestamp vs. our RX timestamp),
      * which is exactly the clock_sync factor of the Root's tracker. */

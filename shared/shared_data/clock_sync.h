@@ -14,14 +14,15 @@
  *        factor = 1.0 + (cfo_raw / 2^26)
  *  Divisor is 2^26 = 67,108,864 (NOT 2^16).  The CFO is a *frequency*
  *  estimate with a noise of a few ppm — good enough to converge quickly,
- *  but not accurate enough to place a beacon on a grid: at slot 7 (70 ms)
- *  a 10 ppm error displaces the beacon by 700 ns ≈ 20 cm.
+ *  but not accurate enough to place a beacon on a grid: at slot 7 (43.75 ms)
+ *  a 10 ppm error displaces the beacon by 437 ns ≈ 131 m.
  *
  *  The far better rate source is the timestamp pair itself:
  *        factor = Δrx_local / Δtx_remote
  *  The RX timestamp is hardware-latched (jitter ~1 ns) and the TX timestamp
- *  is exact, so over a window of ~1.3 s the rate is known to ~1 ppb — three
- *  orders of magnitude better than the CFO, and it needs no calibration.
+ *  is exact, so over a window of ~0.8 s the rate is known to ~1.25 ppb —
+ *  three orders of magnitude better than the CFO, and it needs no
+ *  calibration.
  *  The CFO is kept for the warm-up (the window is empty right after a
  *  reset) and as a cross-check.
  *
@@ -56,12 +57,13 @@
 #define CS_DEFAULT_FACTOR_MEAS_VAR_TS 1e-13
 #define CS_DEFAULT_RC_ALPHA        0.30f
 
-/* Rate window (number of beacons).  16 beacons = 16 x 80 ms = 1.28 s. */
+/* Rate window (number of beacons).  16 beacons = 16 x 50 ms = 0.80 s. */
 #define CS_RATE_WINDOW_SAMPLES   16u
 /* Minimum number of samples before the timestamp-pair rate is trusted.
- * 8 beacons = 0.64 s -> the rate is known to ~1.5 ppb, which already puts
- * the slot placement error (80 ms x 1.5 ppb = 0.12 ns = 3.6 cm) well below
- * the 20 cm target.  The CFO (a few ppm) covers the warm-up before that. */
+ * 8 beacons = 0.40 s -> the rate is known to ~1.5 ppb, which already puts
+ * the slot placement error (the whole 50 ms span x 1.5 ppb = 0.075 ns =
+ * 2.2 cm) well below the 20 cm target.  The CFO (a few ppm) covers the
+ * warm-up before that. */
 #define CS_RATE_MIN_SAMPLES      8u
 
 /* Outlier / clamp thresholds on the rate innovation (dimensionless factor
@@ -69,7 +71,7 @@
 #define CS_FACTOR_OUTLIER_CFO    5e-6    /* 5 ppm  */
 #define CS_FACTOR_OUTLIER_TS     1e-6    /* 1 ppm  */
 /* Maximum rate correction per update once the filter has settled.  2 ppm is
- * 0.16 ns over one 80 ms interval — small enough that even a mis-classified
+ * 0.1 ns over one 50 ms interval — small enough that even a mis-classified
  * sample cannot move the grid, while a genuine 20 ppm crystal still needs
  * only a few updates to be tracked. */
 #define CS_FACTOR_CLAMP          2e-6    /* 2 ppm  */
@@ -94,9 +96,9 @@
  * With the reference form the factor error is only multiplied by the
  * ELAPSED time since the reference - which is what this limit bounds.
  *
- * 3e10 DTU = 0.47 s at 80 ms frames: the factor error (0.2 ppb) then
- * contributes 6 DTU (2.8 cm), and the reference is moved forward with
- * continuity, so the refresh itself costs nothing. */
+ * 3e10 DTU = 0.47 s (about 9 beacon frames at 50 ms): the factor error
+ * (0.2 ppb) then contributes 6 DTU (2.8 cm), and the reference is moved
+ * forward with continuity, so the refresh itself costs nothing. */
 #define CS_REF_MAX_AGE_DTU      3.0e10
 
 /* Sample-level sanity gate (DTU).  For two static anchors the interval
@@ -153,11 +155,11 @@ typedef struct {
     uint16_t neighbor_rank;     /* rank of this neighbor (Anchor-specific) */
 
     /* Rate estimation from timestamp pairs — a REAL sliding window over the
-     * last CS_RATE_WINDOW_SAMPLES beacons (16 x 80 ms = 1.28 s).  The old
+     * last CS_RATE_WINDOW_SAMPLES beacons (16 x 50 ms = 0.80 s).  The old
      * code kept only the two endpoints and slid them one step at a time,
      * so once the window was "full" it degenerated to a two-sample
-     * difference (80 ms) — 16x worse than the intended 1 ppb, i.e. a slot
-     * placement error of ~30 cm. */
+     * difference (50 ms) — 16x worse than the intended 1 ppb, i.e. a slot
+     * placement error of ~24 cm over the 50 ms span. */
     /* Offset reference point (P0-6): the model is
      *      local(remote) = ref_rx + factor * (remote - ref_tx)
      * and offset_dtu is that model expressed absolutely:

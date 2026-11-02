@@ -770,7 +770,8 @@ static bool is_in_root_slot_table(void)
  *
  * The old code decided "is it my slot?" from HAL_GetTick() % 50 ms while the
  * actual transmission was scheduled on the DW3000 SYS_TIME axis (root_tx_ts +
- * slot × 10 ms).  Those two clocks are unrelated, so the gate and the radio
+ * slot × 10 ms — the slot was 10 ms back then, it is 6.25 ms now).
+ * Those two clocks are unrelated, so the gate and the radio
  * disagreed: an anchor could pass the gate and then have its delayed TX land
  * outside its slot (or be silently dropped), which in the worst case meant an
  * entire cycle without any beacon from that anchor.  The Tag then paired
@@ -779,7 +780,7 @@ static bool is_in_root_slot_table(void)
  * Everything below is derived from the DW3000 SYS_TIME counter:
  *   • the grid origin is the Root's beacon TX timestamp (the Root defines the
  *     cycle),
- *   • our slot instant is  origin + my_slot × 10 ms,
+ *   • our slot instant is  origin + my_slot × 6.25 ms,
  *   • the Root's clock is mapped into OUR clock with the clock-sync model we
  *     maintain towards the Root (each DW3000's SYS_TIME starts at 0 on
  *     power-up, so the raw Root timestamp is NOT usable as a local target).
@@ -936,7 +937,8 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
      * the Root's clock is therefore factor × longer in ours.  The old code
      * divided instead of multiplying — invisible while the factor estimate
      * was stuck at 1.0, but at 200 ppm it displaced the slot instant by
-     * slot × 10 ms × 200 ppm ≈ 15 µs (≈ 5 m). */
+     * slot × 6.25 ms × 200 ppm = 1.25 µs per slot (875 ns ≈ 262 m of path
+     * at slot 7), far above the 0.67 ns the 20 cm target needs. */
     double f = 1.0;
     const AnchorClockSync *s = root_sync();
     if (s && s->update_count >= 3) f = s->factor;
