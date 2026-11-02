@@ -334,7 +334,7 @@ static void tag_build_pos_report(uint8_t *pkt)
      * but has no network".  The consumer must not read the gaps in the
      * sequence number as lost frames: while it is degraded the tag
      * deliberately slows down. */
-    if (s_root_seen && (HAL_GetTick() - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
+    if ((HAL_GetTick() - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
         x = 0; y = 0; z = 0;
         q = TAG_REPORT_QUALITY_NONE;
         flags = DL_POS_FLAG_DEGRADED;
