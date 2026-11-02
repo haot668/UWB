@@ -205,6 +205,13 @@ for proj_dir, cfg in projects.items():
     proj = proj.replace("<Define>USE_HAL_DRIVER, STM32L412xx</Define>",
                          f"<Define>{cfg['defines']}</Define>")
 
+    # C99 mode for armcc (AC5).  The whole codebase -- including the vendor
+    # SDK files -- is C99 style (declarations after statements, and the
+    # for-statement declaring its loop variable).  In the default C90 mode
+    # armcc rejects both with hard errors (#254 / #268), so the projects have
+    # to be built with --c99.  <uC99> lives under <Cads>: 0 = C90, 1 = C99.
+    proj = proj.replace("<uC99>0</uC99>", "<uC99>1</uC99>")
+
     # Replace scatter file
     proj = proj.replace(".\\DWS3000_STM32L412.sct", cfg['scatter'])
 
