@@ -262,6 +262,55 @@ static TwrLinkState s_twr_link[ANCHOR_MAX_NEIGHBORS];
 static uint32_t     s_twr_last_tx_ms = 0;  /* when the last correction batch went out */
 
 /*============================================================================
+ * F: the per-neighbour GRID residual (Root side).
+ *
+ * WHAT IT IS
+ *   For every child: how far its beacon ACTUALLY landed from the instant
+ *   the Root's grid says it must have landed —
+ *
+ *       residual = (rx_local - prop_C->R)
+ *                - (grid_base + cycle*period + delta_root + slot*6.25 ms)
+ *
+ *   The first bracket is the child's real TX instant, put on the Root's
+ *   clock (our RX instant minus the measured one-way delay); the second is
+ *   the grid instant of that slot.
+ *
+ * WHY THIS IS THE RIGHT NUMBER
+ *   The Tag does NOT use the advertised TX stamp: it compensates every
+ *   beacon with  toa = rx_local - slot * 6.25 ms  in its own clock.  So the
+ *   TDOA bias of anchor k is exactly "how late did anchor k really put its
+ *   preamble on the air, compared to the grid instant the Tag assumes".
+ *   That is the residual above (up to the Tag's own clock error).
+ *
+ * WHAT IS IN IT
+ *   - the child's own placement error (its slot offset, its clock factor,
+ *     its delta_child calibration),
+ *   - the child's TX jitter,
+ *   - the residual of the propagation estimate: the DS-TWR assumes
+ *     prop_R->X ~ prop_X->R, so a per-link TX/RX hardware asymmetry shows up
+ *     here as a constant (the Root's own RX delay is the same on every link,
+ *     so that part is COMMON to all neighbours and cancels in the trend).
+ *   The Root's own delta_root and its own grid placement CANCEL: the child
+ *   anchors itself on the Root's ADVERTISED stamp, which carries the same
+ *   delta_root.
+ *
+ * SIGN: positive = the beacon landed LATE with respect to its grid slot.
+ *
+ * HOW TO READ IT: the interesting signature is the TREND of the residual
+ * across the neighbours against their slot index (the slot index is in the
+ * TABLE line, printed whenever the slot table changes).  A residual that
+ * grows with the slot index is the rate difference times the slot offset
+ * (6.25 ms x 20 ppm = 125 ns = 3.75 m per slot), which is exactly the term
+ * the Tag's slot compensation cannot remove.
+ *
+ * Printed 1 Hz per neighbour:  GR,<rank>,<residual cm>,<cs_count>,<cs_q>.
+ *==========================================================================*/
+static int32_t  s_gr_resid[ANCHOR_MAX_NEIGHBORS];  /* EMA, DTU, Root's clock */
+static uint32_t s_gr_count[ANCHOR_MAX_NEIGHBORS];
+static uint32_t s_gr_last_ms[ANCHOR_MAX_NEIGHBORS];
+static uint8_t  s_gr_valid[ANCHOR_MAX_NEIGHBORS];
+
+/*============================================================================
  * Device TX delay calibration (K_dev)
  *
  * The DW3000 does not put the preamble on the air at the programmed DX_TIME:
@@ -2216,6 +2265,54 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
             }
         }
     }
+
+    /* ── F: the grid residual of this neighbour (Root side) ───────────────
+     * See the comment on s_gr_resid[] above.  Only the Root owns a grid, so
+     * only the Root can compute this. */
+    if (g_anchor.cs_level == 0 && s_root_grid_base != 0 && s_tx_delay_valid
+        && rx_local >= s_root_grid_base
+        && sender_level >= 1 && slot >= 0 && slot < ANCHOR_MAX_NEIGHBORS) {
+        const TwrLinkState *L = &s_twr_link[slot];
+        uint8_t  tslot = find_my_slot(src_rank);
+        uint16_t cyc   = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
+                              | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
+        /* The child's cycle id is in the Root's numbering (the child stamps
+         * root_cycle_id + k), but it is only 16 bit while the Root counts
+         * absolutely — rebuild the absolute cycle from our own.  The beacon
+         * of a child arrives within the same cycle it was sent in (the slot
+         * offset is < one period), so the difference must be 0 (or 1 when the
+         * 16 bit id has just wrapped). */
+        if (L->corr_valid && tslot != 255 && tslot != 0) {
+            uint64_t period = (uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME;
+            uint64_t k_est  = (rx_local - s_root_grid_base) / period;
+            uint32_t dlt    = (uint32_t)((k_est - (uint64_t)cyc) & 0xFFFFu);
+            if (dlt <= 1u) {
+                uint64_t cyc_abs = k_est - dlt;
+                double   f_root  = g_anchor.neighbors[slot].factor;
+                /* corr_dtu is in the CHILD's clock units -> back to ours. */
+                double   p_root  = (double)L->corr_dtu * f_root;
+                uint64_t nominal = s_root_grid_base + cyc_abs * period
+                                 + (uint64_t)s_tx_delay_dtu
+                                 + (uint64_t)tslot * (uint64_t)ANCHOR_SLOT_DTU_US
+                                   * UUS_TO_DWT_TIME;
+                int64_t  resid   = (int64_t)rx_local - (int64_t)p_root
+                                 - (int64_t)nominal;
+                /* Sanity: +-100 m.  Anything beyond that is a broken model,
+                 * not a measurement — dropping it keeps the average sane. */
+                if (resid > -20000000LL && resid < 20000000LL) {
+                    if (s_gr_count[slot] == 0) {
+                        s_gr_resid[slot] = (int32_t)resid;
+                    } else {
+                        s_gr_resid[slot] = (s_gr_resid[slot] * 3
+                                          + (int32_t)resid) / 4;
+                    }
+                    s_gr_count[slot]++;
+                    s_gr_last_ms[slot] = HAL_GetTick();
+                    s_gr_valid[slot]  = 1;
+                }
+            }
+        }
+    }
 }
 
 /*============================================================================
@@ -2779,6 +2876,23 @@ static void anchor_loop(void)
                     (unsigned long)s->dly_fail_count,
                     (unsigned long)s->outlier_count);
                 DBG_PRINT(line);
+
+                /* F: the grid residual of this neighbour (Root side only) —
+                 * how far its beacon really landed from the grid instant the
+                 * Tag assumes.  This is the direct evidence for "is the slot
+                 * order / the rate difference the cause of the centroid
+                 * error?".  The neighbour's slot index is in the TABLE line
+                 * that is printed whenever the slot table changes. */
+                if (s_gr_valid[i]
+                    && (HAL_GetTick() - s_gr_last_ms[i]) < 1000u) {
+                    char gl[80];
+                    sprintf(gl, "GR,%u,%.1f,%lu,%u\r\n",
+                            (unsigned)s->neighbor_rank,
+                            (double)s_gr_resid[i] * CM_PER_DTU_F,
+                            (unsigned long)s->update_count,
+                            (unsigned int)(s->quality * 100.0f));
+                    DBG_PRINT(gl);
+                }
             }
         }
 
