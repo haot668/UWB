@@ -327,10 +327,21 @@ static uint8_t  s_gr_valid[ANCHOR_MAX_NEIGHBORS];
  *     anchor contributes its own δ as a constant TDOA bias (≈ 30 cm per ns).
  *
  * Both disappear once the TX instant is corrected with the calibrated δ.
- * Note that the programmed instant is truncated to the DX_TIME granularity
- * of 256 DTU (4 ns); because the TDMA round (50 ms = 3,194,900,000 DTU) is
- * an exact multiple of 256 DTU, every grid target shares the same truncation
- * offset — so it is a constant and is absorbed by the calibration.
+ *
+ * THE DX_TIME TRUNCATION (this used to be claimed to be a constant — it is
+ * NOT):
+ *   dwt_setdelayedtrxtime() writes device time bits [39:8] only, so the
+ *   programmed instant is FLOORED to a multiple of 256 DTU (4 ns) and the
+ *   beacon leaves up to 255 DTU (1.2 m of path) EARLY.  The old comment
+ *   here said the TDMA round is an exact multiple of 256 DTU so the
+ *   truncation would be a constant absorbed by the calibration.  That is
+ *   false: 50 ms = 3,194,900,000 DTU and 3,194,900,000 mod 256 = 32, so the
+ *   Root's truncation ADVANCES 32 DTU every cycle — a sawtooth with an
+ *   8-cycle period (0.4 s).  For a child the step is
+ *   (period × factor) mod 256, i.e. an arbitrary per-anchor phase.
+ *   The truncation is therefore measured OUT of the calibration sample
+ *   (the sample is taken against the PROGRAMMED instant, not against the
+ *   grid instant) and it is published per frame in tx_err.
  *==========================================================================*/
 #define TX_DELAY_SAMPLES  16u
 #define TX_DELAY_MIN      4u      /* frames needed before the average is used */
@@ -343,6 +354,27 @@ static uint8_t  s_tx_delay_idx   = 0;
 static uint8_t  s_tx_delay_n     = 0;
 static uint32_t s_tx_delay_dtu   = 0;     /* averaged δ in DTU                */
 static uint8_t  s_tx_delay_valid = 0;
+
+/* The instant the chip will really program: the DX_TIME register holds
+ * device time bits [39:8], so the programmed instant is the grid instant
+ * floored to a multiple of 256 DTU.  Everything that reasons about "when
+ * did the beacon really leave" has to use THIS instant, not the grid one. */
+static uint64_t dx_time_programmed(uint64_t scheduled)
+{
+    return scheduled & ~0xFFULL;
+}
+
+/* The truncation of this frame: how much EARLIER than the grid instant the
+ * beacon leaves, because the DX_TIME register cannot express the remainder.
+ *   0        -> the grid instant is a multiple of 256 DTU (no loss)
+ *   -255     -> the grid instant is 1 DTU above a multiple (max loss)
+ * In DTU.  A pure function of the grid instant, so it is known BEFORE the
+ * frame is sent — which is what lets the anchor publish it in the same
+ * frame it applies to. */
+static int32_t dx_time_trunc_err(uint64_t scheduled)
+{
+    return -(int32_t)(scheduled & 0xFFULL);
+}
 
 /* Record one (actual − programmed) TX delay sample and refresh the average. */
 static void tx_delay_note(uint64_t delta_dtu)
@@ -1067,22 +1099,79 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * PRECISE flag: receivers must not use imprecise timestamps for the
      * clock model or for the grid origin. */
     if (scheduled_tx != 0 && s_tx_delay_valid) {
-        /* The advertised TX instant is the programmed instant PLUS the
-         * calibrated device TX delay — that is the instant the preamble
-         * actually reaches the antenna, which is the only instant every
+        /* The advertised TX instant is the instant the preamble actually
+         * reaches the antenna: the PROGRAMMED instant (the grid instant
+         * floored to the DX_TIME granularity of 256 DTU) PLUS the
+         * calibrated device TX delay.  That is the only instant every
          * receiver can compare against (clock model, DS-TWR round trip,
          * Tag's TDOA).  Without the +δ the anchor's own TX latency shows up
-         * as a constant TDOA bias of δ (≈ 30 cm per ns). */
+         * as a constant TDOA bias of δ (≈ 30 cm per ns); without the
+         * truncation correction the stamp is up to 255 DTU (1.2 m of path)
+         * off, because the DX_TIME register simply cannot express the
+         * remainder of the grid instant. */
         pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX],
-                      scheduled_tx + (uint64_t)s_tx_delay_dtu);
+                      dx_time_programmed(scheduled_tx) + (uint64_t)s_tx_delay_dtu);
         pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_TS_PRECISE;
     } else if (scheduled_tx != 0) {
         /* Calibration not yet available (first frames after boot): advertise
          * the programmed instant but do NOT claim it is precise — a δ-biased
          * stamp must not enter the clock model. */
-        pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], scheduled_tx);
+        pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], dx_time_programmed(scheduled_tx));
     } else {
         pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], now_sys_ext());
+    }
+
+    /* ── tx_err: this frame's DEPARTURE ERROR ─────────────────────────────
+     * The instant the beacon leaves the antenna is not the instant the
+     * anchor aimed at:
+     *   • the DX_TIME register can only express multiples of 256 DTU, so
+     *     the programmed instant is the grid instant FLOORED — the beacon
+     *     leaves up to 255 DTU (1.2 m of path) EARLY;
+     *   • the device TX delay δ adds the pipeline latency on top.
+     * The receiver (the Tag) removes both from its TDOA observable, so
+     * they have to be published PER FRAME: the truncation is different for
+     * every frame and for every anchor.
+     *
+     * The Root publishes its δ as well, because the Root does NOT pull its
+     * own grid target back by δ̂ (it schedules straight onto the grid), so
+     * its whole departure error is measured against the grid instant.  A
+     * child DOES pull its target back by δ̂, so its δ cancels inside its
+     * own grid and only the truncation is left to publish.
+     *
+     * The published value is a DEVIATION from the sender's own grid, i.e.
+     * a duration — not an instant — so it carries no clock-domain offset
+     * and can be applied across anchors.  (That is the whole reason a
+     * measured TX stamp cannot be published instead: a raw stamp is in
+     * the sender's clock, whose offset absorbs the Root→child
+     * propagation delay, so two anchors' stamps cannot be differenced.) */
+    if (scheduled_tx != 0 && s_tx_delay_valid) {
+        int32_t tx_err = dx_time_trunc_err(scheduled_tx);
+        if (g_anchor.cs_level == 0) tx_err += (int32_t)s_tx_delay_dtu;
+        if (tx_err >= -32768 && tx_err <= 32767) {
+            uint16_t u = (uint16_t)(int16_t)tx_err;
+            pkt[DL_TS_TX_ERR_IDX]     = (uint8_t)(u & 0xFF);
+            pkt[DL_TS_TX_ERR_IDX + 1] = (uint8_t)(u >> 8);
+            pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_ERR_VALID;
+        } else {
+            /* The value does not fit into an int16 (an int16 of DTU spans
+             * only ±513 ns).  Publish nothing rather than a wrapped value:
+             * the receiver then keeps the uncorrected frame, which is no
+             * worse than before.  Report it once — it means the measured
+             * device TX delay is far outside its expected range. */
+            static uint8_t s_warned;
+            if (!s_warned) {
+                s_warned = 1;
+                char dbg[64];
+                sprintf(dbg, "TX_ERR overflow %ld dtu\r\n", (long)tx_err);
+                DBG_PRINT(dbg);
+            }
+        }
+    }
+    if (scheduled_tx == 0) {
+        /* Immediate frame (bootstrap / ALOHA): it does not go out on the
+         * grid at all, so there is no grid departure error to publish —
+         * and the receiver must not pair it into the TDOA. */
+        pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_OFFGRID;
     }
     /* P0-1: cs_level and slot are two DIFFERENT bytes now.  They used to
      * share byte 18, so writing the slot destroyed the level and every
@@ -1237,9 +1326,22 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         if (jitter_dtu > jitter_dly_max) jitter_dly_max = jitter_dtu;
         if (ret != DWT_SUCCESS) {
             /* Fallback to immediate — the cycle is lost, but the NEXT cycle
-             * still uses the grid (the grid itself is not affected). */
+             * still uses the grid (the grid itself is not affected).
+             *
+             * The frame now goes out OFF-GRID, so everything it says about
+             * its own TX instant is wrong: the advertised stamp, the
+             * departure error and the "precise" claim.  The frame has NOT
+             * been transmitted yet, so it can still be rewritten in the TX
+             * buffer — do that, otherwise the receiver would apply a
+             * departure error that belongs to a frame that never happened
+             * and would poison its average. */
             jitter_fallback_cnt++;
             tx_dly_fail = 1;
+            pkt[DL_TS_FLAGS_IDX] &= (uint8_t)~(DL_TS_FLAG_TX_ERR_VALID
+                                              | DL_TS_FLAG_TX_TS_PRECISE);
+            pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_OFFGRID;
+            pack_40bit_ts(&pkt[DL_TS_TX_TS_IDX], now_sys_ext());
+            dwt_writetxdata(DL_TIMESYNC_LEN, pkt, 0);
             dwt_starttx(DWT_START_TX_IMMEDIATE);
         }
     }
@@ -1297,9 +1399,17 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * would then be ~2^40/TX_DELAY_SAMPLES and every advertised TX stamp
      * would be nonsense.  A real device TX delay is a few hundred ns
      * (< 100 000 DTU), so anything above that is an anomaly, not a delay. */
-    if (scheduled_tx != 0 && ts_raw > scheduled_tx
-        && (ts_raw - scheduled_tx) < TX_DELAY_MAX_DTU) {
-        tx_delay_note(ts_raw - scheduled_tx);
+    if (scheduled_tx != 0) {
+        /* The sample is taken against the PROGRAMMED instant, NOT against
+         * the grid instant: the DX_TIME truncation is not part of the
+         * device TX delay.  Letting it into the average would bias δ by
+         * up to ±128 DTU (a different, arbitrary value for every anchor,
+         * because the truncation step of a child is an arbitrary phase)
+         * and every grid placement derived from δ̂ would inherit it. */
+        uint64_t prog = dx_time_programmed(scheduled_tx);
+        if (ts_raw > prog && (ts_raw - prog) < TX_DELAY_MAX_DTU) {
+            tx_delay_note(ts_raw - prog);
+        }
     }
 
     /* Root side: remember the ACTUAL TX instant of this cycle — the DS-TWR
@@ -1311,14 +1421,20 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         s_root_tx_idx = (uint8_t)((s_root_tx_idx + 1u) % ROOT_TX_HIST);
     }
 
-    /* Grid accuracy check: how far did the ACTUAL TX instant land from the
-     * programmed grid instant?  A CONSTANT offset is common-mode — every
-     * anchor has it, so it cancels in the TDOA difference.  A varying one is
-     * per-anchor and does not cancel, so the spread is what matters. */
+    /* Grid accuracy check: the two parts of the departure error.
+     *   delay = actual departure − PROGRAMMED instant  (must be stable:
+     *          δ̂ is what the grid placement is built on)
+     *   trunc = the DX_TIME truncation of THIS frame (published per frame
+     *          in tx_err, so it does not have to be small — but it does
+     *          have to be exactly predictable, and it is)
+     * A CONSTANT offset is common-mode — every anchor has it, so it
+     * cancels in the TDOA difference.  A varying one is per-anchor and
+     * does not cancel, so the spread is what matters. */
     if (scheduled_tx != 0) {
         static int64_t s_tx_min, s_tx_max;
         static uint32_t s_tx_n;
-        int64_t d = (int64_t)(ts_raw - scheduled_tx);
+        int64_t d = (int64_t)(ts_raw - dx_time_programmed(scheduled_tx));
+        int32_t tr = dx_time_trunc_err(scheduled_tx);
         /* A difference of a whole epoch (2^40) is not a grid error — it is
          * a wrap, and it would poison the min/max statistics for good. */
         if (d >= 0 && (uint64_t)d < TX_DELAY_MAX_DTU) {
@@ -1327,9 +1443,10 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
             s_tx_n++;
         }
         if ((s_tx_n % 25) == 0 && s_tx_n > 0) {
-            char dbg[72];
-            sprintf(dbg, "TX_GRID err=%ld dtu (%.2f cm) spread=%ld dtu\r\n",
-                    (long)d, (double)d * CM_PER_DTU_F, (long)(s_tx_max - s_tx_min));
+            char dbg[128];
+            sprintf(dbg, "TX_GRID delay=%ld dtu (%.2f cm) spread=%ld dtu trunc=%ld dtu\r\n",
+                    (long)d, (double)d * CM_PER_DTU_F,
+                    (long)(s_tx_max - s_tx_min), (long)tr);
             DBG_PRINT(dbg);
         }
     }
@@ -1811,6 +1928,27 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     uint8_t  ts_flags   = rx_buf[DL_TS_FLAGS_IDX];
     bool     ts_precise = (ts_flags & DL_TS_FLAG_TX_TS_PRECISE) ? true : false;
 
+    /* The sender's departure error for THIS frame: how much earlier than
+     * the grid instant it aimed at its beacon really left the antenna
+     * (the DX_TIME truncation) plus its device TX delay.  It is a
+     * DEVIATION, not an instant, so it can be applied across anchors.
+     * Only the new 67-byte frame carries it, and only when the sender
+     * says the value is usable. */
+    int32_t ts_tx_err = 0;
+    bool    ts_tx_err_valid = false;
+    if (frame_len >= DL_TIMESYNC_LEN
+        && (ts_flags & DL_TS_FLAG_TX_ERR_VALID)) {
+        ts_tx_err = (int32_t)(int16_t)((uint16_t)rx_buf[DL_TS_TX_ERR_IDX]
+                        | ((uint16_t)rx_buf[DL_TS_TX_ERR_IDX + 1] << 8));
+        ts_tx_err_valid = true;
+    }
+    /* The frame did not go out on the grid (immediate/ALOHA frame, or the
+     * delayed TX failed and fell back to immediate).  Such a frame never
+     * carries the PRECISE flag — its advertised TX stamp is an estimate —
+     * so the clock model and the DS-TWR already skip it (see the
+     * "!ts_precise" bail-out below).  The flag exists for the TAG, which
+     * would otherwise pair an off-grid frame into its TDOA average. */
+
     /* Update / allocate Kalman slot */
     int prev_slot = find_neighbor_slot_by_rank(src_rank);
     int slot = (prev_slot >= 0) ? prev_slot : find_or_alloc_neighbor_slot(src_rank);
@@ -2032,16 +2170,34 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
             uint64_t corr = (uint64_t)s_twr_corr_dtu;
             if (corr < g_tdma_ref.base_origin) g_tdma_ref.base_origin -= corr;
         }
+        /* Take the ROOT's own departure error off.
+         *
+         * rx_local − corr is the instant the Root's beacon left the
+         * ANTENNA.  The grid we want to sit on, though, is the instant
+         * the Root PROGRAMMED: its antenna departure is late by the
+         * device delay δ_root and early by the DX_TIME truncation of that
+         * frame.  The Root publishes both in tx_err, so we can take them
+         * off and land exactly on the Root's grid.
+         *
+         * Without this the child inherits the Root's truncation, which
+         * advances 32 DTU every cycle (a sawtooth with an 8-cycle period,
+         * i.e. ±128 DTU = ±60 cm) into every TDOA the child takes part
+         * in — the very error the new tx_err field exists to remove. */
+        if (ts_tx_err_valid) {
+            int64_t bo = (int64_t)g_tdma_ref.base_origin - (int64_t)ts_tx_err;
+            if (bo > 0) g_tdma_ref.base_origin = (uint64_t)bo;
+        }
         /* Subtract our OWN device TX delay as well.
          *
-         * The grid instant is the instant the Root's beacon left the
-         * antenna; our own beacon has to leave the antenna at the SAME
-         * instant, otherwise every anchor is late by its own δ (≈ 30 cm per
-         * ns) and that bias lands straight in the Tag's TDOA.  Our
-         * programmed instant is δ_child earlier than the antenna instant,
-         * so the programmed instant has to be pulled back by δ_child —
-         * the advertised TX stamp then adds δ̂_child back and lands on the
-         * Root's antenna instant (up to the calibration residual). */
+         * The grid instant is the instant the Root PROGRAMMED its beacon
+         * (see the tx_err removal above); our own beacon has to leave the
+         * antenna at that same instant, otherwise every anchor is late by
+         * its own δ (≈ 30 cm per ns) and that bias lands straight in the
+         * Tag's TDOA.  Our programmed instant is δ_child earlier than the
+         * antenna instant, so the programmed instant has to be pulled back
+         * by δ̂_child — the advertised TX stamp then adds δ̂_child back and
+         * lands on the Root's grid instant (up to the calibration
+         * residual). */
         if (s_tx_delay_valid) {
             uint64_t dtx = (uint64_t)s_tx_delay_dtu;
             if (dtx < g_tdma_ref.base_origin) g_tdma_ref.base_origin -= dtx;
