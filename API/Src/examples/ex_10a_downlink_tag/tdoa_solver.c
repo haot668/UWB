@@ -1,3 +1,15 @@
+/*! ============================================================================
+ *  [陈旧副本，勿改]  STALE COPY - DO NOT EDIT
+ *
+ *  本文件是 UWB_V0.0.1 早期版本的一份拷贝，与现行实现已相差数千行。
+ *
+ *  现行代码：shared/downlink/tdoa_solver.c
+ *  真正被编译的是 uwb_anchor / uwb_gateway / uwb_tag 三个 Keil 工程里的
+ *  shared/ 现行版本。本目录不被任何 Keil 工程引用（孤儿副本），删掉也不
+ *  影响构建——保留只是为了留个出处，先在此标注。
+ *
+ *  规则：改代码请改 shared/downlink/tdoa_solver.c，不要改这里。
+ * ==========================================================================*/
 /*! ----------------------------------------------------------------------------
  * @file    tdoa_solver.c
  * @brief   TDOA multilateration solver — Gauss-Newton iterative least squares

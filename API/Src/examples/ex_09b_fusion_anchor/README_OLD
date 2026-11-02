@@ -1,0 +1,29 @@
+README_OLD — 陈旧副本，勿改
+============================================================
+
+本目录下的 fusion_anchor.c / gateway_cmd.c 是 UWB_V0.0.1 **早期版本**的拷贝，
+不是现行实现（与现行版本相差数千行），文件头已加横幅标注。
+
+现行代码
+------------------------------------------------------------
+    基站    shared/fusion_anchor/fusion_anchor.c
+    网关    uwb_gateway/Src/gateway_cmd.c
+
+真正被编译的是这三个 Keil 工程里 shared/ 下的现行版本：
+
+    uwb_anchor/DWS3000_Anchor_Master.uvprojx
+        ..\shared\fusion_anchor\fusion_anchor.c
+    uwb_gateway/DWS3000_Gateway.uvprojx
+        ..\shared\fusion_anchor\fusion_anchor.c
+        .\Src\gateway_cmd.c
+
+为什么还留着
+------------------------------------------------------------
+只有 DECAWAVE 原厂示例工程 API/DWS3000_STM32L412.uvprojx 还在引用本目录的
+这两个文件，而那个 uvprojx 又是 _gen_projects.py 的**生成模板**——uwb_anchor /
+uwb_gateway / uwb_tag 三个真实工程都由它生成。删掉文件会连带打断工程生成，
+所以保留文件，只在这里和源码头标注"陈旧副本"。
+
+规则
+------------------------------------------------------------
+改代码请改 shared/ 下的现行文件，不要改这里。

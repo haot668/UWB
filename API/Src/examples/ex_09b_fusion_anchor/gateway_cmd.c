@@ -1,3 +1,16 @@
+/*! ============================================================================
+ *  [陈旧副本，勿改]  STALE COPY - DO NOT EDIT
+ *
+ *  本文件是 UWB_V0.0.1 早期版本的一份拷贝，与现行实现已相差数千行。
+ *
+ *  现行代码：uwb_gateway/Src/gateway_cmd.c
+ *  真正被编译的是 uwb_anchor / uwb_gateway / uwb_tag 三个 Keil 工程里的
+ *  shared/ 现行版本。本文件只被 DECAWAVE 原厂示例工程
+ *  API/DWS3000_STM32L412.uvprojx 引用，而那个 uvprojx 又是 _gen_projects.py
+ *  的生成模板（三个真实工程由它生成），所以文件保留，只在此标注。
+ *
+ *  规则：改代码请改 uwb_gateway/Src/gateway_cmd.c，不要改这里。
+ * ==========================================================================*/
 /*! ----------------------------------------------------------------------------
  * @file    gateway_cmd.c
  * @brief   Gateway AT command handler — UART RX ring buffer + command dispatch
