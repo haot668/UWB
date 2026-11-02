@@ -189,7 +189,7 @@ extern "C" {
 #define DL_SCAN_TIMEOUT_MS          5000u  /* 5-second scan period on boot          */
 
 /*============================================================================
- * TimeSync frame layout (63 bytes total, including the 10-byte header)
+ * TimeSync frame layout (65 bytes total, including the 10-byte header)
  *   [0-1]   frame_ctrl       (0x41, 0x88)
  *   [2]     seq8
  *   [3-4]   pan_id           (0xCA, 0xDE)
@@ -209,8 +209,27 @@ extern "C" {
  *   [56-60] rx_ref_ts40      (40-bit, RX instant of the frame this
  *                             beacon used as its clock reference) <-- DS-TWR
  *   [61-62] rx_ref_cycle     (uint16, cycle id of that frame)     <-- DS-TWR
- * DW3000 appends 2-byte CRC automatically; we still pad 2 bytes
- * before CRC zone to absorb DW3210 RX last-2-byte corruption.
+ *   [63-64] tail pad 0xCC 0xDD — the absorber for the DW3210 RX
+ *                             last-2-byte corruption.  It has to be
+ *                             exactly at the END of the frame: a
+ *                             DW3210 receiver corrupts the LAST two
+ *                             bytes of a frame it reads back over
+ *                             SPI, so the absorber has to be the last
+ *                             thing in the frame.  DW3000/DW3210 append
+ *                             its own 2-byte CRC after the frame; that
+ *                             CRC is not part of the frame.
+ *
+ * WHY THE FRAME USED TO BE 63 BYTES (a real bug, fixed):
+ *   The frame was 63 bytes and [61-62] carried rx_ref_cycle — live data
+ *   in exactly the corrupted tail.  The Root reads those two bytes to
+ *   close the DS-TWR round trip, so the Root's DS-TWR never completed
+ *   (the cycle-id delta check rejected the garbage), corr_valid stayed
+ *   0, no path correction was ever unicasted, and every child anchor
+ *   kept its Root->child propagation delay as a constant offset in its
+ *   grid placement — a per-anchor bias of tens of metres in the Tag's
+ *   TDOA, which collapses the solution towards the centroid.
+ *   Note the pad at [50-51] does NOT protect anything: the corruption is
+ *   at the end of the frame, not 12 bytes before it.
  *
  * P0-1: cs_level and slot used to share byte 18 — writing the slot
  *       overwrote the level, so every frame looked like level == slot.
@@ -247,7 +266,18 @@ extern "C" {
  *       correction back (FUNC_TWR_CORR), so the child can place its own
  *       beacon exactly on the Root's grid.
  *============================================================================*/
-#define DL_TIMESYNC_LEN            63u
+#define DL_TIMESYNC_LEN            65u
+/* The SHORTEST beacon a receiver still accepts.  A beacon sent by an old
+ * firmware (63 bytes, no tail pad) is still parsed — it just has a
+ * corrupted rx_ref_cycle, so the DS-TWR drops that link and everything
+ * else keeps working.  That way a half-flashed network degrades instead
+ * of going dark.  All frame_len checks are LOWER bounds and use this,
+ * never DL_TIMESYNC_LEN. */
+#define DL_TIMESYNC_MIN_LEN        63u
+#define DL_TS_TAIL_PAD_IDX         63u    /* 2 pad bytes 0xCC 0xDD — the DW3210
+                                           * corrupts the LAST two bytes of an
+                                           * SPI read, so the absorber has to
+                                           * be the last thing in the frame. */
 #define DL_TS_TX_TS_IDX           10u    /* 5-byte TX timestamp (lower 40 bits)    */
 #define DL_TS_FLAGS_IDX           15u    /* bit0 = TX_TS_PRECISE                    */
 #define DL_TS_SLOT_IDX            18u    /* own TDMA slot (255 = unassigned)        */

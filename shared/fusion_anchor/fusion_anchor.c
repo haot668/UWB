@@ -3,7 +3,7 @@
  *  @brief   BD8NCF-style per-anchor TimeSync broadcaster (Phase 1.1)
  *
  *  Every anchor runs the same firmware.  Each anchor:
- *    - Broadcasts one compact 63-byte TimeSync frame per TDMA round (50 ms
+ *    - Broadcasts one compact 65-byte TimeSync frame per TDMA round (50 ms
  *      → 20 frames/s) at its own slot instant, carrying the exact TX
  *      timestamp, cs_level, parent_EUI64, position.
  *    - Listens between broadcasts for other anchors' TimeSync frames and
@@ -1114,7 +1114,10 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pkt[DL_TS_COORD_IDX + 3] = (uint8_t)(y >> 8);
     pkt[DL_TS_COORD_IDX + 4] = (uint8_t)(z & 0xFF);
     pkt[DL_TS_COORD_IDX + 5] = (uint8_t)(z >> 8);
-    pkt[DL_TS_COORD_IDX + 6] = 0xCC;  /* DW3210 RX pad */
+    /* Legacy filler at [50-51].  It does NOT absorb anything: the DW3210
+     * corrupts the LAST two bytes of the frame, which are now the
+     * 0xCC 0xDD tail pad at [63-64]. */
+    pkt[DL_TS_COORD_IDX + 6] = 0xCC;
     pkt[DL_TS_COORD_IDX + 7] = 0xDD;
 
     /* P0-4: TDMA cycle counter.  The Tag only pairs beacons that carry the
@@ -1136,6 +1139,15 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pack_40bit_ts(&pkt[DL_TS_RX_REF_TS_IDX], s_ref_rx_ts);
     pkt[DL_TS_RX_REF_CYCLE_IDX]     = (uint8_t)(s_ref_cycle & 0xFF);
     pkt[DL_TS_RX_REF_CYCLE_IDX + 1] = (uint8_t)(s_ref_cycle >> 8);
+
+    /* The tail pad — the LAST two bytes of a frame read back over SPI are
+     * corrupted by the DW3210 (see downlink_protocol.h), so the absorber
+     * has to be exactly there.  That is why rx_ref_cycle stays at [61-62]
+     * and the frame is 65 bytes long: with the old 63-byte frame the
+     * cycle id itself was the corrupted pair and the Root's DS-TWR could
+     * never close. */
+    pkt[DL_TS_TAIL_PAD_IDX]     = 0xCC;
+    pkt[DL_TS_TAIL_PAD_IDX + 1] = 0xDD;
 
     /* P1-1: presence bitmap over the participant roster.  Only the Root
      * fills it in: bit N is set when the Root has heard participant N.
@@ -1775,7 +1787,10 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * stamps) — after the first wrap every such comparison is wrong. */
     uint64_t rx_local = rx_ts_ext();
 
-    if (frame_len < DL_TIMESYNC_LEN) return;
+    /* Lower bound, so a beacon from an old (63-byte) firmware is still
+     * accepted — its rx_ref_cycle is simply garbage and the DS-TWR drops
+     * that link. */
+    if (frame_len < DL_TIMESYNC_MIN_LEN) return;
 
     uint16_t src_rank = (uint16_t)rx_buf[7] | ((uint16_t)rx_buf[8] << 8);
     uint8_t func = rx_buf[9];
@@ -2425,7 +2440,7 @@ static void anchor_process_rx(uint8_t *rx_buf, uint32_t frame_len)
     }
 
     /* NETWORK_START from Gateway (rank 0) — variable length (roster), bypass
-     * anchor_rx_timesync() length check (DL_TIMESYNC_LEN). */
+     * anchor_rx_timesync() length check (DL_TIMESYNC_MIN_LEN). */
     if (func == FUNC_NETWORK_START && src == GW_MASTER_ADDR) {
         anchor_handle_network_start(rx_buf, frame_len);
         anchor_send_network_ack();

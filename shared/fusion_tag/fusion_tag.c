@@ -967,7 +967,9 @@ static uint64_t tag_rx_ts_ext(void)
 
 static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_ts)
 {
-    if (frame_len < DL_TIMESYNC_LEN) return;
+    /* Lower bound, not the exact length: a beacon from an old (63-byte)
+     * firmware is still accepted.  The Tag never reads the tail pad. */
+    if (frame_len < DL_TIMESYNC_MIN_LEN) return;
 
     uint16_t src_rank = (uint16_t)rx_buf[7] | ((uint16_t)rx_buf[8] << 8);
     if (src_rank == 0) return;
@@ -1504,7 +1506,7 @@ int fusion_tag(void)
                  * origin.  The tag reports its position in the guard time
                  * that follows it — the one interval of the round in which
                  * no anchor is transmitting, whatever the anchor count is. */
-                if (frame_len >= DL_TIMESYNC_LEN
+                if (frame_len >= DL_TIMESYNC_MIN_LEN
                     && rx_buf[DL_TS_SLOT_IDX] == 0
                     && rx_buf[DL_TS_LEVEL_IDX] == 0) {
                     tag_tx_pos_report(rx_hw_ts);
