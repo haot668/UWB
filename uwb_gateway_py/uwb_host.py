@@ -135,6 +135,13 @@ class State:
         #   DEGRADED — the network was running and a member dropped out
         self.net_phase: str = NET_PHASE_IDLE
         self.net_dropped_ranks: set[int] = set()
+        # The gateway's own count of the roster members that are really ON
+        # THE GRID (+NETGRID).  It hears every beacon, so it is the
+        # authority on "the network is formed" — the ACK count only says
+        # that an anchor HEARD the broadcast.
+        self.net_grid_up: int | None = None
+        self.net_grid_total: int | None = None
+        self.net_up_count: int = -1
         self._net_recheck_id = None       # the 2 s re-check timer
         self._net_settle_at = 0.0         # when the anchors had their chance
         self._net_warned = False          # the "still missing" popup was shown
@@ -229,6 +236,8 @@ def parse_line(line: str):
         handle_rankcoll(parts)
     elif head == "+DEVTYPE" and len(parts) >= 4:
         handle_devtype(parts)
+    elif head == "+NETGRID" and len(parts) >= 3:
+        handle_netgrid(parts)
     elif head == "+POS" and len(parts) >= 6:
         handle_pos(parts)
     elif head == "+COORDAck" and len(parts) >= 5:
@@ -367,8 +376,14 @@ def parse_line(line: str):
             set_status(f"组网启动成功 → {ack_count} 个基站响应 (Root=R{root_rank})", "success")
             S.net_missing_ranks = set()
         if hasattr(S, "_netstart_btn") and S._netstart_btn:
-            S._netstart_btn.config(text="✓ 组网成功", state="disabled", bg=C["green"])
-            S._netstart_btn = None
+            # NOT "✓ 组网成功".  The ACK count says only that an anchor
+            # HEARD the broadcast — the anchor still needs up to 3 s to get
+            # its slot confirmed by the Root, and the roster may be missing
+            # members altogether.  The button follows the derived phase and
+            # only turns green when every roster member is really on the
+            # grid (see _net_btn_update and _net_recheck).
+            S._netstart_btn.config(text="⏳ 组网中...", state="normal",
+                                   bg="#e6a800", fg="#1f2328")
         # P1-3/P1-5: the anchor-side timing is much slower than the
         # gateway's broadcast (de-bounce 800 ms, ALOHA 500 ms, slot
         # confirmation up to 3 s).  The optimistic ACK count is therefore
@@ -622,6 +637,38 @@ def set_net_phase(phase, dropped=None):
     S._net_label.config(text=txt, fg=fg)
 
 
+def _net_btn_update(phase, up, total):
+    """The network button follows the DERIVED phase, never the ACK count.
+
+    The old code set the button to "✓ 组网成功" as soon as the gateway
+    answered the NETSTART, and only an error put it back.  The ACK count
+    says "this anchor heard the broadcast" — nothing more: the anchor
+    still needs up to 3 s to get its slot confirmed by the Root, and the
+    roster may be missing members altogether.  With an incomplete roster
+    the button showed a green "组网成功" over a network that was not
+    complete, and nothing on the screen explained the difference.
+
+    So the button shows what is actually known:
+      组网中 n/m   — n of the m roster members are on the grid
+      ✓ 组网成功   — every member is on the grid
+      ⚠ 降级运行   — the network was up and a member dropped out
+    """
+    btn = getattr(S, "_netstart_btn", None)
+    if not btn:
+        return
+    try:
+        if phase == NET_PHASE_RUNNING:
+            btn.config(text="✓ 组网成功", state="disabled", bg=C["green"])
+        elif phase == NET_PHASE_DEGRADED:
+            btn.config(text="⚠ 降级运行", state="normal",
+                       bg="#e6a800", fg="#1f2328")
+        else:
+            btn.config(text=f"⏳ 组网中 {up}/{total}", state="normal",
+                       bg="#e6a800", fg="#1f2328")
+    except Exception:
+        pass
+
+
 def _net_recheck():
     """P1-5: look at the network again, every 2 s.
 
@@ -643,11 +690,14 @@ def _net_recheck():
     phase = net_phase()
     prev = getattr(S, "net_phase", NET_PHASE_IDLE)
     dropped = [r for r in roster if not _anchor_running(r)]
+    up = len(roster) - len(dropped)
 
     changed = (phase != prev
-               or set(dropped) != set(getattr(S, "net_dropped_ranks", set())))
+               or set(dropped) != set(getattr(S, "net_dropped_ranks", set()))
+               or up != getattr(S, "net_up_count", -1))
     S.net_phase = phase
     S.net_dropped_ranks = set(dropped)
+    S.net_up_count = up
     # The map and the device card show the alarm through this flag.
     for r in roster:
         d = S.devices.get(f"{r:04X}")
@@ -660,15 +710,32 @@ def _net_recheck():
         S._dirty = True
 
     set_net_phase(phase, dropped)
+    # The gateway's own count of the members that are ON THE GRID is the
+    # authority (it hears every beacon of the grid); the host's own
+    # derivation is only used until the gateway has reported one.
+    g_up = getattr(S, "net_grid_up", None)
+    g_total = getattr(S, "net_grid_total", None)
+    if g_total == len(roster):
+        disp_up, disp_total = g_up, g_total
+    else:
+        disp_up, disp_total = up, len(roster)
+    # The button follows the phase — never the ACK count (see
+    # _net_btn_update).
+    _net_btn_update(phase, disp_up, disp_total)
 
-    if phase != prev:
+    if phase != prev or (phase == NET_PHASE_STARTING and changed):
         if phase == NET_PHASE_RUNNING:
             set_status(f"● 网络运行中 — {len(roster)} 个基站在时隙表上", "success")
         elif phase == NET_PHASE_DEGRADED:
             txt = ", ".join(f"R{r}" for r in sorted(dropped))
             set_status(f"⚠ 网络降级 — {txt} 掉线，已退出 TDOA 解算", "error")
         elif phase == NET_PHASE_STARTING:
-            set_status("◐ 网络组网中 — 等待全部基站进入运行状态", "info")
+            if dropped:
+                txt = ", ".join(f"R{r}" for r in sorted(dropped))
+                set_status(f"◐ 网络组网中 — {disp_up}/{disp_total} 已上槽，"
+                           f"待就绪: {txt}", "info")
+            else:
+                set_status(f"◐ 网络组网中 — {disp_up}/{disp_total} 已上槽", "info")
         else:
             set_status("网络已停止", "info")
 
@@ -707,7 +774,17 @@ def _net_recheck_stop():
         S._net_recheck_id = None
     S.net_phase = NET_PHASE_IDLE
     S.net_dropped_ranks = set()
+    S.net_up_count = -1
+    S.net_grid_up = None
+    S.net_grid_total = None
     set_net_phase(NET_PHASE_IDLE)
+    # The network is gone — the button must be usable again.
+    if getattr(S, "_netstart_btn", None):
+        try:
+            S._netstart_btn.config(text="开始组网", state="normal", bg=C["card"])
+        except Exception:
+            pass
+        S._netstart_btn = None
 
 
 def net_running():
@@ -837,6 +914,39 @@ def handle_devtype(parts):
     d["id_conflict"] = d.get("id_conflict", 0) + 1
     set_status(f"⚠ ID 冲突：{uid} 同时被识别为{old_n}和{new_n}", "warning")
     S._dirty = True; refresh_lists()
+
+def handle_netgrid(parts):
+    """+NETGRID,<on_grid>,<total>[,<rank>...] — the roster members that are
+    really on the grid.
+
+    The gateway hears every beacon of the grid, so it can tell a member
+    that has a slot from one that merely HEARD the network start.  That
+    distinction is the whole point: the ACK count says "the broadcast
+    arrived", the grid count says "the member is scheduled", and only the
+    second one may be called a formed network.
+
+    The ranks that are on the grid are appended, so the host learns the
+    states of the members even when it connected after the network was
+    formed (the gateway only sends +NETSTATE when a state CHANGES).
+    """
+    try:
+        up = int(parts[1].strip())
+        total = int(parts[2].strip())
+    except (ValueError, IndexError):
+        return
+    S.net_grid_up = up
+    S.net_grid_total = total
+    for p in parts[3:]:
+        p = p.strip()
+        if not p.isdigit():
+            continue
+        r = int(p)
+        uid = f"{r:04X}"
+        d = S.devices.get(uid)
+        if d is not None and d.get("type") == "ANCHOR":
+            if d.get("net_state") != 3:
+                d["net_state"] = 3
+                S._dirty = True
 
 def handle_seen(parts):
     """A device the gateway has sighted ONCE (the gateway needs 2 sightings
@@ -2557,6 +2667,8 @@ def build_settings():
             S.net_roster = list(roster)
             S.net_root_rank = root_rank
             S.net_missing_ranks = set()
+            S.net_grid_up = 0
+            S.net_grid_total = len(roster)
             S.net_phase = NET_PHASE_STARTING
             _net_recheck_start()
             set_net_phase(NET_PHASE_STARTING)

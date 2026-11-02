@@ -284,6 +284,29 @@ static uint16_t gw_net_root = 0;
 static uint16_t gw_net_present = 0;
 static int      gw_net_present_valid = 0;
 
+/* The roster members that are really ON THE GRID, as a bitmap over the
+ * roster order (bit N = roster[N]).
+ *
+ * "On the grid" means: the anchor's own beacon says it has a slot
+ * (slot != 255) or that it IS the Root (level 0).  That is the only
+ * honest criterion -- the slot in the NETWORK_ACK is a BOOTSTRAP estimate
+ * that the anchor computes from the rank distance, and it is reported
+ * before the Root has confirmed the anchor, so it cannot be used to claim
+ * that the network is formed.
+ *
+ * The gateway hears every beacon of the grid, so it knows this without
+ * any extra uplink.  The count is reported to the host as +NETGRID. */
+static uint16_t gw_net_on_grid = 0;
+
+/* The index of a rank in the roster, or -1. */
+static int gw_net_roster_index(uint16_t rank)
+{
+    int i;
+    for (i = 0; i < gw_net_roster_n; i++)
+        if (gw_net_roster[i] == rank) return i;
+    return -1;
+}
+
 /* Find a device by its uid string.  Returns NULL if it is not known. */
 static gw_dev_t *gw_find_dev(const char *uid)
 {
@@ -335,7 +358,7 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
                     sout[sp++]= gw_devs[i].type;
                     sout[sp++]=',';
                     sout[sp++]= new_type;
-                    sout[sp]=' ';
+                    sout[sp]='\0';
                     test_run_info((unsigned char *)sout);
                 }
                 gw_devs[i].type = new_type;
@@ -1058,6 +1081,54 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
                 sout[sp++] = (char)('0' + st);
                 sout[sp]='\0';
                 test_run_info((unsigned char *)sout);
+            }
+        }
+
+        /* The roster members that are really ON THE GRID.
+         *
+         * The gateway hears every beacon of the grid, so it knows this
+         * without any extra uplink.  The criterion is the anchor's own
+         * beacon: it has a slot (slot != 255) or it IS the Root
+         * (level 0).
+         *
+         * The slot in the NETWORK_ACK would NOT do: the anchor computes a
+         * BOOTSTRAP slot from the rank distance and reports it before the
+         * Root has confirmed it, so an ACK count says "this anchor heard
+         * the broadcast" and nothing more.  Claiming the network is formed
+         * on that basis is exactly the bug this count exists to prevent.
+         *
+         * The line is +NETGRID,<on_grid>,<total>[,<rank>...] and is sent
+         * only when the count changes. */
+        if (gw_net_roster_n > 0 && len >= (uint16_t)(DL_TS_SLOT_IDX + 1)) {
+            int idx = gw_net_roster_index(src_addr);
+            if (idx >= 0) {
+                uint8_t lv = frame[DL_TS_LEVEL_IDX];
+                uint8_t sl = frame[DL_TS_SLOT_IDX];
+                int on  = (lv == 0 || sl != 255u);
+                uint16_t bit = (uint16_t)(1u << idx);
+                int was = (gw_net_on_grid & bit) ? 1 : 0;
+                if (was != on) {
+                    char gout[80];
+                    int gp = 0, k, up = 0;
+                    if (on) gw_net_on_grid |= bit;
+                    else    gw_net_on_grid &= (uint16_t)(~bit);
+                    for (k = 0; k < gw_net_roster_n; k++)
+                        if (gw_net_on_grid & (uint16_t)(1u << k)) up++;
+                    gout[gp++]='+'; gout[gp++]='N'; gout[gp++]='E'; gout[gp++]='T';
+                    gout[gp++]='G'; gout[gp++]='R'; gout[gp++]='I'; gout[gp++]='D';
+                    gout[gp++]=',';
+                    gp += fmt_dec(&gout[gp], up);
+                    gout[gp++]=',';
+                    gp += fmt_dec(&gout[gp], gw_net_roster_n);
+                    for (k = 0; k < gw_net_roster_n; k++) {
+                        if (gw_net_on_grid & (uint16_t)(1u << k)) {
+                            gout[gp++]=',';
+                            gp += fmt_dec(&gout[gp], (int)gw_net_roster[k]);
+                        }
+                    }
+                    gout[gp++]='\r'; gout[gp++]='\n'; gout[gp]='\0';
+                    test_run_info((unsigned char *)gout);
+                }
             }
         }
 
@@ -2631,6 +2702,9 @@ void gateway_poll_uart(void)
             gw_net_roster_n = roster_n;
             gw_net_root = (uint16_t)root_rank;
             gw_net_present_valid = 0;
+            /* A fresh network starts with nobody on the grid.  The bitmap
+             * is filled from the beacons that follow. */
+            gw_net_on_grid = 0;
 
             /* Build NETWORK_START payload:
              * [0-1] root_rank (uint16 LE)
@@ -2776,6 +2850,26 @@ void gateway_poll_uart(void)
                     out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
                 }
                 test_run_info((unsigned char *)out);
+                /* The grid state right now.  The ACK count above says who
+                 * HEARD the broadcast; this says who is actually ON THE
+                 * GRID.  Right after the burst that is normally nobody --
+                 * the anchors still have to get their slot confirmed by
+                 * the Root -- and the host must not read that as a formed
+                 * network.  The line is repeated whenever the count
+                 * changes (from the beacons). */
+                {
+                    char g0[32]; int gp = 0, k, up = 0;
+                    for (k = 0; k < gw_net_roster_n; k++)
+                        if (gw_net_on_grid & (uint16_t)(1u << k)) up++;
+                    g0[gp++]='+'; g0[gp++]='N'; g0[gp++]='E'; g0[gp++]='T';
+                    g0[gp++]='G'; g0[gp++]='R'; g0[gp++]='I'; g0[gp++]='D';
+                    g0[gp++]=',';
+                    gp += fmt_dec(&g0[gp], up);
+                    g0[gp++]=',';
+                    gp += fmt_dec(&g0[gp], gw_net_roster_n);
+                    g0[gp++]='\r'; g0[gp++]='\n'; g0[gp]='\0';
+                    test_run_info((unsigned char *)g0);
+                }
             }
             gateway_rx_flush();
         }
