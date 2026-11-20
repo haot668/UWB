@@ -217,7 +217,13 @@ def parse_line(line: str):
     if not line:
         return
     # Debug: print every received line to terminal (even when host app occupies COM port)
-    print(f"[RX] {line}", flush=True)
+    # Guarded: when the app is packaged with pythonw there is no stdout at
+    # all, and an unguarded print() raised -- which, through poll_serial(),
+    # killed the serial polling loop.
+    try:
+        print(f"[RX] {line}", flush=True)
+    except Exception:
+        pass
     parts = line.split(",")
     head = parts[0].strip()
     if head == "+ONLINE" and len(parts) >= 3:
@@ -317,7 +323,10 @@ def parse_line(line: str):
                 S._ping_btn = None
             messagebox.showinfo("AT+PING 结果", "网关 Ping 成功 — 收到 +PONG")
     elif head == "+RATE_OK" and len(parts) >= 2:
-        ms = int(parts[1].strip())
+        try:
+            ms = int(parts[1].strip())
+        except (ValueError, IndexError):
+            ms = 0
         hz = 1000.0 / ms if ms > 0 else 0
         set_status(f"标签更新频率已设置: {ms}ms ({hz:.1f} Hz)", "success")
         if getattr(S, "_rate_pending", False):
@@ -355,8 +364,15 @@ def parse_line(line: str):
     elif head == "+NET_ERR":
         set_status("组网配置失败 — Master 未响应", "error")
     elif head == "+NETSTART_OK" and len(parts) >= 3:
-        ack_count = int(parts[1].strip())
-        root_rank = int(parts[2].strip())
+        # P0: a malformed line must not raise out of the handler (see
+        # poll_serial).  A line that cannot be parsed is ignored.
+        try:
+            ack_count = int(parts[1].strip())
+            root_rank = int(parts[2].strip())
+        except (ValueError, IndexError):
+            set_status("组网回执格式错误（已忽略）", "warning")
+            ack_count = 0
+            root_rank = 0
         # P1-1: the gateway appends the roster members that never answered:
         #   +NETSTART_OK,<ack>,<root>,<miss_cnt>,<rank1>,<rank2>,...
         miss_ranks = []
@@ -826,6 +842,21 @@ def net_running():
     return False
 
 
+def is_anchor_device(d) -> bool:
+    """Is this device an anchor?
+
+    The "type" of a device can flip between ANCHOR and TAG when two
+    devices share an id -- the gateway reports the type of the frame it
+    saw last.  Everything that must not be confused by that (writing a
+    tag's position into an anchor's record, drawing an anchor as a tag)
+    therefore asks this helper, which honours the STICKY "is_anchor" flag
+    that is set the first time the device is seen as an anchor.
+    """
+    if d is None:
+        return False
+    return bool(d.get("is_anchor")) or d.get("type") == "ANCHOR"
+
+
 def get_label(uid: str) -> str:
     """Return display label for a device."""
     dtype = S.devices.get(uid, {}).get("type", "")
@@ -869,6 +900,15 @@ def handle_online(parts):
         S.n_id_conflicts = getattr(S, "n_id_conflicts", 0) + 1
         set_status(f"⚠ ID 冲突：{uid} 的类型由 {old_type} 变为 {dtype}", "warning")
     d["type"] = dtype
+    # P0: the type can FLIP between ANCHOR and TAG when two devices share
+    # an id (the gateway reports the type of the frame it saw last).  The
+    # question "is this an anchor" must therefore be answered by a STICKY
+    # flag and not by the current type -- otherwise the guard in
+    # handle_pos() can be talked out of the way and a tag's position is
+    # written into the anchor's record (the anchor is then drawn on the
+    # tag's position and its real coordinates stop being drawn at all).
+    if dtype == "ANCHOR":
+        d["is_anchor"] = True
     d["rank"] = rank  # store rank for display
     d["pending"] = False   # confirmed online now (it was only "seen" before)
     S.last_update[uid] = time.time()
@@ -1006,6 +1046,8 @@ def handle_seen(parts):
         S.devices[uid] = {"trail": []}
     d = S.devices[uid]
     d["type"] = dtype
+    if dtype == "ANCHOR":
+        d["is_anchor"] = True
     d["rank"] = rank
     d["pending"] = True      # sighted, not yet confirmed online
     S.last_update[uid] = time.time()
@@ -1136,15 +1178,22 @@ def handle_posmiss(parts):
 
 def handle_pos(parts):
     uid = parts[1].strip()
-    x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
-    q = int(parts[5])
-    # The flags and the residual are appended at the end of the line (the
-    # gateway only adds them when the tag sent the extended report).
-    flags  = int(parts[6]) if len(parts) > 6 else 0
-    rms_mm = int(parts[7]) if len(parts) > 7 else 0
-    # P1-7: the round counter of the tag (byte 2 of the report).  A hole
-    # in it is a report that never arrived -- the gateway counts those.
-    seq = int(parts[8]) if len(parts) > 8 else None
+    # P0: a corrupted serial line (a truncated field, a stray character)
+    # used to raise ValueError right here.  The exception propagated out
+    # of parse_line() into poll_serial(), which then never re-armed its
+    # own timer -- the live view froze for good and the RX queue grew
+    # without bound.  A line that cannot be parsed is DROPPED.
+    try:
+        x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+        q = int(parts[5])
+        # The flags and the residual are appended at the end of the line.
+        flags  = int(parts[6]) if len(parts) > 6 else 0
+        rms_mm = int(parts[7]) if len(parts) > 7 else 0
+        # P1-7: the round counter of the tag (byte 2 of the report).  A hole
+        # in it is a report that never arrived -- the gateway counts those.
+        seq = int(parts[8]) if len(parts) > 8 else None
+    except (ValueError, IndexError):
+        return
     if uid not in S.devices:
         S.devices[uid] = {"trail": [], "type": "TAG"}
     d = S.devices[uid]
@@ -1162,7 +1211,7 @@ def handle_pos(parts):
     # anchor's record.  The conflict is counted and reported: it is a
     # configuration problem (two devices with the same id) and the operator
     # has to fix it, not something the host may paper over.
-    if d.get("type") == "ANCHOR":
+    if is_anchor_device(d):
         d["id_conflict"] = d.get("id_conflict", 0) + 1
         S.n_id_conflicts = getattr(S, "n_id_conflicts", 0) + 1
         # The raw values are kept for diagnostics only — the smoothed
@@ -1416,7 +1465,12 @@ def handle_coord(parts):
     the two lines it was looking at; now there is a single unit.
     """
     uid = parts[1].strip()
-    x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+    # P0: a malformed line must not raise out of the handler -- see
+    # poll_serial(): an exception there kills the serial polling loop.
+    try:
+        x, y, z = float(parts[2]), float(parts[3]), float(parts[4])
+    except (ValueError, IndexError):
+        return
 
     # P0-2: the gateway appends the anchor's "do I have a coordinate" flag.
     # Without it a (0,0,0) answer is ambiguous -- a real coordinate at the
@@ -4150,7 +4204,7 @@ def on_mouse_wheel(e):
 
 def on_dbl_click(e):
     anchors = [(d.get("ax",0), d.get("ay",0)) for d in S.devices.values()
-               if d.get("ax") is not None and d.get("type") == "ANCHOR"]
+               if d.get("ax") is not None and is_anchor_device(d)]
     if anchors:
         xs, ys = [a[0] for a in anchors], [a[1] for a in anchors]
         S.ox = (min(xs)+max(xs))/2 if len(xs) > 1 else xs[0]
@@ -4303,7 +4357,11 @@ def render_loop():
     for uid, d in S.devices.items():
         if d.get("type") == "GATEWAY":
             continue  # Gateway has no position on map
-        if d.get("type") == "TAG":
+        # P0: the drawing dispatch must not be talked out of the way by a
+        # type flip.  An anchor whose type temporarily reads "TAG" was
+        # drawn as a tag -- at the TAG's position, and its real
+        # coordinates were not drawn at all.
+        if d.get("type") == "TAG" and not is_anchor_device(d):
             if S.show_trails:
                 draw_trail(c, d)
             draw_tag(c, uid, d)
@@ -4583,7 +4641,7 @@ def draw_scale(c, w, h):
 def draw_links(c):
     """Draw colored lines between anchors showing link quality."""
     anchors = [(uid, d) for uid, d in S.devices.items()
-               if d.get("type") == "ANCHOR" and d.get("ax") is not None]
+               if is_anchor_device(d) and d.get("ax") is not None]
     drawn = set()
     for i, (u1, d1) in enumerate(anchors):
         for j, (u2, d2) in enumerate(anchors):
@@ -4789,7 +4847,18 @@ def check_liveness():
     root.after(3000, check_liveness)
 
 def poll_serial():
-    process_rx()
+    # P0: the re-arm of the timer has to happen even when a handler
+    # raises.  Without this, ONE bad line (a truncated "+POS" from a
+    # noisy serial line, a missing field in a "+NETSTART_OK") killed the
+    # polling loop for good: the view froze on the last frame and the RX
+    # queue kept growing until the process died.
+    try:
+        process_rx()
+    except Exception as e:          # noqa: BLE001 - the loop must survive
+        try:
+            set_status(f"串口数据解析异常（已跳过）：{e}", "warning")
+        except Exception:
+            pass
     root.after(30, poll_serial)
 
 # ══════════════════════════════════════════════
