@@ -336,7 +336,19 @@ static void tag_build_pos_report(uint8_t *pkt)
     x = s_solve_x_cm; y = s_solve_y_cm; z = s_solve_z_cm;
     q = s_solve_q;
     flags = s_solve_flags;
-    rms_mm = (s_solve_rms_cm > 255u) ? 255u : (uint8_t)s_solve_rms_cm;
+    rms_mm = 0;
+    {
+        /* The residual byte is MILLIMETRES.  The protocol says so
+         * (DL_POS_RMS_MM_MAX), the gateway forwards it as mm and the host
+         * prints "残差: X mm".  The solver works in CENTIMETRES, so the
+         * value has to be converted -- it used to be copied in unchanged,
+         * which made every residual on the wire TEN TIMES TOO SMALL (a
+         * 5 cm residual was published as "5 mm").  The multiplication is
+         * done in 32 bits: the residual can be 150 m = 15000 cm, and
+         * 15000 * 10 does not fit into a uint16. */
+        uint32_t rms_mm_val = (uint32_t)s_solve_rms_cm * 10u;
+        rms_mm = (rms_mm_val > 255u) ? 255u : (uint8_t)rms_mm_val;
+    }
 
     /* The Root down means there is no solve any more: the TDOA is
      * referenced to the Root's beacon, so without it the tag cannot
@@ -842,6 +854,15 @@ static void tag_solve(void)
                 s_n_cycle_mismatch++;
                 continue;
             }
+            /* Only OFF-GRID anchors may take part in the raw difference.
+             *
+             * The raw RX difference contains the TX departure error of BOTH
+             * beacons (the Root's tx_err alone is up to 255 DTU = 1.2 m of
+             * path), and the slot compensation is exactly what removes it.
+             * Mixing an on-grid anchor (the Root has slot 0) into the
+             * difference therefore injects a pseudo TDOA of up to a metre
+             * that passes the +-150 m window and poisons the solve. */
+            if (s_trackers[idx].slot != 255) continue;
 
             int64_t tdoa_dtu = (int64_t)(s_trackers[idx].last_rx_ts - toa_dtu[0]);
             if (tdoa_dtu > TDOA_MAX_DTU || tdoa_dtu < -TDOA_MAX_DTU) continue;
@@ -1390,16 +1411,21 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         if (s_print_count[tracker_slot] < 10) {
             s_print_count[tracker_slot]++;
             AnchorClockSync *s = &s_trackers[tracker_slot].sync;
-            char dbg[96];
-            int len = sprintf(dbg, "RX_RAW R=%u tx=%llu rx=%llu f=%.9f fppm=%.1f ofs=%.0f q=%.0f\r\n",
-                src_rank,
+            /* The worst case of this line is ~115 bytes: a 64-bit
+             * timestamp (20 digits), a 64-bit offset (13 digits + sign)
+             * and the fixed parts.  The old 96-byte buffer overflowed it
+             * once the tag had been running for a while. */
+            char dbg[160];
+            int len = snprintf(dbg, sizeof(dbg),
+                "RX_RAW R=%u tx=%llu rx=%llu f=%.9f fppm=%.1f ofs=%.0f q=%.0f\r\n",
+                (unsigned int)src_rank,
                 (unsigned long long)tx_remote,
                 (unsigned long long)rx_local,
-                s->factor,
+                (double)s->factor,
                 (double)(s->factor - 1.0) * 1e6,
                 s->offset_dtu,
-                s->quality);
-            TAG_DIAG_FRAME(dbg);
+                (double)s->quality);
+            if (len > 0) TAG_DIAG_FRAME(dbg);
         }
     }
 
@@ -2077,28 +2103,43 @@ int fusion_tag(void)
         static uint32_t s_summary_ctr;
         if (++s_summary_ctr >= 50) {
             s_summary_ctr = 0;
-            /* 288 bytes: 8 trackers x " R65535:F=+123456:Q=100:A=9999"
-             * (~30 bytes each) plus the header is ~246 bytes — the old
-             * 128-byte buffer overflowed with 5+ active anchors. */
-            char out[288]; int pos = 0;
-            pos += sprintf(out + pos, "TSUM");
+            /* The width of every field here depends on the runtime state:
+             * the rank is a CRC16 (up to 5 digits), the age is a 32-bit
+             * millisecond counter (up to 10 digits) and the report counters
+             * are 32-bit as well.  The worst case is
+             *   4 + 8 * 37 + 42 + 2 + 1 = 345 bytes
+             * so the buffer is 384 -- and every append is BOUNDED, because
+             * the old code used a bare sprintf() and smashed its 288-byte
+             * stack buffer as soon as one anchor went quiet for more than
+             * 100 s (an age of 6 digits is already 8 bytes over). */
+            char out[384]; int pos = 0; int n;
+            n = snprintf(out + pos, sizeof(out) - (size_t)pos, "TSUM");
+            pos += (n > 0) ? n : 0;
             int i;
             for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
                 if (!s_trackers[i].is_active) continue;
                 const AnchorClockSync *s = &s_trackers[i].sync;
                 uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
                             : (HAL_GetTick() - s_trackers[i].last_seen_ms);
-                pos += sprintf(out + pos, " R%d:F=%+07ld:Q=%02u:A=%04u",
-                    s_trackers[i].rank,
+                if (pos >= (int)sizeof(out) - 48) break;   /* no room left */
+                n = snprintf(out + pos, sizeof(out) - (size_t)pos,
+                    " R%u:F=%+07ld:Q=%02u:A=%04u",
+                    (unsigned int)s_trackers[i].rank,
                     (long)((s->factor - 1.0) * 1e6),
                     (unsigned int)(s->quality * 100),
-                    age_ms);
+                    (unsigned int)age_ms);
+                if (n < 0) break;
+                pos += n;
             }
-            pos += sprintf(out + pos, " RPT tx=%u skip=%u id=%04x",
+            n = snprintf(out + pos, sizeof(out) - (size_t)pos,
+                " RPT tx=%u skip=%u id=%04x",
                 (unsigned)s_n_report_tx,
                 (unsigned)s_n_report_skip,
                 (unsigned)s_tag_id);
-            pos += sprintf(out + pos, "\r\n");
+            if (n > 0) pos += n;
+            if (pos < (int)sizeof(out) - 2) {
+                out[pos++] = '\r'; out[pos++] = '\n'; out[pos] = 0;
+            }
             TAG_DIAG_SOLVE(out);
         }
     }
