@@ -86,6 +86,22 @@ static int fmt_str(char *buf, const char *s)
     return i;
 }
 
+/* Copy string with a HARD limit, return bytes written (no terminator).
+ *
+ * The unbounded fmt_str() was used to copy the whole tail of an AT
+ * command into a 32-byte buffer.  The UART line buffer holds up to
+ * GW_CMD_MAX_LEN (600) characters, so a line like
+ *     AT+RESET=AAAA....(500 chars)
+ * wrote ~590 bytes into 32 bytes of stack -- a stack smash and a
+ * HardFault, reachable with nothing but a noisy serial line. */
+static int fmt_str_n(char *buf, int cap, const char *s)
+{
+    int i = 0;
+    if (cap <= 0) return 0;
+    while (*s && i < cap) buf[i++] = *s++;
+    return i;
+}
+
 /*============================================================================
  * UART RX ring buffer
  *============================================================================*/
@@ -1160,21 +1176,30 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
     else if (func == FUNC_DL_POS_REPORT)
     {
         char uid[8];
-        int16_t x = (int16_t)(frame[GW_HDR_LEN]     | (frame[GW_HDR_LEN+1] << 8));
-        int16_t y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
-        int16_t z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
-        uint16_t q = (uint16_t)(frame[GW_HDR_LEN+6] | (frame[GW_HDR_LEN+7] << 8));
+        int16_t x, y, z;
+        uint16_t q;
         /* The flags and the residual live at bytes 20 and 21 of the report
          * (the two-byte tail pad sits at 22-23).  A report from an older
          * tag is only 22 bytes long, so both are only read when the frame
          * is long enough -- otherwise they stay "unknown". */
         uint8_t  pos_flags = 0;
         uint8_t  pos_rms_mm = 0;
-        int      have_extra = 0;
+
+        /* P0: the coordinates and the quality are read from bytes 10..17.
+         * A truncated frame (the caller only guarantees the 10-byte
+         * header) used to be read as "valid coordinates" out of whatever
+         * was left in the RX buffer, and the host drew that ghost
+         * position and smoothed towards it.  A report that does not carry
+         * the full payload is DROPPED. */
+        if (len < (uint16_t)(GW_HDR_LEN + 8)) return;
+
+        x = (int16_t)(frame[GW_HDR_LEN]     | (frame[GW_HDR_LEN+1] << 8));
+        y = (int16_t)(frame[GW_HDR_LEN+2]   | (frame[GW_HDR_LEN+3] << 8));
+        z = (int16_t)(frame[GW_HDR_LEN+4]   | (frame[GW_HDR_LEN+5] << 8));
+        q = (uint16_t)(frame[GW_HDR_LEN+6] | (frame[GW_HDR_LEN+7] << 8));
         if (len >= (uint16_t)(GW_HDR_LEN + 12)) {
             pos_flags  = frame[GW_HDR_LEN + 10];
             pos_rms_mm = frame[GW_HDR_LEN + 11];
-            have_extra = 1;
         }
         /* Mark tag online + extract firmware version */
         {
@@ -1208,12 +1233,16 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         pos += fmt_coord(&out[pos], (int)z);
         out[pos++] = ',';
         pos += fmt_dec(&out[pos], (int)q);
-        if (have_extra) {
-            out[pos++] = ',';
-            pos += fmt_dec(&out[pos], (int)pos_flags);
-            out[pos++] = ',';
-            pos += fmt_dec(&out[pos], (int)pos_rms_mm);
-        }
+        /* The flags and the residual are ALWAYS appended, even when the
+         * report is too short to carry them (an old 22-byte tag): the
+         * sequence number is appended after them, so the host reads
+         * fixed positions.  When the fields were omitted the host used to
+         * read the sequence number as the flags -- a sequence of 1 looked
+         * like "Z_VALID". */
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], (int)pos_flags);
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], (int)pos_rms_mm);
         /* P1-7: the round counter of the tag, APPENDED at the end so that
          * a parser that only knows the old fields still reads the old line
          * correctly. */
@@ -2362,7 +2391,9 @@ void gateway_poll_uart(void)
         int pos;
         ack[0] = '+'; ack[1] = 'R'; ack[2] = 'E'; ack[3] = 'S'; ack[4] = 'E'; ack[5] = 'T'; ack[6] = ',';
         pos = 7;
-        pos += fmt_str(&ack[pos], cmd + 9);
+        /* Bounded: the tail of the command can be up to 600 characters
+         * while the buffer is 32.  Reserve the room for ",OK\0". */
+        pos += fmt_str_n(&ack[pos], (int)sizeof(ack) - pos - 4, cmd + 9);
         ack[pos++] = ','; ack[pos++] = 'O'; ack[pos++] = 'K';
         ack[pos] = '\0';
         test_run_info((unsigned char *)ack);
@@ -2891,7 +2922,7 @@ void gateway_poll_uart(void)
             out[0] = '+'; out[1] = 'O'; out[2] = 'T'; out[3] = 'A'; out[4] = '_'; out[5] = 'D';
             out[6] = 'O'; out[7] = 'N'; out[8] = 'E'; out[9] = ',';
             pos = 10;
-            pos += fmt_str(&out[pos], cmd + 11);
+            pos += fmt_str_n(&out[pos], (int)sizeof(out) - pos - 1, cmd + 11);
             out[pos] = '\0';
             test_run_info((unsigned char *)out);
         }
