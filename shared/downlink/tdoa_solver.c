@@ -148,10 +148,8 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
     float x = x0, y = y0, z = z0;
     int iter, k;
     uint8_t n = num_anchors;
-    /* The state of the LAST iteration: how many anchors survived the
-     * outlier rejection, and how much information the vertical direction
-     * carried. */
-    uint8_t last_used = 0;
+    /* The state of the LAST iteration: how much information the vertical
+     * direction carried. */
     float  last_z_info = 0.0f;
 
     /* Outlier tracking: each measurement's weight (0 = rejected) */
@@ -230,7 +228,6 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
         {
             float tr = H[0][0] + H[1][1] + H[2][2];
             last_z_info = (tr > 0.0f) ? (H[2][2] / tr) : 0.0f;
-            last_used   = used_count;
         }
 
         float denom = (float)(used_count > 0 ? used_count - 1 : 1);
@@ -333,11 +330,23 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
     *y_out = y;
     *z_out = z;
     *rms_out  = prev_rms;
-    /* The count is the number of surviving TDOA MEASUREMENTS (anchor k
-     * against the reference anchor 0).  The reference itself produces no
+    /* The count is the number of INLIER TDOA measurements (anchor k against
+     * the reference anchor 0).  The reference itself produces no
      * measurement, so it is not counted -- the caller can compare this
-     * against (num_anchors - 1) to get the inlier ratio. */
-    if (n_used_out)  *n_used_out  = last_used;
+     * against (num_anchors - 1) to get the inlier ratio.
+     *
+     * An anchor whose residual blew through the outlier threshold keeps a
+     * weight of 0.5: it still contributes to the fit, but it is NOT an
+     * inlier.  Counting it as one made the host's inlier ratio read 100%
+     * while a measurement had just been flagged as an outlier, so the
+     * quality score was optimistic exactly when it should not have been. */
+    {
+        uint8_t clean = 0;
+        for (k = 1; k < (int)n; k++) {
+            if (weight[k] >= 0.999f) clean++;
+        }
+        if (n_used_out)  *n_used_out  = clean;
+    }
     if (z_info_out)  *z_info_out  = last_z_info;
     return 0;
 }
