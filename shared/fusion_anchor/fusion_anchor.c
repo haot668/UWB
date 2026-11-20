@@ -115,6 +115,22 @@ static const uint8_t match_twr_corr[] = {0x41, 0x88, 0,
                                           0xCA, 0xDE, 0, 0,
                                           0,    0,    FUNC_TWR_CORR};
 
+/* NETWORK_START frame header (GW -> all anchors: dst = broadcast).
+ *
+ * P0: this frame needs its OWN pattern.  It used to share
+ * match_twr_corr, whose byte 9 is FUNC_TWR_CORR (0xE7) -- and
+ * match_header() compares byte 9 (it only skips the SN, the DST and the
+ * SRC).  A NETWORK_START frame carries 0xE8 in byte 9, so the match
+ * FAILED, `handled` stayed 0 and anchor_process_rx() was never called:
+ * the gateway could not form a network at all, no anchor ever answered
+ * with a NETWORK_ACK and the Root never started its grid.
+ *
+ * The two frames differ in exactly one byte -- the function code -- so
+ * they need two patterns. */
+static const uint8_t match_network_start[] = {0x41, 0x88, 0,
+                                               0xCA, 0xDE, 0xFF, 0xFF,
+                                               0,    0,    FUNC_NETWORK_START};
+
 /*============================================================================
  * Anchor state machine for hierarchical clock sync
  *============================================================================*/
@@ -3004,6 +3020,8 @@ static void anchor_loop(void)
                         handled = match_header(rx_buf, match_timesync, 10, 1, 0, 1);
                         break;
                     case FUNC_NETWORK_START:   /* GW → anchors: manual net formation */
+                        handled = match_header(rx_buf, match_network_start, 10, 1, 0, 1);
+                        break;
                     case FUNC_TWR_CORR:        /* Root → child: path correction */
                         handled = match_header(rx_buf, match_twr_corr, 10, 1, 1, 1);
                         break;
