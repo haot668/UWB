@@ -339,6 +339,7 @@ P,SEQ,X=<m>,Y=<m>,Z=<m>,Q=<0..1000>,ZV=<0|1>,R=<残差 m>,M=<2D|3D>
 | [`docs/UWB_TDOA3_Optimization_Plan_v2.md`](docs/UWB_TDOA3_Optimization_Plan_v2.md) | 优化方案 v2（**当前有效的方案**） |
 | [`docs/UWB_TDOA3_Optimization_Plan.md`](docs/UWB_TDOA3_Optimization_Plan.md) | 优化方案 v1，**已降为历史备份**，其三条主要结论已被 v2 推翻 |
 | [`docs/粮库UWB定位系统技术方案.md`](docs/粮库UWB定位系统技术方案.md) | 应用侧方案 |
+| [`docs/代码审查报告.md`](docs/代码审查报告.md) | 2026-11-20 代码审查轮：11 项已修复 + 16 项未修复清单（含位置、后果、优先级） |
 | [`docs/DW3000_Delayed_TX技术手册.md`](docs/DW3000_Delayed_TX技术手册.md) | 延迟发送机制 |
 
 **活文档约定**：任何改动影响到流程或算法的提交，必须**同一次提交**更新 `docs/系统架构与算法说明.md`。
