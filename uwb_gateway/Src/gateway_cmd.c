@@ -338,6 +338,21 @@ static int      gw_net_present_valid = 0;
  * any extra uplink.  The count is reported to the host as +NETGRID. */
 static uint16_t gw_net_on_grid = 0;
 
+/* Zone mesh (M2): the zone this gateway serves.
+ *
+ * The gateway is the ONE source of truth for the zone's slot table.  In the
+ * old design every anchor built its own table out of whatever neighbours it
+ * happened to hear, so two anchors could disagree about whose turn it was --
+ * and a beacon that arrives late then lands in the wrong slot, which the tag
+ * charges to the TDOA as a real time difference.
+ *
+ * The gateway hands the whole table out in the NETWORK_START frame, and every
+ * member places its slot instants on the zone's common time axis.
+ *
+ * The zone id comes from the host (AT+ZONE=<id>); until the host says
+ * otherwise the gateway is not zoned and says so in the frame. */
+static uint8_t  gw_zone_id = DL_ZONE_ID_NONE;
+
 /* P1-7: the biggest hole in the tag's round counter that is still counted
  * as lost reports.  The counter is 8 bit, so a hole of 64 rounds (3.2 s)
  * is already implausible as a burst of losses -- it means the tag
@@ -1184,6 +1199,12 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
          * is long enough -- otherwise they stay "unknown". */
         uint8_t  pos_flags = 0;
         uint8_t  pos_rms_mm = 0;
+        /* The zone the fix was solved in (M2).  The same (x,y) means
+         * different things in different zones, so the zone travels WITH the
+         * position — a consumer that drops it mixes two coordinate
+         * systems.  A report from an older tag does not carry it, and then
+         * the zone stays "none". */
+        uint8_t  pos_zone = DL_ZONE_ID_NONE;
 
         /* P0: the coordinates and the quality are read from bytes 10..17.
          * A truncated frame (the caller only guarantees the 10-byte
@@ -1200,6 +1221,9 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         if (len >= (uint16_t)(GW_HDR_LEN + 12)) {
             pos_flags  = frame[GW_HDR_LEN + 10];
             pos_rms_mm = frame[GW_HDR_LEN + 11];
+        }
+        if (len >= (uint16_t)(DL_POS_ZONE_IDX + 1)) {
+            pos_zone = frame[DL_POS_ZONE_IDX];
         }
         /* Mark tag online + extract firmware version */
         {
@@ -1248,6 +1272,12 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
          * correctly. */
         out[pos++] = ',';
         pos += fmt_dec(&out[pos], (int)frame[2]);
+        /* M2: the zone, appended after everything else for the same
+         * reason.  DL_ZONE_ID_NONE (255) means "this fix was not solved in
+         * any zone" — the old behaviour, and the value a tag that runs the
+         * old firmware sends. */
+        out[pos++] = ',';
+        pos += fmt_dec(&out[pos], (int)pos_zone);
         out[pos] = '\0';
         test_run_info((unsigned char *)out);
 
@@ -1319,11 +1349,13 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
          * ordinary receive path, so nothing is lost any more.
          *
          * Parse: [10-11]=root_rank, [12]=cs_level, [13]=slot_idx,
-         *         [14]=n_neighbors */
+         *         [14]=n_neighbors, [15]=zone_id, [16-17]=ref_rank */
         uint16_t ack_root;
         uint8_t  cs_level;
         uint8_t  slot_idx;
         uint8_t  n_neigh;
+        uint8_t  ack_zone = DL_ZONE_ID_NONE;
+        uint16_t ack_ref  = 0xFFFFu;
         uint16_t src_rank;
         if (len < (uint16_t)(DL_TS_NETACK_NNEIGH_IDX + 1)) return;
         ack_root = (uint16_t)(frame[DL_TS_NETACK_ROOT_IDX] |
@@ -1331,6 +1363,16 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         cs_level = frame[DL_TS_NETACK_LEVEL_IDX];
         slot_idx = frame[DL_TS_NETACK_SLOT_IDX];
         n_neigh  = frame[DL_TS_NETACK_NNEIGH_IDX];
+        /* The zone the anchor joined and the clock reference it picked.
+         * An ACK from the old firmware is 15 bytes long and carries
+         * neither, so both stay at their "unknown" values. */
+        if (len >= (uint16_t)(DL_TS_NETACK_ZONE_IDX + 1)) {
+            ack_zone = frame[DL_TS_NETACK_ZONE_IDX];
+        }
+        if (len >= (uint16_t)(DL_TS_NETACK_REF_RANK_IDX + 2)) {
+            ack_ref = (uint16_t)(frame[DL_TS_NETACK_REF_RANK_IDX] |
+                        ((uint16_t)frame[DL_TS_NETACK_REF_RANK_IDX + 1] << 8));
+        }
         src_rank = (uint16_t)(frame[7] | ((uint16_t)frame[8] << 8));
         (void)ack_root; (void)cs_level; (void)slot_idx;
 
@@ -1347,15 +1389,25 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
             /* P1-1: report how many anchors this one hears.  The Root's
              * neighbour count is its coverage -- a Root that hears almost
              * nobody cannot complete the network, so the host can suggest
-             * a better Root. */
+             * a better Root.
+             *
+             * M2: the zone the anchor joined and the clock reference it
+             * picked are appended (zone id, then the reference rank --
+             * 65535 = "no reference yet").  They are appended at the END,
+             * so a host that only knows the two old fields still reads the
+             * old line correctly. */
             {
-                char nout[32]; int np = 0;
+                char nout[48]; int np = 0;
                 nout[np++]='+'; nout[np++]='N'; nout[np++]='E';
                 nout[np++]='T'; nout[np++]='N'; nout[np++]='B';
                 nout[np++]='R'; nout[np++]=',';
                 np += fmt_dec(&nout[np], (int)src_rank);
                 nout[np++]=',';
                 np += fmt_dec(&nout[np], (int)n_neigh);
+                nout[np++]=',';
+                np += fmt_dec(&nout[np], (int)ack_zone);
+                nout[np++]=',';
+                np += fmt_dec(&nout[np], (int)ack_ref);
                 nout[np]='\0';
                 test_run_info((unsigned char *)nout);
             }
@@ -3017,6 +3069,48 @@ void gateway_poll_uart(void)
             }
         }
     }
+    else if (strncmp(cmd, "AT+ZONE", 7) == 0)
+    {
+        /* AT+ZONE=<id>   — the zone the next NETWORK_START belongs to
+         * AT+ZONE?        — read it back
+         *
+         * The zone id is the label every member of a group of anchors
+         * carries.  It is what lets the tag bucket the anchors it hears by
+         * zone and solve each zone on its own: the same (x,y) means
+         * different things in two zones, so a position without its zone is
+         * meaningless.
+         *
+         * The id is chosen by the host (M5 wires it to the zone dialog);
+         * until then it stays DL_ZONE_ID_NONE ("not zoned") and the
+         * anchors behave exactly as they did before. */
+        if (cmd[7] == '?') {
+            char out[24]; int pos = 0;
+            out[pos++]='+'; out[pos++]='Z'; out[pos++]='O';
+            out[pos++]='N'; out[pos++]='E'; out[pos++]=',';
+            pos += fmt_dec(&out[pos], (int)gw_zone_id);
+            out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+            test_run_info((unsigned char *)out);
+        } else if (cmd[7] == '=') {
+            const char *zp = cmd + 8;
+            unsigned int z = 0;
+            int got = 0;
+            while (*zp >= '0' && *zp <= '9') { z = z * 10 + (unsigned int)(*zp++ - '0'); got = 1; }
+            if (!got || z >= DL_MAX_ZONES) {
+                /* DL_MAX_ZONES zones and no more: the id is what the tag
+                 * buckets on, so a bounded set is what makes the bucket
+                 * table a fixed size. */
+                test_run_info((unsigned char *)"+ZONE_ERR,RANGE\r\n");
+            } else {
+                gw_zone_id = (uint8_t)z;
+                { char out[24]; int pos = 0;
+                  out[pos++]='+'; out[pos++]='Z'; out[pos++]='O';
+                  out[pos++]='N'; out[pos++]='E'; out[pos++]=',';
+                  pos += fmt_dec(&out[pos], (int)gw_zone_id);
+                  out[pos++]='\r'; out[pos++]='\n'; out[pos]='\0';
+                  test_run_info((unsigned char *)out); }
+            }
+        }
+    }
     else if (strncmp(cmd, "AT+NETSTART=", 12) == 0)
     {
         /* AT+NETSTART=<root_rank>[,<r1>,<r2>,...]
@@ -3102,23 +3196,73 @@ void gateway_poll_uart(void)
              * is filled from the beacons that follow. */
             gw_net_on_grid = 0;
 
-            /* Build NETWORK_START payload:
-             * [0-1] root_rank (uint16 LE)
-             * [2]   flags (bit[0]=1 force reset)
-             * [3]   n_participants
-             * [4-5] reserved
-             * [6..] participant ranks (n × uint16 LE) */
+            /* Build NETWORK_START payload — a FIXED 43-byte payload (a
+             * 53-byte frame):
+             * [0-1]   root_rank        (uint16 LE)
+             * [2]     flags            (bit[0]=1 force reset)
+             * [3]     n_participants
+             * [4]     zone_id          (DL_ZONE_ID_NONE = not zoned)
+             * [5]     n_slots          (entries in the slot table)
+             * [6..21] roster           (8 × uint16 LE, unused = 0xFFFF)
+             * [22..37] zone slot table (8 × uint16 LE)
+             * [38..42] zone_time_base  (5 bytes, 40-bit DTU)
+             *
+             * The offsets are taken from the protocol header instead of
+             * being counted here: the header is the one place that knows
+             * where every field lives, and a frame that is built from
+             * offsets is immune to a field being added in the middle.
+             *
+             * The roster keeps the offset it had in the old variable-length
+             * frame (payload byte 6), so an anchor that runs the OLD
+             * firmware still reads the same members out of the new frame. */
             uint8_t payload[FUNC_NETWORK_START_MAX];
-            int plen = 0;
-            payload[plen++] = (uint8_t)(root_rank & 0xFF);
-            payload[plen++] = (uint8_t)((root_rank >> 8) & 0xFF);
-            payload[plen++] = NET_FLAG_FORCE_RESET;  /* force reset on anchors */
-            payload[plen++] = (uint8_t)roster_n;
-            payload[plen++] = 0; payload[plen++] = 0;   /* reserved */
-            for (i = 0; i < roster_n; i++) {
-                payload[plen++] = (uint8_t)(roster[i] & 0xFF);
-                payload[plen++] = (uint8_t)((roster[i] >> 8) & 0xFF);
+            int plen;
+            int n_slots = (roster_n > (int)DL_ZONE_MAX_MEMBERS)
+                        ? (int)DL_ZONE_MAX_MEMBERS : roster_n;
+            memset(payload, 0, sizeof(payload));
+#define GW_PAY_OFF(frame_idx) ((int)((frame_idx) - GW_HDR_LEN))
+            payload[GW_PAY_OFF(DL_TS_NET_ROOT_IDX)]     = (uint8_t)(root_rank & 0xFF);
+            payload[GW_PAY_OFF(DL_TS_NET_ROOT_IDX) + 1] = (uint8_t)((root_rank >> 8) & 0xFF);
+            payload[GW_PAY_OFF(DL_TS_NET_FLAGS_IDX)]    = NET_FLAG_FORCE_RESET;
+            payload[GW_PAY_OFF(DL_TS_NET_NPART_IDX)]    = (uint8_t)roster_n;
+            payload[GW_PAY_OFF(DL_TS_NET_ZONE_IDX)]     = gw_zone_id;
+            payload[GW_PAY_OFF(DL_TS_NET_NSLOT_IDX)]    = (uint8_t)n_slots;
+            /* The roster region: the members the operator picked, padded to
+             * NET_MAX_PARTICIPANTS so that the slot table behind it keeps a
+             * fixed offset. */
+            for (i = 0; i < (int)NET_MAX_PARTICIPANTS; i++) {
+                int off = GW_PAY_OFF(DL_TS_NET_ROSTER_IDX) + i * 2;
+                uint16_t r = (i < roster_n) ? roster[i] : 0xFFFFu;
+                payload[off]     = (uint8_t)(r & 0xFF);
+                payload[off + 1] = (uint8_t)((r >> 8) & 0xFF);
             }
+            /* The zone slot table: roster[i] owns slot i.
+             *
+             * The old design gave slot 0 to the Root and let every anchor
+             * GUESS the rest out of the neighbours it happened to hear
+             * (tdma_build_table_from_neighbors).  Two anchors could end up
+             * with two different tables for one grid -- and a beacon that
+             * arrives late then lands in the wrong slot, which the tag
+             * charges to the TDOA as a real time difference.  The gateway
+             * hands the whole table out instead: one table, one zone. */
+            for (i = 0; i < (int)DL_ZONE_MAX_MEMBERS; i++) {
+                int off = GW_PAY_OFF(DL_TS_NET_SLOT_TBL_IDX) + i * 2;
+                uint16_t sl = (i < n_slots) ? (uint16_t)i : 0xFFFFu;
+                payload[off]     = (uint8_t)(sl & 0xFF);
+                payload[off + 1] = (uint8_t)((sl >> 8) & 0xFF);
+            }
+            /* The zone's common time origin.
+             *
+             * The gateway has no clock of its own in the anchors' domain —
+             * every DW3000 counts from zero on power-up — so it cannot
+             * invent a time base.  Until a member has published one (M3
+             * gives the reference edge this job), the field stays zero and
+             * the "time base valid" flag stays CLEAR, so the anchors know
+             * the axis has not been established yet instead of trusting a
+             * number that means nothing. */
+            for (i = 0; i < 5; i++) payload[GW_PAY_OFF(DL_TS_NET_ZTBASE_IDX) + i] = 0;
+            plen = (int)FUNC_NETWORK_START_LEN - GW_HDR_LEN;
+#undef GW_PAY_OFF
 
             /* P0-1: ARM the broadcast instead of running it here.
              *

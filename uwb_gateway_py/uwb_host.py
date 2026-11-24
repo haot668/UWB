@@ -1115,10 +1115,15 @@ def handle_rankcoll(parts):
         d["rank_collision"] = True
 
 def handle_netnbr(parts):
-    """+NETNBR,<rank>,<n_neighbors> — how many anchors this one hears.
+    """+NETNBR,<rank>,<n_neighbors>[,<zone_id>,<ref_rank>] — how many anchors
+    this one hears.
     The Root's neighbour count is its coverage: a Root that hears almost
     nobody can never complete the network, so the operator should pick a
-    better one (P1-1)."""
+    better one (P1-1).
+
+    M2 appends the zone the anchor joined and the clock reference it picked
+    (65535 = none yet).  They are optional: an anchor running the old
+    firmware does not send them."""
     try:
         rank = int(parts[1].strip())
         n = int(parts[2].strip())
@@ -1128,7 +1133,20 @@ def handle_netnbr(parts):
     uid = f"{rank:04X}"
     if uid not in S.devices:
         S.devices[uid] = {"trail": [], "type": "ANCHOR", "rank": rank}
-    S.devices[uid]["n_neighbors"] = n
+    d = S.devices[uid]
+    d["n_neighbors"] = n
+    # The zone and the reference edge — the two things that make the mesh
+    # work without a Root.  Optional: an old anchor sends neither.
+    if len(parts) > 3:
+        try:
+            d["zone"] = int(parts[3].strip())
+        except ValueError:
+            pass
+    if len(parts) > 4:
+        try:
+            d["zone_ref"] = int(parts[4].strip())
+        except ValueError:
+            pass
 
 def _check_root_coverage():
     """P1-1: the Root must be able to reach the other anchors.  Its neighbour
@@ -1192,6 +1210,12 @@ def handle_pos(parts):
         # P1-7: the round counter of the tag (byte 2 of the report).  A hole
         # in it is a report that never arrived -- the gateway counts those.
         seq = int(parts[8]) if len(parts) > 8 else None
+        # M2: the zone the fix was solved in.  The same (x,y) means
+        # different things in different zones, so the zone belongs to the
+        # position -- a consumer that drops it mixes two coordinate
+        # systems.  255 (DL_ZONE_ID_NONE) = "solved in no zone", which is
+        # what a tag running the old firmware sends.
+        zone = int(parts[9]) if len(parts) > 9 else 255
     except (ValueError, IndexError):
         return
     if uid not in S.devices:
@@ -1199,6 +1223,7 @@ def handle_pos(parts):
     d = S.devices[uid]
     if seq is not None:
         d["seq"] = seq
+    d["zone"] = zone
 
     # --- The ID space is shared by anchors and tags -------------------------
     # Both are a CRC16 over the 96-bit STM32 UID, rendered as 4 hex digits,

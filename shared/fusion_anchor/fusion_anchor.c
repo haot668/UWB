@@ -185,6 +185,23 @@ typedef struct {
     uint16_t           slot_owners[DL_MAX_TRACKED_ANCHORS];  /* rank who owns each slot */
     uint8_t            my_slot_idx;    /* this anchor's TX slot (255 = none/root) */
     uint32_t           last_schedule_rx_ms; /* when we last got a slot schedule */
+
+    /* ── Zone mesh (M2) ───────────────────────────────────────────────────
+     * The zone this anchor belongs to, and the clock edge it uses to reach
+     * the zone's common time axis.  In the "no Root" architecture every
+     * anchor picks its OWN reference neighbour — there is no master to
+     * follow — so the reference is stored per anchor, not globally.
+     *
+     * zone_time_base is the zone's common time origin, handed down by the
+     * gateway in NETWORK_START.  It is what makes the anchors of a zone
+     * share ONE physical time axis, which is the precondition for the
+     * tag's slot-compensated TDOA to mean anything. */
+    uint8_t            zone_id;         /* DL_ZONE_ID_NONE = not in any zone  */
+    uint8_t            zone_role;       /* DL_ZONE_ROLE_MEMBER / _REF         */
+    uint16_t           zone_ref_rank;   /* my clock reference (0xFFFF = none) */
+    uint8_t            zone_link_quality; /* quality of that reference edge  */
+    uint64_t           zone_time_base;  /* the zone's time origin (DTU)       */
+    uint8_t            zone_time_base_valid;
 } AnchorState;
 
 static AnchorState g_anchor;
@@ -245,6 +262,27 @@ static uint8_t  s_roster_member = 0;
  * of distances: an anchor without one contributes the distance to the
  * ORIGIN and drags the whole solution towards (0,0). */
 static uint8_t  s_coord_valid = 0;
+
+/* ── Zone mesh (M2) ─────────────────────────────────────────────────────
+ * The zone's slot table, handed down by the GATEWAY in NETWORK_START.
+ *
+ * There is exactly ONE slot table for the whole zone and it comes from one
+ * place.  The old scheme had two: the Root built one from the roster and
+ * broadcast it, and every anchor ALSO built a private one from whatever
+ * neighbours it happened to hear (tdma_build_table_from_neighbors()).  Two
+ * tables for one grid means two different answers to "whose turn is it",
+ * and the anchors disagreed — which is a collision.
+ *
+ * The table is indexed by ROSTER index (not by slot): entry i is the TDMA
+ * slot of roster[i].  0xFFFF = that member has no slot. */
+static uint16_t s_zone_slot_table[DL_ZONE_MAX_MEMBERS];
+static uint8_t  s_zone_slot_n = 0;
+
+/* The zone of every neighbour we hear, parallel to g_anchor.neighbors[].
+ * A neighbour in another zone is NOT a clock reference candidate: its time
+ * axis is a different one by construction. */
+static uint8_t  s_neighbor_zone[ANCHOR_MAX_NEIGHBORS];
+
 
 /*============================================================================
  * DS-TWR state
@@ -1273,12 +1311,35 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     pkt[DL_TS_RX_REF_CYCLE_IDX]     = (uint8_t)(s_ref_cycle & 0xFF);
     pkt[DL_TS_RX_REF_CYCLE_IDX + 1] = (uint8_t)(s_ref_cycle >> 8);
 
+    /* ── Zone mesh fields (M2) ────────────────────────────────────────────
+     * zone_id is the byte the Tag buckets by: anchors of different zones
+     * are never differenced against each other, because their time axes
+     * (and their slot grids) are different by construction.
+     *
+     * link_quality is the quality of MY OWN clock-reference edge.  It lets
+     * the neighbours judge how much to trust my reference, and it is what
+     * the M3 reference-anchor election compares.
+     *
+     * zone_ref_ts is my reference anchor's last TX instant, already mapped
+     * onto the zone's time base.  Until the anchor has a reference edge
+     * (M3 wires it up) the field stays 0 and the ZONE_REF_VALID flag
+     * stays CLEAR, so a receiver knows the field is meaningless instead of
+     * taking it for an instant. */
+    pkt[DL_TS_ZONE_IDX]         = g_anchor.zone_id;
+    pkt[DL_TS_LINK_QUALITY_IDX] = g_anchor.zone_link_quality;
+    pkt[DL_TS_ZONE_ROLE_IDX]    = g_anchor.zone_role;
+    /* zone_ref_ts stays 0 (the buffer was zeroed) and the validity flag
+     * stays CLEAR until M3 gives the anchor a real reference edge.  A
+     * receiver therefore never mistakes a zero for an instant. */
+    pkt[DL_TS_FLAGS_IDX] &= (uint8_t)~DL_TS_FLAG_ZONE_REF_VALID;
+
     /* The tail pad — the LAST two bytes of a frame read back over SPI are
      * corrupted by the DW3210 (see downlink_protocol.h), so the absorber
      * has to be exactly there.  That is why rx_ref_cycle stays at [61-62]
-     * and the frame is 65 bytes long: with the old 63-byte frame the
-     * cycle id itself was the corrupted pair and the Root's DS-TWR could
-     * never close. */
+     * and the pad sits at [73-74]: the frame is 75 bytes long, and every
+     * live field (the zone fields included) is in front of the absorber.
+     * With the old 63-byte frame the cycle id itself was the corrupted
+     * pair and the Root's DS-TWR could never close. */
     pkt[DL_TS_TAIL_PAD_IDX]     = 0xCC;
     pkt[DL_TS_TAIL_PAD_IDX + 1] = 0xDD;
 
@@ -1798,6 +1859,69 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
 
     s_net_root_rank = designated_root;
 
+    /* ── Zone mesh (M2): the zone this network is, its slot table and its
+     * time base.  All three come from the GATEWAY — one source of truth for
+     * the whole zone.
+     *
+     * The slot table is indexed by ROSTER index: entry i is the TDMA slot of
+     * roster[i].  It is the replacement for the Root's broadcast table AND
+     * for the per-anchor table built from whatever neighbours an anchor
+     * happened to hear (tdma_build_table_from_neighbors()) — two tables for
+     * one grid is how anchors end up disagreeing about whose turn it is.
+     *
+     * The zone_time_base is the zone's common time origin in DTU.  Every
+     * member places its slot instants on that axis, which is what makes the
+     * tag's slot-compensated TDOA comparable between the members.
+     *
+     * A NETWORK_START from the old 16-byte gateway carries none of this: the
+     * zone stays "none", the table stays empty and the time base stays
+     * invalid, and the anchor behaves exactly as before. */
+    {
+        uint8_t zone = DL_ZONE_ID_NONE;
+        if (frame_len >= DL_TS_NET_ZONE_IDX + 1) {
+            zone = rx_buf[DL_TS_NET_ZONE_IDX];
+        }
+        g_anchor.zone_id = zone;
+        g_anchor.zone_role = DL_ZONE_ROLE_MEMBER;
+        g_anchor.zone_ref_rank = 0xFFFFu;   /* no reference edge yet (M3) */
+        g_anchor.zone_link_quality = 0;
+
+        s_zone_slot_n = 0;
+        {
+            int i;
+            for (i = 0; i < DL_ZONE_MAX_MEMBERS; i++) {
+                s_zone_slot_table[i] = 0xFFFFu;
+            }
+            if (frame_len >= DL_TS_NET_SLOT_TBL_IDX + DL_TS_NET_SLOT_TBL_LEN) {
+                uint8_t n_slots = rx_buf[DL_TS_NET_NSLOT_IDX];
+                if (n_slots > DL_ZONE_MAX_MEMBERS) n_slots = DL_ZONE_MAX_MEMBERS;
+                for (i = 0; i < (int)n_slots; i++) {
+                    int off = DL_TS_NET_SLOT_TBL_IDX + i * 2;
+                    s_zone_slot_table[i] =
+                        (uint16_t)(rx_buf[off] | ((uint16_t)rx_buf[off + 1] << 8));
+                }
+                s_zone_slot_n = n_slots;
+            }
+        }
+
+        g_anchor.zone_time_base = 0;
+        g_anchor.zone_time_base_valid = 0;
+        /* The time base is only meaningful when the gateway says it has
+         * one.  The gateway has no clock in the anchors' domain, so it
+         * leaves the field at zero and the flag CLEAR until a member has
+         * published a reference (M3).  Reading a zero base as a real time
+         * axis would put every slot instant on the wrong origin. */
+        if ((flags & NET_FLAG_ZTBASE_VALID) &&
+            frame_len >= DL_TS_NET_ZTBASE_IDX + 5) {
+            g_anchor.zone_time_base =
+                unpack_40bit_ts(&rx_buf[DL_TS_NET_ZTBASE_IDX]);
+            g_anchor.zone_time_base_valid = 1;
+        }
+        { char dbg[80]; sprintf(dbg, "ZONE id=%u slots=%u ztb=%lu\r\n",
+            (unsigned)g_anchor.zone_id, (unsigned)s_zone_slot_n,
+            (unsigned long)g_anchor.zone_time_base); DBG_PRINT(dbg); }
+    }
+
     /* Restart the TDMA grid from scratch (P0-3): the Root's beacon defines
      * the cycle origin, so a fresh network needs a fresh origin. */
     s_root_grid_base = 0;
@@ -1905,6 +2029,18 @@ static void anchor_send_network_ack(void)
       }
       ack[DL_TS_NETACK_NNEIGH_IDX] = nn;
     }
+    /* Zone mesh (M2): which zone I joined, and which anchor I use as my
+     * clock reference.  The gateway collects these to build the zone's
+     * health picture — it is the only place that sees every member's
+     * answer.  0xFFFF = "no reference chosen yet" (M3 wires the election
+     * up; until then every member reports that). */
+    ack[DL_TS_NETACK_ZONE_IDX] = g_anchor.zone_id;
+    ack[DL_TS_NETACK_REF_RANK_IDX]     = (uint8_t)(g_anchor.zone_ref_rank & 0xFF);
+    ack[DL_TS_NETACK_REF_RANK_IDX + 1] = (uint8_t)(g_anchor.zone_ref_rank >> 8);
+    /* Tail pad — the last two bytes of a received frame are corrupted by the
+     * DW3210, and the gateway reads this frame. */
+    ack[DL_TS_NETACK_PAD_IDX]     = 0xCC;
+    ack[DL_TS_NETACK_PAD_IDX + 1] = 0xDD;
 
     port_DisableEXT_IRQ();
     dwt_forcetrxoff();
@@ -2019,7 +2155,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * says the value is usable. */
     int32_t ts_tx_err = 0;
     bool    ts_tx_err_valid = false;
-    if (frame_len >= DL_TIMESYNC_LEN
+    if (frame_len >= DL_TIMESYNC_V2_LEN
         && (ts_flags & DL_TS_FLAG_TX_ERR_VALID)) {
         ts_tx_err = (int32_t)(int16_t)((uint16_t)rx_buf[DL_TS_TX_ERR_IDX]
                         | ((uint16_t)rx_buf[DL_TS_TX_ERR_IDX + 1] << 8));
@@ -2038,6 +2174,24 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     /* Root always rebuilds slot table on every RX to keep it current */
     if (g_anchor.cs_level == 0) {
         tdma_build_table();
+    }
+
+    /* ── Zone mesh (M2): which zone is the sender in? ──────────────────────
+     * A neighbour in another zone lives on a DIFFERENT time axis and a
+     * different slot grid, so it can never be this anchor's clock reference
+     * and its beacon must never be differenced against ours.
+     *
+     * A beacon from the 67-byte firmware has no zone byte at all: it is
+     * treated as "no zone", which is the conservative answer (it matches
+     * nobody, so it is not usable as a reference). */
+    {
+        uint8_t peer_zone = DL_ZONE_ID_NONE;
+        if (frame_len >= DL_TS_ZONE_IDX + 1) {
+            peer_zone = rx_buf[DL_TS_ZONE_IDX];
+        }
+        if (slot >= 0 && slot < ANCHOR_MAX_NEIGHBORS) {
+            s_neighbor_zone[slot] = peer_zone;
+        }
     }
 
     /* ── NET_WAIT_CONFIRM: Child waiting for Root to confirm our slot.
@@ -3210,6 +3364,22 @@ static int anchor_init(void)
     g_anchor.prev_tx_ts = 0;
     g_anchor.prev_tx_ts_ext = 0;
     g_anchor.prev_scheduled_tx = 0;
+
+    /* Zone mesh (M2): an anchor that has not been given a zone yet belongs
+     * to none, and it has no clock reference edge.  The gateway assigns both
+     * in NETWORK_START. */
+    g_anchor.zone_id = DL_ZONE_ID_NONE;
+    g_anchor.zone_role = DL_ZONE_ROLE_MEMBER;
+    g_anchor.zone_ref_rank = 0xFFFFu;
+    g_anchor.zone_link_quality = 0;
+    g_anchor.zone_time_base = 0;
+    g_anchor.zone_time_base_valid = 0;
+    {
+        int zi;
+        for (zi = 0; zi < DL_ZONE_MAX_MEMBERS; zi++) s_zone_slot_table[zi] = 0xFFFFu;
+        s_zone_slot_n = 0;
+        for (zi = 0; zi < ANCHOR_MAX_NEIGHBORS; zi++) s_neighbor_zone[zi] = DL_ZONE_ID_NONE;
+    }
 
     /* Hierarchical sync: start in SCAN state */
     g_anchor.run_state = STATE_SCAN;

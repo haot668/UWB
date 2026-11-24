@@ -53,6 +53,57 @@ extern "C" {
 /* Anchor discovery — anchor announces itself while not yet networked */
 #define FUNC_ANCHOR_DISCOVERY  0xECu   /* Anchor → GW broadcast: I exist       */
 
+/* Zone mesh (M2) — per-edge clock sync inside a zone.  These REPLACE the
+ * Root's broadcast path (FUNC_TWR_CORR) in the M3 milestone; until then
+ * they are defined but not sent. */
+#define FUNC_ZONE_SYNC_REQ     0xEAu   /* Anchor → zone broadcast: my clock     */
+#define FUNC_ZONE_SYNC_RSP     0xEBu   /* Anchor → unicast: my reference clock  */
+
+/*============================================================================
+ * Zone mesh (M2) — the "no Root" architecture
+ *
+ * A ZONE is one locating domain AND one clock domain: a set of anchors that
+ * are mutually reachable and spatially close.  The zone has no master — the
+ * anchors in it pick their own clock reference by link quality, and the
+ * gateway hands the zone a common time base so that all of them end up on
+ * ONE physical time axis (which is what the tag's slot-compensated TDOA
+ * needs).
+ *
+ * The tag buckets the anchors by zone_id and solves each bucket SEPARATELY.
+ * Anchors of different zones are never differenced against each other.
+ *============================================================================*/
+#define DL_MAX_ZONES             4u      /* zones one gateway can serve      */
+#define DL_ZONE_MAX_MEMBERS      8u      /* anchors per zone (DL_MAX_ANCHORS)*/
+#define DL_ZONE_ID_NONE        0xFFu     /* "not in any zone"                 */
+
+/* An anchor whose best link is worse than this may not serve as a clock
+ * reference — a bad reference poisons every TDOA of the zone. */
+#define DL_REF_QUALITY_MIN      60u
+
+/* A reference edge that has not been heard from for this long is dead. */
+#define DL_REF_STALE_MS       3000u
+
+/* Switching to a new reference anchor needs the new one to be this much
+ * BETTER, otherwise the reference flaps and the TDOA jumps. */
+#define DL_REF_SWITCH_HYSTERESIS 15u
+
+/* A link is "bidirectional enough" when the two directions each carry at
+ * least this share of the frames (uBeacon uses >85% for the same test). */
+#define DL_LINK_BI_RATE_MIN_PCT 85u
+
+/* How often an anchor probes its neighbours' clocks (edge clock sync). */
+#define DL_EDGE_PROBE_PERIOD_MS 200u
+
+/* A TDOA larger than this (20 m) is not a path difference of one zone — it
+ * is a mis-pairing or a cross-zone frame. */
+#define DL_TDOA_MAX_CM         2000u
+
+/* The role an anchor plays in its zone.  Both roles are ordinary members;
+ * the distinction is only bookkeeping (the reference provider publishes its
+ * reference instant so the others can check they share the axis). */
+#define DL_ZONE_ROLE_MEMBER     0u
+#define DL_ZONE_ROLE_REF        1u
+
 /*============================================================================
  * Manual network configuration
  *============================================================================*/
@@ -111,30 +162,62 @@ extern "C" {
 
 /*============================================================================
  * NETWORK_START frame (Gateway → All anchors, broadcast)
+ *
+ * ZONE MODE (M2).  The frame now has a FIXED length of 53 bytes and
+ * carries the whole zone description — the roster, the zone's slot table
+ * and the zone's time base — so that the slot table has exactly ONE source
+ * of truth (the gateway) instead of one per anchor.
+ *
  *   [0-1]   frame_ctrl       (0x41, 0x88)
  *   [2]     seq8
  *   [3-4]   pan_id           (0xCA, 0xDE)
  *   [5-6]   dest_addr        (0xFFFF broadcast)
  *   [7-8]   source_addr      (Gateway rank=0)
  *   [9]     func             (0xE8)
- *   [10-11] root_rank        (uint16 LE, the designated root)
- *   [12]    flags           (bit[0]=1 force reset)
- *   [13]    n_participants   (N, number of anchors taking part in the network)
- *   [14-15] reserved
- *   [16..]  participant ranks (N × uint16 LE, same order on every anchor)
+ *   [10-11] root_rank        (uint16 LE, legacy Root; in zone mode: the
+ *                             anchor that provides the zone time base)
+ *   [12]    flags            (bit[0] = 1 force reset)
+ *   [13]    n_participants   (N, number of anchors taking part)
+ *   [14]    zone_id          (uint8, DL_ZONE_ID_NONE = not zoned)
+ *   [15]    n_slots          (number of valid entries in the slot table)
+ *   [16-31] roster           (NET_MAX_PARTICIPANTS × uint16 LE; only the
+ *                             first N are meaningful, the rest are 0xFFFF)
+ *   [32-47] zone slot table  (DL_ZONE_MAX_MEMBERS × uint16 LE; entry i is
+ *                             the TDMA slot of roster[i], 0xFFFF = none)
+ *   [48-52] zone_time_base   (5 bytes, 40-bit DTU — the zone's common time
+ *                             origin, the axis every member's slot instants
+ *                             are placed on)
  *
  * The roster solves P1-1: a Root that only learns its neighbours from the
  * frames it happens to hear can never complete the network when one link is
  * one-way.  With the roster, every anchor knows how many members the network
  * must have and the Root can report which ones it is still missing.
+ *
+ * WHY THE ROSTER REGION IS FIXED-SIZE: the slot table and the time base
+ * follow the roster, and a variable-length roster would make their offsets
+ * depend on N — three different parsers would have to agree on where the
+ * slot table starts.  The region is padded to NET_MAX_PARTICIPANTS instead,
+ * and the unused entries are 0xFFFF.
  *============================================================================*/
-#define FUNC_NETWORK_START_LEN    16u     /* header + fixed fields            */
-#define FUNC_NETWORK_START_MAX    (FUNC_NETWORK_START_LEN + NET_MAX_PARTICIPANTS * 2u)
+#define FUNC_NETWORK_START_LEN    53u     /* the whole frame — fixed length  */
+#define FUNC_NETWORK_START_MAX    FUNC_NETWORK_START_LEN
 #define NET_FLAG_FORCE_RESET     0x01u
+/* The zone_time_base field carries a MEANINGFUL origin.  The gateway has no
+ * clock of its own in the anchors' domain, so it cannot invent one: until a
+ * member has published a reference (M3 gives the reference edge that job),
+ * the field is zero and this flag stays CLEAR — a member must not treat a
+ * zero base as a real time axis. */
+#define NET_FLAG_ZTBASE_VALID    0x02u
 #define DL_TS_NET_ROOT_IDX      10u
 #define DL_TS_NET_FLAGS_IDX     12u
 #define DL_TS_NET_NPART_IDX     13u
+#define DL_TS_NET_ZONE_IDX      14u
+#define DL_TS_NET_NSLOT_IDX     15u
 #define DL_TS_NET_ROSTER_IDX    16u
+#define DL_TS_NET_ROSTER_LEN    (NET_MAX_PARTICIPANTS * 2u)   /* 16 bytes   */
+#define DL_TS_NET_SLOT_TBL_IDX  32u
+#define DL_TS_NET_SLOT_TBL_LEN  (DL_ZONE_MAX_MEMBERS * 2u)    /* 16 bytes   */
+#define DL_TS_NET_ZTBASE_IDX    48u     /* 5 bytes, 40-bit DTU              */
 
 /*============================================================================
  * NETWORK_ACK frame (Anchor → Gateway, unicast to rank 0)
@@ -145,15 +228,22 @@ extern "C" {
  *   [7-8]   source_addr      (Anchor rank)
  *   [9]     func             (0xE9)
  *   [10-11] root_rank        (confirmed root rank, uint16 LE)
- *   [12]    cs_level         (0=root, 1=child)
- *   [13]    slot_idx        (TDMA slot, 255=unassigned)
+ *   [12]    cs_level         (0=root, 1=child)      (legacy, M3 deletes it)
+ *   [13]    slot_idx         (TDMA slot, 255=unassigned)
  *   [14]    n_neighbors      (discovered neighbor count)
+ *   [15]    zone_id          (uint8, the zone I joined)
+ *   [16-17] ref_rank         (uint16 LE, the anchor I chose as my clock
+ *                              reference; 0xFFFF = none chosen yet)
+ *   [18-19] pad 0xCC 0xDD    (DW3210 corrupts the last two bytes)
  *============================================================================*/
-#define FUNC_NETWORK_ACK_LEN      15u
+#define FUNC_NETWORK_ACK_LEN      20u
 #define DL_TS_NETACK_ROOT_IDX    10u
 #define DL_TS_NETACK_LEVEL_IDX   12u
 #define DL_TS_NETACK_SLOT_IDX    13u
 #define DL_TS_NETACK_NNEIGH_IDX  14u
+#define DL_TS_NETACK_ZONE_IDX    15u
+#define DL_TS_NETACK_REF_RANK_IDX 16u
+#define DL_TS_NETACK_PAD_IDX     18u
 
 /*============================================================================
  * Timing constants — per-anchor self-broadcast (BD8NCF style)
@@ -195,7 +285,7 @@ extern "C" {
 #define DL_SCAN_TIMEOUT_MS          5000u  /* 5-second scan period on boot          */
 
 /*============================================================================
- * TimeSync frame layout (67 bytes total, including the 10-byte header)
+ * TimeSync frame layout (75 bytes total, including the 10-byte header)
  *   [0-1]   frame_ctrl       (0x41, 0x88)
  *   [2]     seq8
  *   [3-4]   pan_id           (0xCA, 0xDE)
@@ -219,7 +309,23 @@ extern "C" {
  *   [63-64] tx_err           (int16, LE) — this frame's TX departure
  *                             error, in the SENDER's device time units
  *                             (DTU).  See "TX DEPARTURE ERROR" below.
- *   [65-66] tail pad 0xCC 0xDD — the absorber for the DW3210 RX
+ *   [65]    zone_id          (uint8, M2) — the zone this anchor belongs
+ *                             to; DL_ZONE_ID_NONE (0xFF) = not in any
+ *                             zone.  THE TAG BUCKETS BY THIS BYTE: anchors
+ *                             of different zones are never differenced
+ *                             against each other.
+ *   [66]    link_quality     (uint8, M2) — the quality of this anchor's own
+ *                             clock-reference edge (0..255).  0 = no
+ *                             reference edge yet.
+ *   [67]    zone_role        (uint8, M2) — DL_ZONE_ROLE_MEMBER (0) or
+ *                             DL_ZONE_ROLE_REF (1).
+ *   [68-72] zone_ref_ts      (5 bytes, 40-bit DTU, M2) — the TX instant of
+ *                             THIS anchor's reference anchor's last beacon,
+ *                             mapped onto the ZONE time base.  The tag uses
+ *                             it to check that all the members of a zone
+ *                             really do share one time axis.  Only valid
+ *                             when DL_TS_FLAG_ZONE_REF_VALID is set.
+ *   [73-74] tail pad 0xCC 0xDD — the absorber for the DW3210 RX
  *                             last-2-byte corruption.  It has to be
  *                             exactly at the END of the frame: a
  *                             DW3210 receiver corrupts the LAST two
@@ -228,6 +334,20 @@ extern "C" {
  *                             thing in the frame.  DW3000/DW3210 append
  *                             its own 2-byte CRC after the frame; that
  *                             CRC is not part of the frame.
+ *
+ * WHY THE ZONE FIELDS GO AT THE END AND NOT INTO THE cs_level BYTE
+ * -------------------------------------------------------------------
+ * The port plan proposed to re-use the cs_level byte (27) for zone_id,
+ * because the Root hierarchy it carried is deleted in M3.  That is right
+ * for the END state, but it is wrong for the ORDER of the work: cs_level
+ * is read and written by the anchor's election logic (fusion_anchor.c) and
+ * by the tag's Root detection, and changing its meaning in M2 — before M3
+ * removes those readers — would silently corrupt the hierarchy.
+ *
+ * So M2 only ADDS bytes at the end of the frame.  The old fields stay
+ * where they are until the milestone that actually deletes them; only then
+ * are the freed bytes reclaimed, and by then the zone fields' offsets have
+ * been frozen by the M2 release.
  *
  * WHY THE FRAME USED TO BE 63 BYTES (a real bug, fixed):
  *   The frame was 63 bytes and [61-62] carried rx_ref_cycle — live data
@@ -308,7 +428,14 @@ extern "C" {
  *       correction back (FUNC_TWR_CORR), so the child can place its own
  *       beacon exactly on the Root's grid.
  *============================================================================*/
-#define DL_TIMESYNC_LEN            67u
+#define DL_TIMESYNC_LEN            75u
+/* The length of the PREVIOUS revision of the beacon (67 bytes: the one
+ * that carries tx_err and the full slot table).  Parsers that need the
+ * tx_err field must test against THIS, not against DL_TIMESYNC_LEN —
+ * otherwise a beacon from the 67-byte firmware would be treated as
+ * "too short" and its departure error would be dropped, which is a
+ * silent loss of a metre of path. */
+#define DL_TIMESYNC_V2_LEN         67u
 /* The SHORTEST beacon a receiver still accepts.  A beacon sent by an old
  * firmware (63 bytes, no tail pad) is still parsed — it just has a
  * corrupted rx_ref_cycle, so the DS-TWR drops that link and everything
@@ -316,14 +443,15 @@ extern "C" {
  * of going dark.  All frame_len checks are LOWER bounds and use this,
  * never DL_TIMESYNC_LEN. */
 #define DL_TIMESYNC_MIN_LEN        63u
-#define DL_TS_TAIL_PAD_IDX         65u    /* 2 pad bytes 0xCC 0xDD — the DW3210
+#define DL_TS_TAIL_PAD_IDX         73u    /* 2 pad bytes 0xCC 0xDD — the DW3210
                                            * corrupts the LAST two bytes of an
                                            * SPI read, so the absorber has to
                                            * be the last thing in the frame. */
 #define DL_TS_TX_TS_IDX           10u    /* 5-byte TX timestamp (lower 40 bits)    */
 #define DL_TS_FLAGS_IDX           15u    /* bit0 = TX_TS_PRECISE
                                            * bit1 = TX_ERR_VALID
-                                           * bit2 = TX_OFFGRID                    */
+                                           * bit2 = TX_OFFGRID
+                                           * bit4 = ZONE_REF_VALID (M2)            */
 #define DL_TS_TX_ERR_IDX          63u    /* int16 LE: this frame's TX departure
                                            * error in the sender's DTU             */
 #define DL_TS_SLOT_IDX            18u    /* own TDMA slot (255 = unassigned)        */
@@ -333,6 +461,13 @@ extern "C" {
 #define DL_TS_COORD_IDX           44u    /* x/y/z coords appended after slot table  */
 #define DL_TS_CYCLE_IDX           52u    /* uint16 TDMA cycle counter                */
 #define DL_TS_PRESENT_IDX         54u    /* uint16 roster presence bitmap            */
+
+/* Zone mesh fields (M2) — appended at the end, before the tail pad. */
+#define DL_TS_ZONE_IDX            65u    /* uint8 zone id (0xFF = none)              */
+#define DL_TS_LINK_QUALITY_IDX    66u    /* uint8 quality of my reference edge      */
+#define DL_TS_ZONE_ROLE_IDX       67u    /* uint8 DL_ZONE_ROLE_*                     */
+#define DL_TS_ZONE_REF_TS_IDX     68u    /* 5-byte reference instant on the zone axis */
+#define DL_TS_ZONE_REF_TS_LEN      5u
 
 /* P1-6: how recently a roster member has to have been heard to still count
  * as "present" in the Root's presence bitmap.  A round is 50 ms, so 500 ms
@@ -352,6 +487,13 @@ extern "C" {
                                            * meaningless — receivers must drop the
                                            * frame from the TDOA pairing instead of
                                            * poisoning the average with it.        */
+#define DL_TS_FLAG_ZONE_REF_VALID 0x10u  /* M2: zone_ref_ts40 holds a usable
+                                           * reference instant on the zone
+                                           * time axis.  When this bit is
+                                           * clear the field is meaningless
+                                           * and the receiver must ignore it
+                                           * (it is 0 on an anchor that has
+                                           * no reference edge yet).      */
 #define DL_TS_FLAG_COORD_VALID    0x08u  /* the coordinates in this frame are the
                                            * CONFIGURED ones — the anchor really has
                                            * a position, it is not the (0,0,0) of an
@@ -371,6 +513,48 @@ extern "C" {
                                            * (the flash persistence of the
                                            * coordinate is a stub — see the F9/F10
                                            * item of the review). */
+
+/*============================================================================
+ * ZONE_SYNC frames (M2) — the replacement for the Root's clock broadcast
+ *
+ * In the "no Root" architecture there is no anchor that owns the time axis
+ * of the network.  Instead, every anchor keeps a CLOCK EDGE to every
+ * neighbour it hears, and picks the best edge as its reference.  Two
+ * mechanisms make the zone converge on ONE axis:
+ *
+ *   1. ZONE_SYNC_REQ (0xEA) — a periodic broadcast inside the zone.  Every
+ *      anchor publishes the instant of its own reference anchor, already
+ *      mapped onto the zone time base.  An anchor that hears two members
+ *      publishing DIFFERENT instants for the same reference knows that they
+ *      are not aligned and can re-solve its own edge.
+ *
+ *   2. ZONE_SYNC_RSP (0xEB) — the unicast answer to a request.  The
+ *      requester gets the peer's own clock model (not just an instant), so
+ *      it can re-derive its edge to that peer instead of trusting a
+ *      stale broadcast.
+ *
+ * Both frames carry the same payload:
+ *   [0-9]   header (10 B)
+ *   [10]    zone_id        (uint8, the zone this belongs to)
+ *   [11]    role           (uint8, DL_ZONE_ROLE_*)
+ *   [12]    quality        (uint8, quality of my own reference edge)
+ *   [13]    flags          (uint8)
+ *   [14-18] zone_ts40      (5 bytes, my reference instant on the zone axis)
+ *   [19-20] cycle_id       (uint16, the TDMA cycle the instant belongs to)
+ *   [21-22] ref_rank       (uint16 LE, the anchor I use as my reference;
+ *                           0xFFFF = none yet)
+ *   [23-24] pad 0xCC 0xDD
+ *==========================================================================*/
+#define FUNC_ZONE_SYNC_LEN         25u
+#define DL_ZS_ZONE_IDX             10u
+#define DL_ZS_ROLE_IDX             11u
+#define DL_ZS_QUALITY_IDX          12u
+#define DL_ZS_FLAGS_IDX            13u
+#define DL_ZS_TS_IDX               14u    /* 5-byte instant on the zone axis  */
+#define DL_ZS_TS_LEN                5u
+#define DL_ZS_CYCLE_IDX            19u
+#define DL_ZS_REF_RANK_IDX         21u    /* 2 bytes                          */
+#define DL_ZS_PAD_IDX              23u
 
 /*============================================================================
  * TWR correction frame (Root → broadcast, variable length)
@@ -440,7 +624,7 @@ extern "C" {
 #define DL_FB_CONFIDENCE_IDX       24u
 
 /*============================================================================
- * Tag Position Report (24 bytes)
+ * Tag Position Report (26 bytes)
  *   [0-1]   frame type 0x41 0x88
  *   [2]     sequence (per tag, incremented per report)
  *   [3-4]   source EUI64 tag 0xCA 0xDE
@@ -454,7 +638,9 @@ extern "C" {
  *   [18-19] uint16 fw_version
  *   [20]    uint8 flags   (see DL_POS_FLAG_* below)
  *   [21]    uint8 rms_mm  (the residual in millimetres, 255 = saturated)
- *   [22-23] pad 0xCC 0xDD (DW3210 RX corruption)
+ *   [22]    uint8 zone_id (M2: the zone this fix was solved in,
+ *                          DL_ZONE_ID_NONE = no valid zone)
+ *   [23-24] pad 0xCC 0xDD (DW3210 RX corruption)
  *
  * THE QUALITY SCALE
  * ------------------
@@ -483,7 +669,8 @@ extern "C" {
  * says so.
  *
  * The frame grew from 22 to 24 bytes so that the flags and the residual
- * sit BEFORE the trailing pad.  A DW3210 receiver corrupts the LAST TWO
+ * sit BEFORE the trailing pad, and from 24 to 26 bytes in M2 for the
+ * zone_id.  A DW3210 receiver corrupts the LAST TWO
  * BYTES of a received frame, so the pad has to stay at the very end.
  *
  * The tag is a pure receiver in the TDMA grid.  Its report goes out in the
@@ -508,7 +695,10 @@ extern "C" {
  * accuracy of the position at all — the delayed TX exists only to place the
  * frame inside the guard window.
  *==========================================================================*/
-#define DL_POS_REPORT_LEN          24u
+#define DL_POS_REPORT_LEN          26u
+/* The zone the fix was solved in (M2).  DL_ZONE_ID_NONE means "this report
+ * carries no position" — the consumer must not draw it. */
+#define DL_POS_ZONE_IDX            22u
 #define TAG_REPORT_DELAY_US       3000u  /* 3.0 ms after the guard start      */
 /* The ALOHA jitter spreads the reports of the tags that share the guard
  * time of slot 0.  The window used to be 2.0 ms, i.e. the reports of N tags

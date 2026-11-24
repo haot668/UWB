@@ -180,6 +180,18 @@ typedef struct {
     uint8_t            sc_n;             /* frames since the baseline            */
     uint32_t           desync_count;     /* consecutive self-check failures      */
     uint8_t            desynced;         /* the anchor left the grid             */
+
+    /* ── Zone mesh (M2) ───────────────────────────────────────────────────
+     * The zone this anchor belongs to (DL_ZONE_ID_NONE = unknown).
+     *
+     * A zone is ONE clock domain and ONE slot grid.  Anchors of different
+     * zones live on different time axes, so their beacons must NEVER be
+     * differenced against each other: the difference would be a TDOA of
+     * tens of metres, which passes every sanity window and drags the
+     * solution to a place the tag has never been.  The tag therefore
+     * buckets the anchors by this field and solves each bucket on its own
+     * (that bucketing is M4; M2 only carries the field). */
+    uint8_t            zone_id;
 } TagAnchorTracker;
 
 /* P1-1 self-check tuning -------------------------------------------------
@@ -292,6 +304,11 @@ static int16_t  s_solve_z_cm    = 0;
 static uint16_t s_solve_q       = TAG_REPORT_QUALITY_NONE;
 static uint16_t s_solve_rms_cm  = 0;
 static uint8_t  s_solve_flags   = 0;
+/* The zone the published fix was solved in (M2).  DL_ZONE_ID_NONE means
+ * "no valid zone" — the consumer must not draw the position.  M4 replaces
+ * this with the real per-bucket solve; until then it says which zone the
+ * whole anchor set belongs to, and NONE when the set straddles zones. */
+static uint8_t  s_solve_zone    = DL_ZONE_ID_NONE;
 static uint32_t s_solve_ms      = 0;
 static uint8_t  s_report_seq    = 0;
 /* P1-6: the published frame.
@@ -337,6 +354,10 @@ static void tag_build_pos_report(uint8_t *pkt)
     q = s_solve_q;
     flags = s_solve_flags;
     rms_mm = 0;
+    /* The zone the fix was solved in (M2).  It travels WITH the position:
+     * the same (x,y) means different things in different zones, so a
+     * consumer that ignores the zone can mix two coordinate systems. */
+    uint8_t zone = s_solve_zone;
     {
         /* The residual byte is MILLIMETRES.  The protocol says so
          * (DL_POS_RMS_MM_MAX), the gateway forwards it as mm and the host
@@ -364,16 +385,19 @@ static void tag_build_pos_report(uint8_t *pkt)
         q = TAG_REPORT_QUALITY_NONE;
         flags = DL_POS_FLAG_DEGRADED;
         rms_mm = 0;
+        zone = DL_ZONE_ID_NONE;
     } else if (!s_solve_valid) {
         x = 0; y = 0; z = 0;
         q = TAG_REPORT_QUALITY_NONE;
         flags = 0;
         rms_mm = 0;
+        zone = DL_ZONE_ID_NONE;
     } else if ((HAL_GetTick() - s_solve_ms) > 500u) {
         /* The solution is stale — the tag is alive but no longer solving. */
         q = TAG_REPORT_QUALITY_NONE;
         flags = 0;
         rms_mm = 0;
+        zone = DL_ZONE_ID_NONE;
     }
 
     memset(pkt, 0, DL_POS_REPORT_LEN);
@@ -401,9 +425,13 @@ static void tag_build_pos_report(uint8_t *pkt)
     pkt[19] = (uint8_t)((FW_VERSION_U16 >> 8) & 0xFF);
     pkt[20] = flags;
     pkt[21] = rms_mm;
-    /* [22..23] pad — the last two bytes of a received frame are corrupted
+    /* [22] zone — the zone this fix was solved in.  It travels WITH the
+     * position because the same (x,y) means different things in different
+     * zones; a consumer that ignores it mixes two coordinate systems. */
+    pkt[DL_POS_ZONE_IDX] = zone;
+    /* [23..24] pad — the last two bytes of a received frame are corrupted
      * by a DW3210, so they carry nothing but the absorber. */
-    pkt[22] = 0xCC; pkt[23] = 0xDD;
+    pkt[23] = 0xCC; pkt[24] = 0xDD;
 }
 static uint32_t s_n_report_tx   = 0;    /* reports actually transmitted      */
 static uint32_t s_n_report_skip = 0;    /* reports dropped (too late)        */
@@ -1023,6 +1051,30 @@ static void tag_solve(void)
     s_solve_y_cm  = (int16_t)y_cm;
     s_solve_z_cm  = (int16_t)z_cm;
     s_solve_rms_cm = (uint16_t)((rms > 0.0f) ? rms : 0.0f);
+
+    /* ── Zone mesh (M2): which zone was this fix solved in? ───────────────
+     * The anchors that took part in the solve must all live in ONE zone:
+     * two zones are two time axes, and a TDOA between them is a distance
+     * difference of tens of metres — it passes every sanity window and
+     * pulls the solution somewhere the tag has never been.
+     *
+     * So: if the set spans more than one zone, the zone is NONE and the
+     * consumer knows the fix is not from a single clock domain.  (M4 goes
+     * further and solves each zone on its own instead of mixing them.)
+     *
+     * The zone of the ROUND ORIGIN anchor (valid_idx[0], the reference) is
+     * what decides: it is the anchor whose beacon defines the grid the
+     * others were placed on. */
+    {
+        uint8_t z = s_trackers[valid_idx[0]].zone_id;
+        int k;
+        bool mixed = false;
+        for (k = 1; k < n_valid; k++) {
+            if (s_trackers[valid_idx[k]].zone_id != z) { mixed = true; break; }
+        }
+        s_solve_zone = mixed ? (uint8_t)DL_ZONE_ID_NONE : z;
+    }
+
     /* The flags say what the numbers mean.  Z_VALID is the honest answer
      * to "was the height measured, or is it just the plane of the
      * anchors?" -- with coplanar anchors it is the latter, and the flag
@@ -1057,7 +1109,7 @@ static void tag_report_publish(void)
     tag_build_pos_report(s_report_buf);
 
 #if TAG_DEBUG_OUTPUT
-    /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=<0..1000>,ZV=<0|1>,R=<residual m>,M=<2D|3D>
+    /* ASCII debug: P,SEQ,X=m,Y=m,Z=m,Q=<0..1000>,ZV=<0|1>,R=<residual m>,M=<2D|3D>,ZN=<zone>
      *
      * Q is the SCORE (bigger is better), R is the residual in metres, ZV
      * says whether the height was measured at all and M says whether the
@@ -1114,6 +1166,12 @@ static void tag_report_publish(void)
         } else {
             out[pos++] = '2'; out[pos++] = 'D';
         }
+        /* M2: the zone the fix was solved in.  255 = "solved in no zone".
+         * The same (x,y) means different things in two zones, so the zone
+         * is part of the position, not a decoration. */
+        out[pos++] = ','; out[pos++] = 'Z'; out[pos++] = 'N'; out[pos++] = '=';
+        p = sprintf(tmp, "%u", (unsigned)s_report_buf[DL_POS_ZONE_IDX]);
+        for (k = 0; k < p; k++) out[pos++] = tmp[k];
         out[pos++] = '\r'; out[pos++] = '\n'; out[pos] = 0;
         test_run_info((unsigned char *)out);
     }
@@ -1176,6 +1234,7 @@ static int alloc_tracker_slot(uint16_t rank)
             s_trackers[i].tdoa_valid = 0;
             s_trackers[i].coord_valid = 0;
             s_trackers[i].desynced = 0;
+            s_trackers[i].zone_id = (uint8_t)DL_ZONE_ID_NONE;
             s_trackers[i].desync_count = 0;
             clock_sync_init(&s_trackers[i].sync, 1.0, 0.0, 0.0, 0.0, 0.0);
             return i;
@@ -1204,6 +1263,7 @@ static int alloc_tracker_slot(uint16_t rank)
     s_trackers[worst].tdoa_now   = 0;
     s_trackers[worst].tdoa_valid = 0;
     s_trackers[worst].coord_valid = 0;
+    s_trackers[worst].zone_id = (uint8_t)DL_ZONE_ID_NONE;
     s_trackers[worst].tdoa_avg   = 0;
     s_trackers[worst].tdoa_n     = 0;
     s_trackers[worst].sc_valid   = 0;
@@ -1313,7 +1373,7 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * the value is usable. */
     int32_t ts_tx_err = 0;
     uint8_t ts_tx_err_valid = 0;
-    if (frame_len >= DL_TIMESYNC_LEN
+    if (frame_len >= DL_TIMESYNC_V2_LEN
         && (ts_flags & DL_TS_FLAG_TX_ERR_VALID)) {
         ts_tx_err = (int32_t)(int16_t)((uint16_t)rx_buf[DL_TS_TX_ERR_IDX]
                         | ((uint16_t)rx_buf[DL_TS_TX_ERR_IDX + 1] << 8));
@@ -1368,6 +1428,12 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     /* P0-4: TDMA cycle id of this beacon */
     s_trackers[tracker_slot].cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
                                 | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
+    /* Zone mesh (M2): which zone the sender is in.  A beacon from the old
+     * 67-byte firmware carries no zone byte — it counts as "no zone", which
+     * is the conservative answer (it matches no bucket). */
+    s_trackers[tracker_slot].zone_id =
+        (frame_len >= DL_TS_ZONE_IDX + 1) ? rx_buf[DL_TS_ZONE_IDX]
+                                          : (uint8_t)DL_ZONE_ID_NONE;
 
     int16_t cfo_raw = dwt_readclockoffset();
 
