@@ -40,8 +40,11 @@
 
 #define MAXA  DL_MAX_ANCHORS
 
-/* The solver's own conversion (mirrors tdoa_solver.c). */
-#define CM_PER_DTU 0.46907f
+/* The solver's own conversion (mirrors tdoa_solver.c).
+ * M1: it comes from shared_defines.h now — the test must not carry its
+ * own copy of the number, or the test could "pass" against a constant the
+ * firmware does not use. */
+#define CM_PER_DTU CM_PER_DTU_F
 
 static int g_fail = 0;
 static int g_checks = 0;

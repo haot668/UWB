@@ -32,6 +32,12 @@ extern "C" {
 
 #include <stdint.h>
 
+/* The DTU <-> cm conversion constants live in exactly ONE place:
+ * shared_defines.h (CM_PER_DTU_F and friends).  Including it here means
+ * every consumer of this header uses the same numbers, and a protocol
+ * change cannot silently disagree with the solver about the units. */
+#include "shared_defines.h"
+
 /*============================================================================
  * Function codes
  *============================================================================*/
@@ -564,9 +570,11 @@ extern "C" {
 #define DL_ANCHOR_ENTRY_SIZE  7u
 
 /* TDOA conversion: 1 DW3000 device time unit ≈ 15.65 ps ≈ 0.46907 cm.
- * P2-9: the canonical value is CM_PER_DTU_F in shared_defines.h — this
- * alias must not drift from it. */
-#define TDOA_CM_PER_DTU         0.46907f
+ * M1: the number now lives in ONE place only — shared_defines.h.  This is
+ * an alias to it, not a second copy of the literal, so the two cannot
+ * drift apart (the old copy here was a hard 0.46907f that nobody
+ * remembered to update). */
+#define TDOA_CM_PER_DTU         CM_PER_DTU_F
 
 typedef struct {
     uint16_t id;    /* anchor rank (16-bit to support ranks > 255) */
