@@ -3,18 +3,26 @@
  *  @brief   BD8NCF-style per-anchor TimeSync broadcaster (Phase 1.1)
  *
  *  Every anchor runs the same firmware.  Each anchor:
- *    - Broadcasts one compact 65-byte TimeSync frame per TDMA round (50 ms
+ *    - Broadcasts one compact 75-byte TimeSync frame per TDMA round (50 ms
  *      → 20 frames/s) at its own slot instant, carrying the exact TX
- *      timestamp, cs_level, parent_EUI64, position.
+ *      timestamp, the zone role, the zone's axis stamp and the position.
  *    - Listens between broadcasts for other anchors' TimeSync frames and
  *      updates its per-source Kalman clock-sync state (see clock_sync.h).
  *    - Accepts COORD_WRITE from the Gateway via UWB unicast to set its
  *      position.  Position is then broadcast in every TimeSync.
  *    - Keeps all OTA hooks intact for in-field firmware updates.
  *
- *  Phase 1.2 will introduce full cascading-sync election logic and Phase 1.3
- *  Observer feedback.  For Phase 1.1 every anchor assumes cs_level = 1
- *  (child of an implicit "root") — sufficient for first bring-up and test.
+ *  ZONE MESH (M3): there is no Root, no election and no ALOHA.
+ *    - The GATEWAY hands every anchor its zone, its slot and the zone's
+ *      clock reference in one NETWORK_START command; the anchor's slot is
+ *      known the moment the command arrives.
+ *    - The zone's REFERENCE anchor defines the zone's common time axis
+ *      (its beacon is the cycle origin) and closes the DS-TWR round trips
+ *      of the zone's members.  It carries no hierarchy.
+ *    - Every anchor of a zone places its slot instants on that axis, which
+ *      is what makes the Tag's slot-compensated TDOA meaningful inside the
+ *      zone.  Anchors of DIFFERENT zones sit on different axes and must
+ *      never be differenced against each other.
  *
  * @attention
  * Copyright 2015-2026 (c) UWB project authors.
@@ -132,23 +140,33 @@ static const uint8_t match_network_start[] = {0x41, 0x88, 0,
                                                0,    0,    FUNC_NETWORK_START};
 
 /*============================================================================
- * Anchor state machine for hierarchical clock sync
- *============================================================================*/
+ * Anchor run state (M3: no hierarchy, no election)
+ *
+ * The old design had four states because the anchor ELECTED itself a role:
+ * it scanned for peers, compared ranks, picked a parent and followed it.
+ * The zone mesh has no hierarchy — the gateway hands every anchor its zone,
+ * its slot and the zone's clock reference, so there is nothing to elect.
+ *
+ * STATE_IDLE  : no zone configuration yet (or the zone reference is gone).
+ * STATE_SYNC  : on the zone's TDMA grid.
+ *==========================================================================*/
 typedef enum {
-    STATE_SCAN = 0,   /* Boot: listening only, collecting peer info (5 seconds) */
-    STATE_ELECTING,   /* 5s scan ended: comparing ranks, determining role */
-    STATE_SYNC,       /* Normal operation: synced to parent */
-    STATE_ORPHAN      /* No parent heard for 30s: re-entering SCAN */
+    STATE_IDLE = 0,   /* Not on a grid: waiting for NETWORK_START */
+    STATE_SYNC        /* On the zone grid */
 } AnchorRunState;
 
 /*============================================================================
  * Manual network startup state (controlled by Gateway command)
- *============================================================================*/
+ *
+ * M3: there is no ALOHA and no confirmation handshake any more.  The gateway
+ * distributes the zone's slot table together with the zone configuration, so
+ * an anchor knows its slot the moment NETWORK_START arrives.  The only thing
+ * it still has to learn from the radio is the grid itself (the zone
+ * reference's beacon), which is not a state — it is a timestamp.
+ *==========================================================================*/
 typedef enum {
     NET_IDLE = 0,         /* Power-on: silent, waiting for NETWORK_START */
-    NET_STARTING,          /* NETWORK_START received: waiting child delay */
-    NET_WAIT_CONFIRM,      /* Sent ALOHA, waiting Root beacon to confirm slot in table */
-    NET_RUNNING            /* Root confirmed slot: normal TDMA operation */
+    NET_RUNNING           /* On the grid */
 } NetworkState;
 
 /*============================================================================
@@ -156,8 +174,9 @@ typedef enum {
  *============================================================================*/
 typedef struct {
     uint16_t           rank;             /* Anchor rank (0..15) — same as SRC addr */
-    uint8_t            cs_level;         /* 0 = root, 1+ = child */
-    uint64_t           parent_eui64;     /* EUI64 of anchor we sync to (0 if root) */
+    uint8_t            cs_level;         /* 0 = zone reference, 1 = member (M3:
+                                         * no longer a hierarchy level — it is
+                                         * only "am I the zone's clock origin") */
     uint64_t           my_eui64;         /* This anchor's EUI64 */
     dl_anchor_entry_t  my_pos;           /* My position, broadcast in TimeSync */
     uint64_t           prev_tx_ts;       /* Last actual TX timestamp (40-bit, latched) */
@@ -167,12 +186,10 @@ typedef struct {
     uint32_t           tx_count;
     uint32_t           rx_count;
 
-    /* Hierarchical sync state */
-    AnchorRunState     run_state;        /* SCAN / ELECTING / SYNC / ORPHAN */
-    uint16_t           parent_rank;      /* Rank of anchor we sync to (0 = no parent) */
-    uint32_t           scan_start_ms;    /* When SCAN began (for 5s timeout) */
-    uint32_t           last_parent_rx_ms;/* Last time we heard our parent */
-    uint32_t           electing_start_ms; /* When ELECTING began (for timeout) */
+    /* Zone mesh run state (M3): no hierarchy, no election, no parent.
+     * The anchor is either waiting for a zone configuration (NET_IDLE /
+     * STATE_IDLE) or on the zone's grid (NET_RUNNING / STATE_SYNC). */
+    AnchorRunState     run_state;        /* IDLE / SYNC */
 
     /* Per-source clock-sync state: when we RX another anchor's TimeSync, we
      * track its clock offset relative to ours via a Kalman filter. */
@@ -202,36 +219,50 @@ typedef struct {
     uint8_t            zone_link_quality; /* quality of that reference edge  */
     uint64_t           zone_time_base;  /* the zone's time origin (DTU)       */
     uint8_t            zone_time_base_valid;
+    /* The zone reference's most recent TX instant (raw 40-bit, in the
+     * reference's clock = the zone's axis).  Published in every beacon so
+     * that the Tag can check that the anchors it buckets together really do
+     * sit on ONE axis — two anchors of different zones publish different
+     * stamps, and mixing them is exactly the error the zone split exists to
+     * prevent. */
+    uint64_t           zone_ref_ts;
+    uint8_t            zone_ref_ts_valid;
 } AnchorState;
 
 static AnchorState g_anchor;
 
-/* TDMA reference state: updated when we receive Root's beacon.
- * Used by non-root anchors to schedule their TX relative to Root's TX time.
+/* TDMA reference state: updated when we receive the ZONE REFERENCE's beacon.
+ * Used by the zone's members to schedule their TX relative to the reference's
+ * TX time.
  *
- * P0-3: the grid is anchored on the ROOT's clock, but every anchor schedules
- * its own delayed TX in ITS OWN DW3000 SYS_TIME.  The two clocks are NOT the
- * same (each DW3000's SYS_TIME starts at 0 on power-up, so the offset between
- * two anchors equals their power-up skew — potentially seconds!).  Therefore
- * the Root's grid instants MUST be converted into the local clock before they
- * are used as a delayed-TX target, using the clock-sync model we maintain
- * towards the Root (factor_R / offset_R).
+ * P0-3: the grid is anchored on the REFERENCE's clock, but every anchor
+ * schedules its own delayed TX in ITS OWN DW3000 SYS_TIME.  The two clocks
+ * are NOT the same (each DW3000's SYS_TIME starts at 0 on power-up, so the
+ * offset between two anchors equals their power-up skew — potentially
+ * seconds!).  Therefore the reference's grid instants MUST be converted into
+ * the local clock before they are used as a delayed-TX target, using the
+ * clock-sync model we maintain towards the reference (factor_R / offset_R).
+ *
+ * M3: "Root" became "zone reference".  There is no longer ONE master for the
+ * whole network — every zone has its own reference, and the two live in
+ * parallel without interfering.  The names below were renamed so that no
+ * piece of code still reads as if a global master existed.
  */
 static struct {
-    uint64_t root_tx_ts;       /* Root's TX timestamp, EXTENDED to 64 bit      */
-    uint64_t root_tx_raw;      /* last raw 40-bit value (wrap detection)      */
-    uint64_t root_local_ts;    /* our SYS_TIME when that Root frame arrived    */
-    uint64_t base_origin;      /* cycle origin in OUR clock (Root ts mapped)   */
-    uint64_t base_local_time;  /* our SYS_TIME when that beacon was received   */
-    uint32_t root_rx_ms;       /* SysTick when we received that beacon         */
-    uint8_t  root_slot;        /* Root's slot index (always 0)                 */
-    bool     have_root_ref;    /* true once we've received a Root beacon       */
-    uint16_t root_cycle_id;    /* cycle counter carried by the last Root beacon*/
+    uint64_t ref_tx_ts;       /* reference TX timestamp, EXTENDED to 64 bit    */
+    uint64_t ref_tx_raw;      /* last raw 40-bit value (wrap detection)       */
+    uint64_t ref_local_ts;    /* our SYS_TIME when that frame arrived          */
+    uint64_t base_origin;     /* cycle origin in OUR clock (ref ts mapped)     */
+    uint64_t base_local_time; /* our SYS_TIME when that beacon was received     */
+    uint32_t ref_rx_ms;       /* SysTick when we received that beacon           */
+    uint8_t  ref_slot;        /* reference's slot index (normally 0)            */
+    bool     have_ref;        /* true once we've received a reference beacon   */
+    uint16_t ref_cycle_id;    /* cycle counter carried by the last ref beacon  */
 } g_tdma_ref;
 
-/* Grid base for the Root: the Root's own first TX timestamp after entering
- * NET_RUNNING.  Fixed, so the cycle index (now - base) / period is stable. */
-static uint64_t s_root_grid_base = 0;
+/* Grid base for the zone reference: its own first TX timestamp after joining
+ * the zone.  Fixed, so the cycle index (now - base) / period is stable. */
+static uint64_t s_zone_grid_base = 0;
 
 /* Last grid instant (local clock) at which we actually transmitted.
  * Used to guarantee at most ONE transmission per TDMA cycle. */
@@ -492,31 +523,44 @@ static void anchor_clear_slot(const char *reason)
  * TDOA budget).  The history is short because the reference frame is at most
  * a couple of cycles old.
  *==========================================================================*/
-#define ROOT_TX_HIST 8u
-static uint64_t s_root_tx_ts[ROOT_TX_HIST];
-static uint16_t s_root_tx_cycle[ROOT_TX_HIST];
-static uint8_t  s_root_tx_idx = 0;
+#define ZONE_REF_TX_HIST 8u
+static uint64_t s_zone_ref_tx_ts[ZONE_REF_TX_HIST];
+static uint16_t s_zone_ref_tx_cycle[ZONE_REF_TX_HIST];
+static uint8_t  s_zone_ref_tx_idx = 0;
 
-/* Look up the Root's ACTUAL TX instant for a cycle id (0 = not in history). */
-static uint64_t root_tx_ts_for_cycle(uint16_t cycle)
+/* Look up the zone reference's ACTUAL TX instant for a cycle id
+ * (0 = not in history). */
+static uint64_t zone_ref_tx_ts_for_cycle(uint16_t cycle)
 {
     int i;
-    for (i = 0; i < ROOT_TX_HIST; i++) {
+    for (i = 0; i < ZONE_REF_TX_HIST; i++) {
         /* newest first */
-        uint8_t k = (uint8_t)((s_root_tx_idx + 1u + i) % ROOT_TX_HIST);
-        if (s_root_tx_ts[k] != 0 && s_root_tx_cycle[k] == cycle) return s_root_tx_ts[k];
+        uint8_t k = (uint8_t)((s_zone_ref_tx_idx + 1u + i) % ZONE_REF_TX_HIST);
+        if (s_zone_ref_tx_ts[k] != 0 && s_zone_ref_tx_cycle[k] == cycle) {
+            return s_zone_ref_tx_ts[k];
+        }
     }
     return 0;
 }
 
 /* Manual network state: controlled by Gateway's NETWORK_START command */
 static NetworkState s_net_state = NET_IDLE;
-static uint16_t     s_net_root_rank = 0;     /* designated root rank */
+/* The zone's clock reference (M3).
+ *
+ * In the old design there was ONE Root for the whole network and every
+ * anchor placed its slot instants on that Root's clock.  Now there is one
+ * reference PER ZONE: the anchor named by the gateway in NETWORK_START
+ * (DL_TS_NET_ZREF_IDX).  The gateway takes it from the host's choice, so
+ * it is a CONFIGURATION, not the result of an election race between
+ * anchors that may not hear each other.
+ *
+ * The name is "reference", not "Root", because it carries no hierarchy:
+ * it does not own the slot table (the gateway does), it does not own the
+ * parameter sync, and it does not have to be the anchor that others
+ * "belong" to. */
+static uint16_t     s_zone_ref_rank = 0;     /* the zone's clock reference */
 static uint8_t      s_net_slot_idx = 255;    /* this anchor's assigned slot */
 static uint32_t     s_net_start_ms = 0;      /* when NETWORK_START was received */
-static uint32_t     s_aloha_sent_ms = 0;     /* timestamp of last ALOHA TX (0 = none/cooldown expired) */
-static uint32_t     s_confirm_wait_ms = 0;   /* when NET_WAIT_CONFIRM started */
-static uint8_t      s_aloha_mode = 0;        /* 1 = in ALOHA fallback (timeout), allows TX even if slot=255 */
 static uint32_t     s_last_start_ms = 0;     /* when NETWORK_START was last applied (dedup) */
 
 /*============================================================================
@@ -700,22 +744,6 @@ static int find_neighbor_slot_by_rank(uint16_t rank)
 
 /* TDMA slot scheduling helpers ------------------------------------------------*/
 
-/* Parse the 8-byte TX slot table from a received Timesync frame.
- * Populates slot_owners[] with the ranks in slot order.
- * Returns the number of active slots. */
-static uint8_t parse_slot_table(const uint8_t *buf)
-{
-    uint8_t count = 0;
-    int i;
-    for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
-        uint16_t r = (uint16_t)buf[i * 2] | ((uint16_t)buf[i * 2 + 1] << 8);
-        g_anchor.slot_owners[i] = r;
-        if (r != 0) count++;
-    }
-    g_anchor.last_schedule_rx_ms = HAL_GetTick();
-    return count;
-}
-
 /* Find which slot index this anchor's rank occupies.
  * Returns 255 if not found (no slot assigned). */
 static uint8_t find_my_slot(uint16_t my_rank)
@@ -728,150 +756,76 @@ static uint8_t find_my_slot(uint16_t my_rank)
 }
 
 /*============================================================================
- * Slot table from the participant roster (P2-7)
+ * The zone's slot table (M3)
  *
- * The roster is the participant list the gateway sent together with
- * NETWORK_START.  Every anchor holds the SAME list, so a rank's slot index
- * is identical on every node and for the whole life of the network.
+ * ONE table for the whole zone, and it comes from ONE place: the GATEWAY.
  *
- * WHY THIS MATTERS: the Tag compensates every beacon with
+ * The old scheme had two.  The Root built one from the roster and broadcast
+ * it, and every anchor ALSO built a private one out of whatever neighbours
+ * it happened to hear (tdma_build_table_from_neighbors()).  Two tables for
+ * one grid means two different answers to "whose turn is it", and the
+ * anchors disagreed — which is a collision, and a beacon that lands in the
+ * wrong slot is charged to the TDOA as a real time difference.
+ *
+ * WHY THE TABLE HAS TO BE SHARED: the Tag compensates every beacon with
  *     toa_equiv = rx_local - slot x 6.25 ms
- * The slot is what tells the Tag HOW LATE the beacon was sent.  If the Root
- * rebuilt the table from the neighbours it happened to hear, then ONE
- * evicted or newly heard anchor shifts the slot of every anchor behind it
- * — and the Tag compensates those beacons against the wrong slot instant,
- * i.e. off by a multiple of 6.25 ms (a multiple of ~2 km of path).
+ * The slot is what tells the Tag HOW LATE the beacon was sent.  If one
+ * anchor rebuilt the table from its own neighbours, ONE evicted or newly
+ * heard anchor shifts the slot of every anchor behind it — and the Tag
+ * compensates those beacons against the wrong slot instant, i.e. off by a
+ * multiple of 6.25 ms (a multiple of ~2 km of path).
  *
- * The table is therefore built from the roster: slot 0 = the Root, then the
- * roster members in the roster's order.
+ * The gateway's table is indexed by ROSTER index: entry i is the TDMA slot
+ * of roster[i].  0xFFFF = that member has no slot.
  *
- * THE ROSTER IS THE WHOLE LIST — nothing is appended.
+ * The anchor's OWN slot is taken from that table directly.  There is no
+ * "tentative slot", no "wait until the Root admits us" state and no ALOHA:
+ * the gateway knows the membership before it sends the command, so the
+ * anchor knows its slot the moment the command arrives.
  *
- * An anchor that is HEARD but NOT LISTED used to be appended at the end, so
- * it got a slot and joined the grid.  That was wrong: the operator picked
- * the members in the host dialog, and an anchor that was not picked still
- * received the NETWORK_START broadcast (it is a broadcast!) — so it landed
- * in the grid with a slot, and the Tag included it in the TDOA with the
- * coordinates (0,0,0) it never had.  One extra anchor was enough to pull
- * the whole solution towards the origin.
- *
- * An anchor that is not in the roster now gets NO slot: it stays off the
- * grid, keeps broadcasting off-grid beacons with slot = 255, and the Tag
- * excludes it (it skips every anchor whose slot is unknown).
- *
- * Returns false when the roster cannot be used (empty) — the caller then
- * keeps the neighbour-based table.
+ * An anchor that is HEARD but NOT LISTED gets NO slot: it stays off the
+ * grid, and the Tag excludes it (it skips every anchor whose slot is
+ * unknown).
  *==========================================================================*/
-static bool tdma_build_table_from_roster(void)
-{
-    uint16_t ranks[ANCHOR_MAX_SLOTS];
-    int count = 0;
-    int i, j;
-
-    if (s_roster_n == 0) return false;
-
-    /* Slot 0 belongs to the Root of the network. */
-    uint16_t root = s_net_root_rank;
-    if (root == 0) root = g_anchor.rank;
-    ranks[count++] = root;
-
-    /* The remaining roster members, in the roster's order. */
-    for (i = 0; i < (int)s_roster_n && count < ANCHOR_MAX_SLOTS; i++) {
-        uint16_t r = s_roster[i];
-        if (r == 0 || r == root) continue;
-        bool dup = false;
-        for (j = 0; j < count; j++) { if (ranks[j] == r) { dup = true; break; } }
-        if (!dup) ranks[count++] = r;
-    }
-
-    /* NOTHING is appended here: an anchor that is heard but not listed gets
-     * no slot at all (see the comment above). */
-
-    for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
-        g_anchor.slot_owners[i] = (i < count) ? ranks[i] : 0;
-    }
-    return true;
-}
-
-/* Fallback: collect all discovered anchor ranks (from neighbors[]) and fill
- * slot_owners[] in ascending rank order. Self (root rank) goes in slot 0.
- * Only used for a network that was started without a roster. */
-static void tdma_build_table_from_neighbors(void)
-{
-    /* Collect up to ANCHOR_MAX_SLOTS unique ranks */
-    uint16_t ranks[ANCHOR_MAX_SLOTS];
-    int count = 0;
-    int i;
-
-    /* Root (cs_level=0) always occupies slot 0 — do not sort root away.
-     * This prevents a lower-ranked child anchor from displacing root. */
-    if (g_anchor.cs_level == 0) {
-        ranks[count++] = g_anchor.rank;  /* slot 0 = root */
-    }
-
-    /* Add all discovered neighbors (skip self) */
-    for (i = 0; i < ANCHOR_MAX_NEIGHBORS && count < ANCHOR_MAX_SLOTS; i++) {
-        if (!g_anchor.neighbors[i].initialized) continue;
-        uint16_t r = g_anchor.neighbors[i].neighbor_rank;
-        if (r == 0 || r == g_anchor.rank) continue;
-        /* Avoid duplicates */
-        int j; bool dup = false;
-        for (j = 0; j < count; j++) { if (ranks[j] == r) { dup = true; break; } }
-        if (!dup) ranks[count++] = r;
-    }
-
-    /* Sort non-root ranks ascending (slot 0 already taken by root) */
-    int sort_start = (g_anchor.cs_level == 0) ? 1 : 0;
-    for (i = sort_start; i < count - 1; i++) {
-        int j;
-        for (j = i + 1; j < count; j++) {
-            if (ranks[j] < ranks[i]) {
-                uint16_t tmp = ranks[i]; ranks[i] = ranks[j]; ranks[j] = tmp;
-            }
-        }
-    }
-
-    /* Fill slot_owners with sorted ranks, zero-fill rest */
-    for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
-        g_anchor.slot_owners[i] = (i < count) ? ranks[i] : 0;
-    }
-}
-
-/* Root only: fill slot_owners[] — from the participant roster when there is
- * one (stable slots, P2-7), otherwise from the discovered neighbours.
- * Call this whenever a new neighbor is discovered or the topology changes. */
 static void tdma_build_table(void)
 {
-    /* P2-7: the Root takes its slots from the roster — they do not move
-     * while the network runs.  The neighbour-based table is only the
-     * fallback for a network that was started without a roster. */
-    if (g_anchor.cs_level == 0 && tdma_build_table_from_roster()) return;
+    int i, j;
 
-    tdma_build_table_from_neighbors();
-    /* Update our own slot index — but only if Root has confirmed us.
-     * During NET_WAIT_CONFIRM the Child is NOT yet in Root's slot_owners,
-     * so find_my_slot() returns 255.
-     * P1-2: in that case my_slot_idx stays 255 (the pre-computed bootstrap
-     * slot is NOT used) — the Tag then skips this anchor instead of pairing
-     * it against a slot instant it does not own. */
-    {
-        uint8_t real_slot = find_my_slot(g_anchor.rank);
-        if (real_slot != 255) {
-            g_anchor.my_slot_idx = real_slot;
+    for (i = 0; i < ANCHOR_MAX_SLOTS; i++) g_anchor.slot_owners[i] = 0;
+
+    for (i = 0; i < (int)s_roster_n; i++) {
+        uint16_t r = s_roster[i];
+        uint16_t sl;
+        if (r == 0) continue;
+        sl = (i < (int)s_zone_slot_n) ? s_zone_slot_table[i] : 0xFFFFu;
+        if (sl == 0xFFFFu || sl >= (uint16_t)ANCHOR_MAX_SLOTS) continue;
+        /* One slot per anchor: if two roster entries claim the same slot,
+         * the first one wins — a duplicated slot would put two anchors on
+         * the same instant, which is a collision. */
+        bool dup = false;
+        for (j = 0; j < ANCHOR_MAX_SLOTS; j++) {
+            if (g_anchor.slot_owners[j] == r) { dup = true; break; }
         }
+        if (dup) continue;
+        g_anchor.slot_owners[sl] = r;
     }
-}
 
-/* Child only: check if our rank appears anywhere in Root's slot_owners table.
- * This confirms that Root has heard our ALOHA beacon and registered us. */
-static bool is_in_root_slot_table(void)
-{
-    int i;
-    for (i = 0; i < ANCHOR_MAX_SLOTS; i++) {
-        if (g_anchor.slot_owners[i] == g_anchor.rank)
-            return true;
+    /* My own slot: the one the gateway gave MY roster entry. */
+    {
+        uint8_t my_slot = 255;
+        for (i = 0; i < (int)s_roster_n; i++) {
+            if (s_roster[i] != g_anchor.rank) continue;
+            if (i < (int)s_zone_slot_n) {
+                uint16_t sl = s_zone_slot_table[i];
+                if (sl != 0xFFFFu && sl < (uint16_t)ANCHOR_MAX_SLOTS) {
+                    my_slot = (uint8_t)sl;
+                }
+            }
+            break;
+        }
+        g_anchor.my_slot_idx = my_slot;
+        s_net_slot_idx = my_slot;
     }
-    return false;
 }
 
 /*============================================================================
@@ -949,37 +903,60 @@ static uint64_t rx_ts_ext(void)
     return ext;
 }
 
-/* Clock-sync model of this anchor towards the designated Root (if any). */
-static const AnchorClockSync *root_sync(void)
+/* Am I the reference anchor of my zone?
+ *
+ * The reference is DESIGNATED by the gateway (NETWORK_START), it is not
+ * elected: it is the anchor whose clock defines the zone's common time
+ * axis.  It carries no hierarchy — no parent, no children list, no slot
+ * table of its own (the gateway hands that out). */
+static bool am_zone_ref(void)
+{
+    return (s_zone_ref_rank != 0 && g_anchor.rank == s_zone_ref_rank);
+}
+
+/* Clock-sync model of this anchor towards the ZONE REFERENCE (if any).
+ *
+ * This is the edge that carries the zone's clock: the reference anchor's
+ * programmed instants are the axis every member of the zone places its own
+ * slot instants on.  It is an ordinary edge in the neighbour table — the
+ * "no Root" architecture has no privileged link, it has one link that
+ * happens to be the axis of THIS zone.
+ *
+ * M3: the reference is the one the GATEWAY named.  An anchor does NOT
+ * pick a different one on its own: a unilateral switch would put this
+ * anchor on a DIFFERENT time axis than the rest of the zone, and the
+ * slot-compensated TDOA between them would be meaningless.  Re-designating
+ * the reference is therefore a ZONE-wide event, driven by the host. */
+static const AnchorClockSync *ref_sync(void)
 {
     int i;
-    if (s_net_root_rank == 0) return NULL;
+    if (g_anchor.zone_ref_rank == 0 || g_anchor.zone_ref_rank == 0xFFFFu) return NULL;
     for (i = 0; i < ANCHOR_MAX_NEIGHBORS; i++) {
         if (g_anchor.neighbors[i].initialized
-            && g_anchor.neighbors[i].neighbor_rank == s_net_root_rank) {
+            && g_anchor.neighbors[i].neighbor_rank == g_anchor.zone_ref_rank) {
             return &g_anchor.neighbors[i];
         }
     }
     return NULL;
 }
 
-/* Mutable variant of root_sync() — used to book TX-side events (GTX freeze,
- * delayed-TX fallback) on the link towards the Root. */
-static AnchorClockSync *root_sync_mut(void)
+/* Mutable variant of ref_sync() — used to book TX-side events (GTX freeze,
+ * delayed-TX fallback) on the link towards the zone reference. */
+static AnchorClockSync *ref_sync_mut(void)
 {
     int i;
-    if (s_net_root_rank == 0) return NULL;
+    if (g_anchor.zone_ref_rank == 0 || g_anchor.zone_ref_rank == 0xFFFFu) return NULL;
     for (i = 0; i < ANCHOR_MAX_NEIGHBORS; i++) {
         if (g_anchor.neighbors[i].initialized
-            && g_anchor.neighbors[i].neighbor_rank == s_net_root_rank) {
+            && g_anchor.neighbors[i].neighbor_rank == g_anchor.zone_ref_rank) {
             return &g_anchor.neighbors[i];
         }
     }
     return NULL;
 }
 
-/* Map an instant expressed in the ROOT's clock into this anchor's clock.
- * The sync model is  local_rx ≈ factor * remote_tx + offset_dtu, i.e.
+/* Map an instant expressed in the zone reference's clock into this anchor's
+ * clock.  The sync model is  local_rx ≈ factor * remote_tx + offset_dtu, i.e.
  *   local_clock = factor * remote_clock + offset_dtu.
  * Without a converged model we fall back to identity (assume identical
  * clocks) — the grid still works, only the absolute slot accuracy degrades.
@@ -992,35 +969,35 @@ static AnchorClockSync *root_sync_mut(void)
  * NOTE: this form is only used for DIAGNOSTICS.  Its error is
  * factor_error * (ts - ref_tx), i.e. it is only accurate for stamps close
  * to the reference — far too coarse to place a beacon on the grid.  The
- * grid origin is taken from our own RX instant of the Root's beacon
+ * grid origin is taken from our own RX instant of the reference's beacon
  * instead (see anchor_rx_timesync()). */
-static uint64_t root_clock_to_local(uint64_t root_ts)
+static uint64_t zone_ref_clock_to_local(uint64_t ref_ts)
 {
-    const AnchorClockSync *s = root_sync();
-    if (!s || s->update_count < 3) return root_ts;
-    double v = s->factor * (double)root_ts + (double)s->offset_dtu;
+    const AnchorClockSync *s = ref_sync();
+    if (!s || s->update_count < 3) return ref_ts;
+    double v = s->factor * (double)ref_ts + (double)s->offset_dtu;
     if (v < 0.0) v = 0.0;
     return (uint64_t)v;
 }
 
-/* Compute the exact instant of our next slot in the Root's grid.
+/* Compute the exact instant of our next slot on the ZONE grid.
  *
  *   *target_out : the instant (OUR clock) at which we must transmit
  *   *cycle_out  : TDMA cycle counter to stamp into the frame
  *
- * Returns false when no grid is known yet (no Root beacon heard).
+ * Returns false when no grid is known yet (no reference beacon heard).
  */
 static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
 {
     uint64_t period = (uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME;
 
-    if (g_anchor.cs_level == 0) {
-        /* ── Root: the grid origin is our own first beacon of this network ── */
-        if (s_root_grid_base == 0) return false;
+    if (am_zone_ref()) {
+        /* ── Reference: the grid origin is our own first beacon of this zone ── */
+        if (s_zone_grid_base == 0) return false;
         uint64_t now = now_sys_ext();
-        if (now < s_root_grid_base) return false;
-        uint64_t k    = (now - s_root_grid_base) / period;
-        uint64_t tgt = s_root_grid_base + k * period;
+        if (now < s_zone_grid_base) return false;
+        uint64_t k    = (now - s_zone_grid_base) / period;
+        uint64_t tgt = s_zone_grid_base + k * period;
         uint16_t cyc = (uint16_t)(k & 0xFFFFu);
         /* If this round's instant has already passed, take the next one.
          * The criterion is "the instant is gone", NOT "the instant is more
@@ -1037,19 +1014,19 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
         return true;
     }
 
-    /* ── Child: origin = the Root's beacon TX instant, mapped to our clock ── */
-    if (!g_tdma_ref.have_root_ref) return false;
+    /* ── Member: origin = the reference's beacon TX instant, in our clock ── */
+    if (!g_tdma_ref.have_ref) return false;
     if (g_anchor.my_slot_idx == 255) return false;   /* not admitted yet */
 
-    /* The sync model is  local = factor * root + offset_dtu, i.e. `factor`
-     * is OUR clock rate relative to the Root's.  An interval measured in
-     * the Root's clock is therefore factor × longer in ours.  The old code
+    /* The sync model is  local = factor * remote + offset_dtu, i.e. `factor`
+     * is OUR clock rate relative to the reference's.  An interval measured in
+     * the reference's clock is therefore factor × longer in ours.  The old code
      * divided instead of multiplying — invisible while the factor estimate
      * was stuck at 1.0, but at 200 ppm it displaced the slot instant by
      * slot × 6.25 ms × 200 ppm = 1.25 µs per slot (875 ns ≈ 262 m of path
      * at slot 7), far above the 0.67 ns the 20 cm target needs. */
     double f = 1.0;
-    const AnchorClockSync *s = root_sync();
+    const AnchorClockSync *s = ref_sync();
     if (s && s->update_count >= 3) f = s->factor;
     if (!(f > 0.5 && f < 2.0)) f = 1.0;
     uint64_t period_local = (uint64_t)((double)period * f);
@@ -1058,18 +1035,18 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
     uint64_t now = now_sys_ext();
     if (now < g_tdma_ref.base_local_time) return false;
     /* Cycles elapsed since the reference beacon (the reference is refreshed
-     * on every Root beacon, so this stays within ±1 cycle). */
+     * on every reference beacon, so this stays within ±1 cycle). */
     uint64_t k    = (now - g_tdma_ref.base_local_time) / period_local;
     uint64_t slot_off = (uint64_t)((double)((uint64_t)g_anchor.my_slot_idx
                                              * ANCHOR_SLOT_DTU_US * UUS_TO_DWT_TIME) * f);
     uint64_t tgt  = g_tdma_ref.base_origin + k * period_local + slot_off;
 
-    /* DS-TWR: the Root→Child propagation delay is already removed from
-     * base_origin (it is the instant the Root's beacon was TRANSMITTED, not
-     * the instant it arrived), so no further shift is needed here.  The
+    /* DS-TWR: the reference→member propagation delay is already removed from
+     * base_origin (it is the instant the reference's beacon was TRANSMITTED,
+     * not the instant it arrived), so no further shift is needed here.  The
      * correction s_twr_corr_dtu is applied where base_origin is built. */
 
-    uint16_t cyc  = (uint16_t)(g_tdma_ref.root_cycle_id + (uint16_t)k);
+    uint16_t cyc  = (uint16_t)(g_tdma_ref.ref_cycle_id + (uint16_t)k);
     /* Same rule as on the Root: the instant has passed → take the next one. */
     if (tgt <= now) {
         tgt += period_local;
@@ -1092,39 +1069,23 @@ static bool tdma_grid_target(uint64_t *target_out, uint16_t *cycle_out)
  */
 static bool tdma_may_tx(uint64_t *target_out, uint16_t *cycle_out)
 {
-    /* Manual network: NET_IDLE / NET_STARTING / NET_WAIT_CONFIRM → silent.
-     * (NET_WAIT_CONFIRM uses the off-grid ALOHA bootstrap instead, which the
-     * main loop sends explicitly — see below.) */
-    if (s_net_state == NET_IDLE) return false;
-    if (s_net_state == NET_STARTING) return false;
-    if (s_net_state == NET_WAIT_CONFIRM) return false;
+    /* Not in a zone yet → silent.  There is no ALOHA and no confirmation
+     * handshake any more: the gateway's NETWORK_START carries the slot
+     * table, so the anchor knows its slot the moment the command arrives. */
+    if (s_net_state != NET_RUNNING) return false;
 
-    /* ── ALOHA fallback (after NET_CONFIRM_TIMEOUT) ───────────────────────
-     * s_aloha_mode=1 means the Root never confirmed our slot (RF link issue).
-     * In this mode we transmit off-grid every ~500 ms to re-establish contact.
-     * Off-grid beacons carry slot = 255, so the Tag excludes them from the
-     * TDOA solve (P1-2) — they can never corrupt the geometry. */
-    if (s_aloha_mode) {
-        if (g_anchor.my_slot_idx != 255) s_aloha_mode = 0;   /* Root confirmed us */
-        return false;   /* handled by the ALOHA path in the main loop */
-    }
-
-    /* ── Normal TDMA operation (NET_RUNNING, slot confirmed) ─────────────
-     * The Root's schedule is stale (> 5 s without a Root beacon) — we keep
-     * our slot but stop transmitting rather than guessing a slot instant. */
-    uint32_t age_ms = HAL_GetTick() - g_anchor.last_schedule_rx_ms;
-    if (age_ms > 5000) {
-        if (g_anchor.cs_level != 0) {
-            /* A child that has not heard the Root for 5 s cannot know its
-             * slot instant any more: it leaves the grid instead of
-             * transmitting at a guessed instant (a mis-timed beacon
-             * poisons the TDOA of every other anchor in that cycle). */
-            anchor_clear_slot("ROOT_SCHEDULE_STALE");
-            return false;
-        }
-        /* The Root owns slot 0 and is the clock source of the whole
-         * network — it keeps beaconing even when no child has been heard
-         * for a while, otherwise a one-way link silences the network. */
+    /* ── The zone reference is the axis ────────────────────────────────────
+     * A member that has not heard the reference for DL_REF_STALE_MS cannot
+     * know its slot instant any more: it leaves the grid instead of
+     * transmitting at a guessed instant (a mis-timed beacon poisons the
+     * TDOA of every other anchor in that cycle).
+     *
+     * The reference itself keeps beaconing — it owns the zone's grid, and a
+     * one-way link must not silence the zone. */
+    if (!am_zone_ref()) {
+        if (!g_tdma_ref.have_ref) return false;
+        uint32_t age_ms = HAL_GetTick() - g_tdma_ref.ref_rx_ms;
+        if (age_ms > (uint32_t)DL_REF_STALE_MS) return false;
     }
 
     if (!tdma_grid_target(target_out, cycle_out)) return false;
@@ -1142,7 +1103,7 @@ static bool tdma_may_tx(uint64_t *target_out, uint16_t *cycle_out)
  * TimeSync TX — one beacon per TDMA cycle, at our slot instant
  *
  * scheduled_tx : the exact instant (our DW3000 clock) to transmit at.
- *                0 → transmit immediately (bootstrap / ALOHA).
+ *                0 → transmit immediately (the zone reference's bootstrap).
  * cycle_id     : TDMA cycle counter to stamp into the frame (P0-4).
  *============================================================================*/
 static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
@@ -1170,7 +1131,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * of dwt_setdelayedtrxtime() — known exactly before the frame is built
      * and accurate to the 8-DTU (125 ps) hardware granularity — so the
      * PRECISE flag is set.
-     * For an immediate frame (ALOHA / bootstrap) the real TX instant can only
+     * For an immediate frame (the reference's bootstrap) the real TX instant can only
      * be read after the transmission, so we put the current SYS_TIME (an
      * estimate, off by the SPI write + starttx latency ≈ 30 µs) and CLEAR the
      * PRECISE flag: receivers must not use imprecise timestamps for the
@@ -1223,7 +1184,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * propagation delay, so two anchors' stamps cannot be differenced.) */
     if (scheduled_tx != 0 && s_tx_delay_valid) {
         int32_t tx_err = dx_time_trunc_err(scheduled_tx);
-        if (g_anchor.cs_level == 0) tx_err += (int32_t)s_tx_delay_dtu;
+        if (am_zone_ref()) tx_err += (int32_t)s_tx_delay_dtu;
         if (tx_err >= -32768 && tx_err <= 32767) {
             uint16_t u = (uint16_t)(int16_t)tx_err;
             pkt[DL_TS_TX_ERR_IDX]     = (uint8_t)(u & 0xFF);
@@ -1245,22 +1206,55 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         }
     }
     if (scheduled_tx == 0) {
-        /* Immediate frame (bootstrap / ALOHA): it does not go out on the
-         * grid at all, so there is no grid departure error to publish —
-         * and the receiver must not pair it into the TDOA. */
+        /* Immediate frame (the reference's bootstrap): it does not go out
+         * on the grid at all, so there is no grid departure error to
+         * publish — and the receiver must not pair it into the TDOA. */
         pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_OFFGRID;
     }
     /* P0-1: cs_level and slot are two DIFFERENT bytes now.  They used to
      * share byte 18, so writing the slot destroyed the level and every
-     * receiver saw a corrupted hierarchy. */
-    pkt[DL_TS_LEVEL_IDX] = g_anchor.cs_level;
-    pkt[DL_TS_SLOT_IDX]  = g_anchor.my_slot_idx;   /* 255 = not admitted */
-    pack_eui64_u64(&pkt[DL_TS_PARENT_EUI_IDX], g_anchor.parent_eui64);
+     * receiver saw a corrupted hierarchy.
+     *
+     * M3: cs_level no longer describes a hierarchy level — there is no
+     * hierarchy any more.  It is the ZONE ROLE: 0 = the zone's reference
+     * (the anchor whose clock defines the zone's axis), 1 = a member.
+     * The Tag still reads this byte to find the reference of the zone it
+     * is in (M4 replaces that by a per-zone bucket). */
+    pkt[DL_TS_LEVEL_IDX] = am_zone_ref() ? 0 : 1;
 
-    /* Root broadcasts TX slot table (8 slots × 2 bytes = 16 bytes).
-     * Layout: uint16_t rank per slot, 0 = empty. All anchors listen to the
-     * same table so they can compute their own slot index. Non-root anchors
-     * store this table to find their slot but do not re-broadcast it. */
+    /* The slot the TAG compensates this beacon with.
+     *
+     * Until the zone reference has closed the DS-TWR round trip with us, our
+     * beacon sits ONE PROPAGATION DELAY off the axis (the one-way delay
+     * cannot be separated from the clock offset).  Advertising our slot
+     * then would let the Tag charge that delay to the TDOA as a real
+     * difference of distance — so the slot stays 255 and the Tag skips us
+     * completely (P1-3).
+     *
+     * We DO transmit on the grid all the same: that is exactly what lets the
+     * reference hear us and close the round trip.  With the ALOHA of the old
+     * design gone, this on-grid "unadmitted" beacon is the only thing that
+     * can get the member onto the axis — without it the member would stay
+     * silent forever and never be measured at all. */
+    {
+        uint8_t tx_slot = g_anchor.my_slot_idx;
+        if (!am_zone_ref() && !(s_twr_corr_valid && !s_twr_corr_stale)) {
+            tx_slot = 255;
+        }
+        pkt[DL_TS_SLOT_IDX] = tx_slot;   /* 255 = not admitted */
+    }
+
+    /* The parent EUI64 field [19-26] is DEAD in M3: the zone mesh has no
+     * parent (no anchor belongs to another anchor).  The bytes stay in the
+     * frame so that the layout of the older fields does not move — they are
+     * simply zero (the buffer was zeroed). */
+
+    /* The zone's TX slot table (8 slots × 2 bytes = 16 bytes).
+     * Layout: uint16_t rank per slot, 0 = empty.  The table is the one the
+     * GATEWAY handed out; the reference merely echoes it so that a member
+     * which joined late can check its mapping.  Nobody rebuilds it from
+     * neighbours any more — that was the source of two disagreeing tables
+     * for one grid. */
     {
         int si;
         for (si = 0; si < ANCHOR_MAX_SLOTS; si++) {
@@ -1327,11 +1321,24 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * taking it for an instant. */
     pkt[DL_TS_ZONE_IDX]         = g_anchor.zone_id;
     pkt[DL_TS_LINK_QUALITY_IDX] = g_anchor.zone_link_quality;
-    pkt[DL_TS_ZONE_ROLE_IDX]    = g_anchor.zone_role;
-    /* zone_ref_ts stays 0 (the buffer was zeroed) and the validity flag
-     * stays CLEAR until M3 gives the anchor a real reference edge.  A
-     * receiver therefore never mistakes a zero for an instant. */
-    pkt[DL_TS_FLAGS_IDX] &= (uint8_t)~DL_TS_FLAG_ZONE_REF_VALID;
+    pkt[DL_TS_ZONE_ROLE_IDX]    = am_zone_ref() ? DL_ZONE_ROLE_REF
+                                                : DL_ZONE_ROLE_MEMBER;
+    /* The zone reference's last TX instant — the anchor's own stamp of the
+     * axis it lives on.  A member publishes the reference's stamp as it
+     * heard it, the reference publishes its own previous stamp: in both
+     * cases the value is in the REFERENCE's clock, i.e. on the zone's
+     * common axis, so two beacons of the same zone carry comparable stamps
+     * and two beacons of different zones do not.
+     *
+     * The flag says whether the stamp means anything: it is CLEAR until the
+     * reference has been heard (or until the reference itself has sent its
+     * first beacon), so a receiver never mistakes a zero for an instant. */
+    if (g_anchor.zone_ref_ts_valid) {
+        pack_40bit_ts(&pkt[DL_TS_ZONE_REF_TS_IDX], g_anchor.zone_ref_ts);
+        pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_ZONE_REF_VALID;
+    } else {
+        pkt[DL_TS_FLAGS_IDX] &= (uint8_t)~DL_TS_FLAG_ZONE_REF_VALID;
+    }
 
     /* The tail pad — the LAST two bytes of a frame read back over SPI are
      * corrupted by the DW3210 (see downlink_protocol.h), so the absorber
@@ -1354,7 +1361,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * has been heard within DL_PRESENCE_TIMEOUT_MS (500 ms = ten rounds). */
     {
         uint16_t mask = 0;
-        if (g_anchor.cs_level == 0) {
+        if (am_zone_ref()) {
             uint32_t now_ms = HAL_GetTick();
             int i;
             for (i = 0; i < s_roster_n; i++) {
@@ -1399,7 +1406,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     uint8_t  tx_freeze = 0, tx_dly_fail = 0;
 
     if (scheduled_tx == 0) {
-        /* Frame 1 (bootstrap) or ALOHA fallback: immediate TX */
+        /* Frame 1 (the zone reference's bootstrap): immediate TX */
         ts_before = dwt_readsystimestamphi32();
         dwt_starttx(DWT_START_TX_IMMEDIATE);
         ts_after = dwt_readsystimestamphi32();
@@ -1453,7 +1460,7 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
 
     /* Book the TX-side events on the link towards the Root (P1-6: these
      * counters used to be dead fields). */
-    clock_sync_note_tx_event(root_sync_mut(), tx_freeze, tx_dly_fail);
+    clock_sync_note_tx_event(ref_sync_mut(), tx_freeze, tx_dly_fail);
     /* Remember the grid instant we used (one TX per cycle, P0-3) */
     if (scheduled_tx != 0) s_last_tx_target = scheduled_tx;
     g_anchor.prev_scheduled_tx = scheduled_tx;
@@ -1517,13 +1524,19 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         }
     }
 
-    /* Root side: remember the ACTUAL TX instant of this cycle — the DS-TWR
-     * round trip uses it as T1 (the nominal grid instant would leak the
-     * grid placement error into the solved propagation delay). */
-    if (g_anchor.cs_level == 0) {
-        s_root_tx_ts[s_root_tx_idx]    = ts_raw;
-        s_root_tx_cycle[s_root_tx_idx] = cycle_id;
-        s_root_tx_idx = (uint8_t)((s_root_tx_idx + 1u) % ROOT_TX_HIST);
+    /* Reference side: remember the ACTUAL TX instant of this cycle — the
+     * DS-TWR round trip uses it as T1 (the nominal grid instant would leak
+     * the grid placement error into the solved propagation delay).
+     *
+     * The reference also publishes its own last TX instant as the zone's
+     * axis stamp (zone_ref_ts) — its members copy that stamp into their
+     * beacons, so the whole zone carries one comparable time stamp. */
+    if (am_zone_ref()) {
+        s_zone_ref_tx_ts[s_zone_ref_tx_idx]    = ts_raw;
+        s_zone_ref_tx_cycle[s_zone_ref_tx_idx] = cycle_id;
+        s_zone_ref_tx_idx = (uint8_t)((s_zone_ref_tx_idx + 1u) % ZONE_REF_TX_HIST);
+        g_anchor.zone_ref_ts = ts_raw & 0xFFFFFFFFFFULL;
+        g_anchor.zone_ref_ts_valid = 1;
     }
 
     /* Grid accuracy check: the two parts of the departure error.
@@ -1556,16 +1569,16 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
         }
     }
 
-    /* The Root defines the TDMA grid: its very first beacon of this network
-     * becomes the cycle origin every child schedules against. */
-    if (g_anchor.cs_level == 0 && s_root_grid_base == 0) {
+    /* The zone reference defines the TDMA grid: its very first beacon of
+     * this zone becomes the cycle origin every member schedules against. */
+    if (am_zone_ref() && s_zone_grid_base == 0) {
         /* Put the raw 40-bit TX timestamp onto the same 64-bit timeline as
          * now_sys_ext().  Without this an anchor that has been running for
          * more than one SYS_TIME wrap (17.2 s) would see the grid origin
          * jump by 2^40 and the cycle counter start at a random value. */
         uint64_t base = (s_sys_time_ext & ~0xFFFFFFFFFFULL) | (ts_raw & 0xFFFFFFFFFFULL);
         if (s_sys_time_ext != 0 && base > s_sys_time_ext) base -= (1ULL << 40);
-        s_root_grid_base = base;
+        s_zone_grid_base = base;
         { char dbg[48]; sprintf(dbg, "GRID_BASE set ts=%llu\r\n",
             (unsigned long long)ts_raw); DBG_PRINT(dbg); }
     }
@@ -1604,14 +1617,15 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
     g_anchor.tx_count++;
 }
 
-/* The Root's current TDMA cycle id (the one stamped into its beacon). */
-static uint16_t root_current_cycle(void)
+/* The zone reference's current TDMA cycle id (the one stamped into its
+ * beacon). */
+static uint16_t zone_ref_current_cycle(void)
 {
-    if (s_root_grid_base == 0) return 0;
+    if (s_zone_grid_base == 0) return 0;
     uint64_t period = (uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME;
     uint64_t now = now_sys_ext();
-    if (now < s_root_grid_base) return 0;
-    return (uint16_t)(((now - s_root_grid_base) / period) & 0xFFFFu);
+    if (now < s_zone_grid_base) return 0;
+    return (uint16_t)(((now - s_zone_grid_base) / period) & 0xFFFFu);
 }
 
 /*============================================================================
@@ -1644,8 +1658,8 @@ static uint16_t root_current_cycle(void)
  *============================================================================*/
 static void anchor_twr_corr_poll(void)
 {
-    if (g_anchor.cs_level != 0) return;              /* Root only */
-    if (s_root_grid_base == 0) return;
+    if (!am_zone_ref()) return;                      /* the reference only */
+    if (s_zone_grid_base == 0) return;
 
     uint32_t now_ms = HAL_GetTick();
     /* One batch per TDMA cycle. */
@@ -1662,7 +1676,7 @@ static void anchor_twr_corr_poll(void)
     pkt[8] = (uint8_t)(g_anchor.rank >> 8);
     pkt[9] = FUNC_TWR_CORR;
 
-    uint16_t cur_cycle = root_current_cycle();
+    uint16_t cur_cycle = zone_ref_current_cycle();
     uint8_t  n = 0;
     uint8_t  max_age = 0;
     int i;
@@ -1765,7 +1779,7 @@ static void anchor_handle_twr_corr(const uint8_t *rx_buf, uint32_t frame_len)
         }
         /* Freshness bookkeeping (P1-3): the Root cycle this correction
          * belongs to. */
-        s_twr_corr_cycle = g_tdma_ref.root_cycle_id;
+        s_twr_corr_cycle = g_tdma_ref.ref_cycle_id;
         if (s_twr_corr_stale) {
             s_twr_corr_stale = 0;
             { char dbg[48];
@@ -1790,16 +1804,32 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
                             | ((uint16_t)rx_buf[DL_TS_NET_ROOT_IDX + 1] << 8);
     uint8_t flags = rx_buf[DL_TS_NET_FLAGS_IDX];
 
+    /* ── The zone's clock reference (M3) ───────────────────────────────────
+     * The reference is DESIGNATED, not elected.  The gateway hands it down
+     * (DL_TS_NET_ZREF_IDX) — it took it from the host's choice — so the
+     * choice is a configuration and not the outcome of a boot-time race
+     * between anchors that may not even hear each other.
+     *
+     * A frame from the older gateway (which had no such field) falls back
+     * to the root rank: the same anchor, but now it is the reference of ONE
+     * zone instead of the master of the whole network. */
+    uint16_t zone_ref = designated_root;
+    if (frame_len >= DL_TS_NET_ZREF_IDX + 2u) {
+        uint16_t z = (uint16_t)(rx_buf[DL_TS_NET_ZREF_IDX]
+                        | ((uint16_t)rx_buf[DL_TS_NET_ZREF_IDX + 1] << 8));
+        if (z != 0) zone_ref = z;
+    }
+
     /* The gateway broadcasts NETWORK_START in a burst (30 × ~10 ms).
      * Re-applying it on every frame would reset the neighbour table and the
-     * child's slot timer over and over, so the child would never reach
-     * NET_WAIT_CONFIRM.  Treat repeats of the SAME root within the dedup
-     * window as the same command: keep the current state (the caller still
-     * re-sends the ACK).  A genuine re-run (same root, later than the
-     * window, or a different root) falls through and does a full reset. */
+     * grid state over and over, so the anchor would never settle.  Treat
+     * repeats of the SAME reference within the dedup window as the same
+     * command: keep the current state (the caller still re-sends the ACK).
+     * A genuine re-run (same reference, later than the window, or a
+     * different one) falls through and does a full reset. */
     {
         uint32_t now_ms = HAL_GetTick();
-        if (s_net_state != NET_IDLE && s_net_root_rank == designated_root &&
+        if (s_net_state != NET_IDLE && s_zone_ref_rank == zone_ref &&
             (int32_t)(now_ms - s_last_start_ms) < NET_START_DEDUP_MS) {
             s_last_start_ms = now_ms;
             return;
@@ -1810,9 +1840,7 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
     /* Force reset: clear neighbor table and reset state */
     if (flags & NET_FLAG_FORCE_RESET) {
         s_net_state = NET_IDLE;
-        s_aloha_mode = 0;
-        s_aloha_sent_ms = 0;
-        g_anchor.run_state = STATE_SCAN;
+        g_anchor.run_state = STATE_IDLE;
         anchor_clear_slot("NET_FORCE_RESET");
         int ni;
         for (ni = 0; ni < ANCHOR_MAX_NEIGHBORS; ni++) {
@@ -1857,7 +1885,13 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
         }
     }
 
-    s_net_root_rank = designated_root;
+    s_zone_ref_rank = zone_ref;
+    /* The reference edge I take my clock from.  It is the anchor the
+     * gateway designated: an anchor does NOT pick one on its own, because a
+     * unilateral switch would put it on a different time axis than the rest
+     * of the zone.  Re-designating the reference is a zone-wide event that
+     * the host drives through the gateway. */
+    g_anchor.zone_ref_rank = zone_ref;
 
     /* ── Zone mesh (M2): the zone this network is, its slot table and its
      * time base.  All three come from the GATEWAY — one source of truth for
@@ -1883,8 +1917,12 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
         }
         g_anchor.zone_id = zone;
         g_anchor.zone_role = DL_ZONE_ROLE_MEMBER;
-        g_anchor.zone_ref_rank = 0xFFFFu;   /* no reference edge yet (M3) */
         g_anchor.zone_link_quality = 0;
+        /* The axis stamp: the reference's last TX instant.  It is unknown
+         * until the reference has been heard (or, for the reference itself,
+         * until it has sent its first beacon). */
+        g_anchor.zone_ref_ts = 0;
+        g_anchor.zone_ref_ts_valid = 0;
 
         s_zone_slot_n = 0;
         {
@@ -1922,80 +1960,69 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
             (unsigned long)g_anchor.zone_time_base); DBG_PRINT(dbg); }
     }
 
-    /* Restart the TDMA grid from scratch (P0-3): the Root's beacon defines
-     * the cycle origin, so a fresh network needs a fresh origin. */
-    s_root_grid_base = 0;
+    /* Restart the TDMA grid from scratch (P0-3): the reference's beacon
+     * defines the cycle origin, so a fresh zone needs a fresh origin. */
+    s_zone_grid_base = 0;
     s_last_tx_target = 0;
-    g_tdma_ref.have_root_ref = false;
-    g_tdma_ref.root_cycle_id = 0;
-    g_tdma_ref.root_tx_ts = 0;
-    g_tdma_ref.root_local_ts = 0;
+    g_tdma_ref.have_ref = false;
+    g_tdma_ref.ref_cycle_id = 0;
+    g_tdma_ref.ref_tx_ts = 0;
+    g_tdma_ref.ref_local_ts = 0;
+    g_tdma_ref.base_origin = 0;
+    g_tdma_ref.base_local_time = 0;
+    /* The DS-TWR correction belongs to the old round trip: a fresh zone
+     * means a fresh measurement.  Keeping it would put the anchor on the
+     * grid with a propagation delay that was measured against a reference
+     * that is no longer there. */
+    s_twr_corr_valid = 0;
+    s_twr_corr_stale = 0;
+    s_twr_corr_dtu = 0;
 
-    if (g_anchor.rank != designated_root && !s_roster_member) {
+    /* The slot table: the roster plus the gateway's slot table.  ONE table
+     * for the zone — nobody rebuilds it from the neighbours any more. */
+    tdma_build_table();
+
+    if (!s_roster_member) {
         /* ── NOT one of the picked participants ────────────────────────────
          * The operator did not tick this anchor in the host dialog, so it
-         * must not join the grid.  It keeps broadcasting OFF-GRID beacons
-         * (slot = 255, immediate TX) every 500 ms, so it stays visible as
-         * an online device, and the Tag excludes it from the TDOA solve —
-         * it skips every anchor whose slot is unknown.
+         * must not join the grid.  It gets NO slot, so it transmits no
+         * beacon at all: the Tag would otherwise include it in the TDOA
+         * with the coordinates (0,0,0) it never had, and one such anchor
+         * is enough to pull the whole solution towards the origin.
+         *
+         * It stays visible as an online device through its DISCOVERY frame
+         * (0xEC, every NET_DISCOVERY_PERIOD_MS), which is what the gateway
+         * registers it by — no off-grid beacon and no ALOHA are needed.
          *
          * It also does NOT answer the NETWORK_ACK: the gateway counts the
          * answers to report "who is still missing", and an anchor that was
          * never asked for must not appear there. */
         g_anchor.cs_level = 1;
-        g_anchor.parent_rank = designated_root;
         anchor_clear_slot("NOT_IN_ROSTER");
         s_net_slot_idx = 255;
-        s_net_state = NET_RUNNING;
-        s_aloha_mode = 1;        /* off-grid beacons, slot = 255 */
-        s_aloha_sent_ms = 0;
-        s_net_start_ms = HAL_GetTick();
-        g_anchor.run_state = STATE_SYNC;
+        s_net_state = NET_IDLE;      /* silent on the grid */
+        g_anchor.run_state = STATE_IDLE;
         { char dbg[80]; sprintf(dbg, "NET_START→OFFGRID (not picked, roster=%u)\r\n",
             (unsigned)s_roster_n); DBG_PRINT(dbg); }
         return;
     }
 
-    if (g_anchor.rank == designated_root) {
-        /* I am the Root — start immediately */
-        g_anchor.cs_level = 0;
-        g_anchor.parent_rank = 0;
-        g_anchor.my_slot_idx = 0;
-        s_net_slot_idx = 0;
-        s_net_state = NET_RUNNING;
-        s_aloha_mode = 0;
-        s_aloha_sent_ms = 0;
-        g_anchor.run_state = STATE_SYNC;
-        tdma_build_table();
-        { char dbg[64]; sprintf(dbg, "NET_START→ROOT(slot=0) n=%u\r\n",
-            (unsigned)s_roster_n); DBG_PRINT(dbg); }
-    } else {
-        /* I am a Child — wait before TX so Root can go first */
-        g_anchor.cs_level = 1;
-        g_anchor.parent_rank = designated_root;
-        /* Compute a tentative slot from the 16-bit rank distance to the root.
-         * This is only a BOOTSTRAP slot — the Root's table is authoritative
-         * and overrides it as soon as this anchor is admitted.
-         *
-         * P1-2: the tentative slot is reported in the NETWORK_ACK but NOT
-         * used for scheduling.  Until the Root confirms us our beacon carries
-         * slot = 255, which makes the Tag exclude us from the TDOA solve
-         * instead of pairing us against the wrong slot instant. */
-        uint32_t diff = (g_anchor.rank > designated_root)
-                        ? (uint32_t)(g_anchor.rank - designated_root)
-                        : (uint32_t)(g_anchor.rank + 65536u - designated_root);
-        s_net_slot_idx = (uint8_t)((diff % (NET_MAX_SLOTS - 1u)) + 1u);  /* slot 1..7 */
-        if (s_net_slot_idx >= NET_MAX_SLOTS) s_net_slot_idx = NET_MAX_SLOTS - 1;
-        anchor_clear_slot("NOT_ADMITTED_YET");   /* P1-2 */
-        s_net_state = NET_STARTING;
-        s_net_start_ms = HAL_GetTick();
-        s_aloha_sent_ms = 0;
-        s_aloha_mode = 0;  /* reset on fresh NETWORK_START */
-        g_anchor.run_state = STATE_SYNC;
-        tdma_build_table();
-        { char dbg[64]; sprintf(dbg, "NET_START→CHILD(slot=%u) parent=R%u\r\n",
-            s_net_slot_idx, designated_root); DBG_PRINT(dbg); }
-    }
+    /* ── I am a member of the zone ─────────────────────────────────────────
+     * The reference and the members are on the SAME grid; they differ only
+     * in what they contribute:
+     *   • the reference defines the cycle origin and closes the DS-TWR
+     *     round trips of the members,
+     *   • the members place their slot instants on the reference's axis.
+     * There is no hierarchy, no parent, and no admission handshake: the
+     * slot table came with this very command. */
+    g_anchor.cs_level = am_zone_ref() ? 0 : 1;
+    g_anchor.zone_role = am_zone_ref() ? DL_ZONE_ROLE_REF : DL_ZONE_ROLE_MEMBER;
+    s_net_state = NET_RUNNING;
+    s_net_start_ms = HAL_GetTick();
+    g_anchor.run_state = STATE_SYNC;
+    { char dbg[96]; sprintf(dbg, "NET_START→ZONE id=%u ref=R%u slot=%u n=%u\r\n",
+        (unsigned)g_anchor.zone_id, (unsigned)s_zone_ref_rank,
+        (unsigned)g_anchor.my_slot_idx, (unsigned)s_roster_n); DBG_PRINT(dbg); }
 }
 
 /*============================================================================
@@ -2016,11 +2043,11 @@ static void anchor_send_network_ack(void)
     ack[7] = (uint8_t)(g_anchor.rank & 0xFF);
     ack[8] = (uint8_t)(g_anchor.rank >> 8);
     ack[9] = FUNC_NETWORK_ACK;
-    /* root_rank confirmed */
-    ack[DL_TS_NETACK_ROOT_IDX]   = (uint8_t)(s_net_root_rank & 0xFF);
-    ack[DL_TS_NETACK_ROOT_IDX+1] = (uint8_t)(s_net_root_rank >> 8);
-    /* cs_level and slot */
-    ack[DL_TS_NETACK_LEVEL_IDX] = g_anchor.cs_level;
+    /* the zone's clock reference, confirmed */
+    ack[DL_TS_NETACK_ROOT_IDX]   = (uint8_t)(s_zone_ref_rank & 0xFF);
+    ack[DL_TS_NETACK_ROOT_IDX+1] = (uint8_t)(s_zone_ref_rank >> 8);
+    /* role (0 = the zone's reference, 1 = a member) and my slot */
+    ack[DL_TS_NETACK_LEVEL_IDX] = am_zone_ref() ? 0 : 1;
     ack[DL_TS_NETACK_SLOT_IDX]  = s_net_slot_idx;
     /* neighbor count */
     { uint8_t nn = 0; int ni;
@@ -2029,11 +2056,12 @@ static void anchor_send_network_ack(void)
       }
       ack[DL_TS_NETACK_NNEIGH_IDX] = nn;
     }
-    /* Zone mesh (M2): which zone I joined, and which anchor I use as my
+    /* Zone mesh (M2/M3): which zone I joined, and which anchor I use as my
      * clock reference.  The gateway collects these to build the zone's
      * health picture — it is the only place that sees every member's
-     * answer.  0xFFFF = "no reference chosen yet" (M3 wires the election
-     * up; until then every member reports that). */
+     * answer.  In M3 the reference is the one the gateway designated, so
+     * every member of a zone reports the SAME rank here: the gateway can
+     * therefore see at a glance when a zone is split over two references. */
     ack[DL_TS_NETACK_ZONE_IDX] = g_anchor.zone_id;
     ack[DL_TS_NETACK_REF_RANK_IDX]     = (uint8_t)(g_anchor.zone_ref_rank & 0xFF);
     ack[DL_TS_NETACK_REF_RANK_IDX + 1] = (uint8_t)(g_anchor.zone_ref_rank >> 8);
@@ -2161,7 +2189,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                         | ((uint16_t)rx_buf[DL_TS_TX_ERR_IDX + 1] << 8));
         ts_tx_err_valid = true;
     }
-    /* The frame did not go out on the grid (immediate/ALOHA frame, or the
+    /* The frame did not go out on the grid (an immediate bootstrap frame, or the
      * delayed TX failed and fell back to immediate).  Such a frame never
      * carries the PRECISE flag — its advertised TX stamp is an estimate —
      * so the clock model and the DS-TWR already skip it (see the
@@ -2171,10 +2199,10 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     /* Update / allocate Kalman slot */
     int prev_slot = find_neighbor_slot_by_rank(src_rank);
     int slot = (prev_slot >= 0) ? prev_slot : find_or_alloc_neighbor_slot(src_rank);
-    /* Root always rebuilds slot table on every RX to keep it current */
-    if (g_anchor.cs_level == 0) {
-        tdma_build_table();
-    }
+    /* M3: the slot table is NOT rebuilt on every RX.  It comes from the
+     * gateway and it does not change while the zone runs — rebuilding it
+     * from the neighbours is exactly what made two anchors disagree about
+     * the grid. */
 
     /* ── Zone mesh (M2): which zone is the sender in? ──────────────────────
      * A neighbour in another zone lives on a DIFFERENT time axis and a
@@ -2194,115 +2222,63 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
         }
     }
 
-    /* ── NET_WAIT_CONFIRM: Child waiting for Root to confirm our slot.
-     * Every time we receive a Root beacon (src = designated_root), check if
-     * our rank now appears in the slot_owners table. If yes → we are confirmed.
-     * If timeout expires → give up and fall back to ALOHA (NET_RUNNING). */
-    if (s_net_state == NET_WAIT_CONFIRM) {
-        if (src_rank == s_net_root_rank) {
-            if (is_in_root_slot_table()) {
-                s_net_state = NET_RUNNING;
-                s_aloha_sent_ms = 0;
-                s_aloha_mode = 0;  /* confirmed: normal TDMA, no ALOHA */
-                { char dbg[32]; sprintf(dbg, "NET_CONFIRMED→RUNNING\r\n"); DBG_PRINT(dbg); }
-            } else if ((HAL_GetTick() - s_confirm_wait_ms) > NET_CONFIRM_TIMEOUT_MS) {
-                /* Timeout: Root never heard our ALOHA. Fall back to ALOHA mode.
-                 * Mark slot invalid so tdma_may_tx() uses its stale-slot ALOHA path. */
-                s_net_state = NET_RUNNING;
-                anchor_clear_slot("CONFIRM_TIMEOUT");
-                s_aloha_sent_ms = 0;
-                s_aloha_mode = 1;  /* enter ALOHA fallback — TX allowed even if slot=255 */
-                { char dbg[48]; sprintf(dbg, "NET_CONFIRM_TIMEOUT→ALOHA\r\n"); DBG_PRINT(dbg); }
-            }
-        }
-    }
-
-    /* ── Hierarchical election ─────────────────────────────────────────
-     * In SYNC state: hear lower cs_level (e.g. level 0 root) → adopt level+1.
-     * In SCAN/ELECTING: hear lower rank → immediately become child (level 1).
-     *   This handles the case where all anchors start at cs_level=1 and the
-     *   first one to discover a lower-rank peer wins as child.
-     * parent_rank is the sync parent identifier. */
-    uint8_t sender_level = rx_buf[DL_TS_CS_LEVEL_IDX];
-    AnchorRunState prev_state = g_anchor.run_state;
-    if (sender_level < g_anchor.cs_level) {
-        g_anchor.cs_level = sender_level + 1;
-        g_anchor.parent_rank = src_rank;
-        g_anchor.last_parent_rx_ms = HAL_GetTick();
-        g_anchor.run_state = STATE_SYNC;
-    } else if (prev_state != STATE_SYNC && src_rank < g_anchor.rank) {
-        /* In SCAN/ELECTING: heard a lower-ranked anchor → become its child.
-         * This catches the case where peer hasn't reached SYNC yet (cs_level=1). */
-        g_anchor.cs_level = 1;
-        g_anchor.parent_rank = src_rank;
-        g_anchor.last_parent_rx_ms = HAL_GetTick();
-        g_anchor.run_state = STATE_SYNC;
-    }
-    /* Print ELECT only on the transition into SYNC (not every frame) */
-    if (prev_state != STATE_SYNC && g_anchor.run_state == STATE_SYNC) {
-        char dbg[48];
-        sprintf(dbg, "ELECT[L=%u P=%u]\r\n",
-                (unsigned)g_anchor.cs_level, (unsigned)g_anchor.parent_rank);
-        DBG_PRINT(dbg);
-    }
-    /* Track parent alive heartbeat */
-    if (src_rank == g_anchor.parent_rank) {
-        g_anchor.last_parent_rx_ms = HAL_GetTick();
-    }
-
-    /* Parse TX slot table if present.
+    /* ── The zone reference (M3) ───────────────────────────────────────────
+     * There is no election and no admission handshake any more.  The zone's
+     * clock reference is the anchor the GATEWAY designated (s_zone_ref_rank);
+     * the only thing the radio has to tell us is whether we can still HEAR
+     * it, and how well.
      *
-     * ONLY a non-root anchor adopts the received table.  The Root's table is
-     * authoritative and was just rebuilt from its own neighbour list above
-     * (tdma_build_table) — which now includes the anchor that just sent this
-     * frame.  Letting the Root overwrite its table with the copy echoed by a
-     * child would erase that very child again (the child's copy is one
-     * broadcast old), and the child could then never be confirmed. */
-    if (frame_len >= DL_TS_SLOT_TABLE_IDX + ANCHOR_MAX_SLOTS * 2u) {
-        /* Adopt the table ONLY from a Root frame (sender_level == 0).
-         * A child echoes the table it last received, which is one broadcast
-         * old — adopting that would roll our slot assignment backwards. */
-        if (g_anchor.cs_level != 0 && sender_level == 0) {
-            uint8_t cnt = parse_slot_table(&rx_buf[DL_TS_SLOT_TABLE_IDX]);
-            (void)cnt;   /* unused but available for future diagnostics */
-            /* Update our assigned slot index from the received table — but
-             * only if the table actually contains us.  Until the Root has
-             * admitted us, find_my_slot() returns 255 and we must keep the
-             * pre-computed slot, otherwise TX would be blocked for 3 s. */
-            {
-                uint8_t real_slot = find_my_slot(g_anchor.rank);
-                /* P1-3: while our DS-TWR correction is stale we stay off
-                 * the grid — a beacon without a valid correction would be
-                 * one propagation delay off and would poison the Tag's
-                 * TDOA.  A fresh correction re-admits us. */
-                if (real_slot != 255 && !s_twr_corr_stale) {
-                    g_anchor.my_slot_idx = real_slot;
-                    s_net_slot_idx = real_slot;   /* authoritative slot (P1-2) */
-                }
-            }
-        } else if (g_anchor.cs_level == 0) {
-            /* Root: keep our own table, but refresh the schedule heartbeat. */
-            g_anchor.last_schedule_rx_ms = HAL_GetTick();
-        }
+     * The reference's TX instant is the zone's axis stamp: every member
+     * publishes it in its own beacon, so the Tag can check that the anchors
+     * it buckets together really do share ONE axis.  Two anchors of
+     * different zones carry different stamps — which is exactly the
+     * cross-zone mixing the zone split exists to prevent. */
+    uint8_t sender_level = rx_buf[DL_TS_CS_LEVEL_IDX];
+    bool sender_is_ref = (src_rank == s_zone_ref_rank);
 
-        /* ALOHA fallback recovery: the Root may admit us long after the
-         * 3 s confirmation window expired (e.g. the first ALOHA was lost).
-         * Now that the fresh table is parsed, check again and switch back to
-         * normal TDMA if we are in it. */
-        if (s_aloha_mode && s_net_state == NET_RUNNING
-            && src_rank == s_net_root_rank && is_in_root_slot_table()) {
-            s_aloha_mode = 0;
-            s_aloha_sent_ms = 0;
-            {
-                uint8_t real_slot = find_my_slot(g_anchor.rank);
-                if (real_slot != 255 && !s_twr_corr_stale) {  /* P1-3 */
-                    g_anchor.my_slot_idx = real_slot;
-                    s_net_slot_idx = real_slot;
-                }
-            }
-            { char dbg[48]; sprintf(dbg, "ALOHA→TDMA (slot=%u)\r\n",
-                (unsigned)g_anchor.my_slot_idx); DBG_PRINT(dbg); }
+    /* The sender's own role byte has to agree with the designation: 0 means
+     * "I am the zone's reference".  A sender that is designated as the
+     * reference but claims the member role is running a different
+     * configuration — its beacon must not be taken for the zone's axis.
+     * Reported once, it is a configuration error, not a link error. */
+    if (sender_is_ref && sender_level != 0) {
+        static uint8_t s_role_warned;
+        if (!s_role_warned) {
+            s_role_warned = 1;
+            DBG_PRINT("REF role mismatch (sender is not a reference)\r\n");
         }
+        sender_is_ref = false;
+    }
+
+    if (sender_is_ref && s_net_state == NET_RUNNING) {
+        g_anchor.zone_ref_ts = tx_remote & 0xFFFFFFFFFFULL;
+        g_anchor.zone_ref_ts_valid = 1;
+    }
+
+    /* The zone's TX slot table, as published by the reference.
+     *
+     * It is NOT adopted: the GATEWAY's table is the authoritative one, and
+     * adopting a broadcast copy would roll the assignment backwards (the
+     * copy is one broadcast old).  It is only CHECKED — a mismatch means
+     * the gateway and the anchors disagree about the grid, which is worth
+     * knowing about, and it is reported once. */
+    if (frame_len >= DL_TS_SLOT_TABLE_IDX + ANCHOR_MAX_SLOTS * 2u
+        && sender_is_ref) {
+        bool mismatch = false;
+        int si;
+        for (si = 0; si < ANCHOR_MAX_SLOTS; si++) {
+            uint16_t pub = (uint16_t)(rx_buf[DL_TS_SLOT_TABLE_IDX + si * 2]
+                        | ((uint16_t)rx_buf[DL_TS_SLOT_TABLE_IDX + si * 2 + 1] << 8));
+            if (pub != g_anchor.slot_owners[si]) { mismatch = true; break; }
+        }
+        if (mismatch) {
+            static uint8_t s_tbl_warned;
+            if (!s_tbl_warned) {
+                s_tbl_warned = 1;
+                DBG_PRINT("SLOT_TABLE differs from the gateway's\r\n");
+            }
+        }
+        g_anchor.last_schedule_rx_ms = HAL_GetTick();
     }
 
     /* TDMA reference update: if this is a Root (cs_level=0) beacon,
@@ -2313,7 +2289,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * on power-up).  The Root's cycle origin is therefore mapped into our
      * clock with the sync model we maintain towards the Root before it is
      * used as a scheduling base. */
-    if (sender_level == 0 && ts_precise) {
+    if (sender_is_ref && ts_precise) {
         uint64_t now_local = now_sys_ext();
 
         /* Extend the Root's 40-bit timestamp to 64 bit (it wraps every
@@ -2330,7 +2306,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * irrelevant: only the RELATIVE progression is used. */
         uint64_t raw = tx_remote & 0xFFFFFFFFFFULL;
         uint64_t root_ext;
-        if (!g_tdma_ref.have_root_ref) {
+        if (!g_tdma_ref.have_ref) {
             /* First Root frame: the Root's counter starts at 0 when it is
              * powered on, so its epoch is simply the raw value. */
             root_ext = raw;
@@ -2340,8 +2316,8 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
              * counter advanced by ~elapsed since the previous frame.  The
              * unknown constant offset between the two clocks cancels out,
              * only the progression is used. */
-            uint64_t elapsed = now_local - g_tdma_ref.root_local_ts;
-            uint64_t expect = g_tdma_ref.root_tx_ts + elapsed;
+            uint64_t elapsed = now_local - g_tdma_ref.ref_local_ts;
+            uint64_t expect = g_tdma_ref.ref_tx_ts + elapsed;
             root_ext = (expect & ~0xFFFFFFFFFFULL) | raw;
             /* Pick the wrap that puts the value closest to the estimate. */
             if (root_ext + (1ULL << 39) < expect) {
@@ -2350,15 +2326,15 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                 root_ext -= (1ULL << 40);
             }
         }
-        g_tdma_ref.root_tx_ts = root_ext;
-        g_tdma_ref.root_local_ts = now_local;
-        g_tdma_ref.root_rx_ms = HAL_GetTick();
-        g_tdma_ref.root_slot = 0;
-        g_tdma_ref.have_root_ref = true;
+        g_tdma_ref.ref_tx_ts = root_ext;
+        g_tdma_ref.ref_local_ts = now_local;
+        g_tdma_ref.ref_rx_ms = HAL_GetTick();
+        g_tdma_ref.ref_slot = 0;
+        g_tdma_ref.have_ref = true;
 
         /* Cycle counter carried by the Root (P0-4) */
         if (frame_len >= DL_TS_CYCLE_IDX + 2) {
-            g_tdma_ref.root_cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
+            g_tdma_ref.ref_cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
                                     | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
         }
 
@@ -2370,7 +2346,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * stale correction would put us one propagation delay off the grid
          * and poison the Tag's TDOA. */
         if (s_twr_corr_valid && !s_twr_corr_stale) {
-            uint16_t age = (uint16_t)((g_tdma_ref.root_cycle_id
+            uint16_t age = (uint16_t)((g_tdma_ref.ref_cycle_id
                                        - s_twr_corr_cycle) & 0xFFFFu);
             if (age > DL_TWR_CORR_MAX_AGE_CYCLES) {
                 char dbg[64];
@@ -2445,7 +2421,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * id it carried — the Root needs both to close the round trip with
          * our next beacon. */
         s_ref_rx_ts = rx_local;
-        s_ref_cycle = g_tdma_ref.root_cycle_id;
+        s_ref_cycle = g_tdma_ref.ref_cycle_id;
 
         /* Diagnostic: how far the clock-offset model is from our own RX
          * instant.  The difference is (mostly) the Root→Child propagation
@@ -2459,7 +2435,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
                 /* The sync model lives in the RAW 40-bit domain of both
                  * clocks — the 64-bit extended Root stamp must not be fed
                  * into it (P1-5 domain mix-up). */
-                int64_t err = (int64_t)(root_clock_to_local(raw)
+                int64_t err = (int64_t)(zone_ref_clock_to_local(raw)
                                         - g_tdma_ref.base_origin);
                 char dbg[64];
                 sprintf(dbg, "GRID_REF err=%ld dtu (%.1f cm) corr=%lu\r\n",
@@ -2481,7 +2457,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * printed ON CHANGE instead.  The buffer is 288 bytes: the worst case
      * (8 neighbours with 5-digit ranks + 8 slot owners) is ~220 bytes, so
      * the old 128-byte buffer could overflow it. */
-    if (g_anchor.cs_level == 0) {
+    if (am_zone_ref()) {
         static char s_last_tbl[288];
         char dbg[288]; int pos = 0;
         int n_neigh = 0; int ni;
@@ -2557,6 +2533,19 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     g_anchor.last_heard_ms[slot] = HAL_GetTick();
     g_anchor.rx_count++;
 
+    /* The quality of MY reference edge (M3).
+     *
+     * This is the number the host watches: it says how well this anchor
+     * hears the axis it lives on.  Below DL_REF_QUALITY_MIN the edge is
+     * considered unusable, and above it the zone is in good shape.  The
+     * reference itself has no reference edge — it IS the axis — and reports
+     * 100. */
+    if (sender_is_ref) {
+        uint8_t q = (uint8_t)(g_anchor.neighbors[slot].quality * 100.0f);
+        if (q > 100u) q = 100u;
+        g_anchor.zone_link_quality = q;
+    }
+
     {
         static uint32_t s_rx_diag_ctr;
         char dbg[48];
@@ -2598,13 +2587,13 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      *   - The ROOT's grid placement error DOES enter through T1, so T1 must
      *     be the Root's ACTUAL TX instant, not the nominal grid instant —
      *     otherwise the grid error (and δ_root) leaks straight into the
-     *     solved propagation delay.  That is what root_tx_ts_for_cycle()
+     *     solved propagation delay.  That is what zone_ref_tx_ts_for_cycle()
      *     provides.
      *
      * All four timestamps are 40-bit on the wire; the differences are small
      * compared to 2^40, so a plain subtraction with wrap handling is exact. */
-    if (g_anchor.cs_level == 0 && s_root_grid_base != 0 && rx_local >= s_root_grid_base
-        && sender_level >= 1 && slot >= 0 && slot < ANCHOR_MAX_NEIGHBORS) {
+    if (am_zone_ref() && s_zone_grid_base != 0 && rx_local >= s_zone_grid_base
+        && !sender_is_ref && slot >= 0 && slot < ANCHOR_MAX_NEIGHBORS) {
         uint64_t t2 = tx_remote & 0xFFFFFFFFFFULL;              /* child clock */
         uint64_t r1 = unpack_40bit_ts(&rx_buf[DL_TS_RX_REF_TS_IDX]); /* child clock */
         uint16_t refc = (uint16_t)(rx_buf[DL_TS_RX_REF_CYCLE_IDX]
@@ -2615,7 +2604,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * (~87 min).  Reconstruct the absolute cycle of the reference frame
          * from our own current cycle: the reference is at most a couple of
          * cycles old (the child refreshes it on every Root beacon). */
-        uint64_t cur_k = (rx_local - s_root_grid_base) / period;
+        uint64_t cur_k = (rx_local - s_zone_grid_base) / period;
         uint32_t delta = (uint32_t)((cur_k - (uint64_t)refc) & 0xFFFFu);
         if (delta <= 3) {
             uint64_t k_ref = cur_k - delta;
@@ -2624,9 +2613,9 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
              * nominal grid instant is only a fallback; a measurement that
              * needs it is dropped, because the grid error would end up in
              * the propagation delay. */
-            uint64_t t1 = root_tx_ts_for_cycle(refc);
+            uint64_t t1 = zone_ref_tx_ts_for_cycle(refc);
             bool t1_exact = (t1 != 0);
-            if (!t1_exact) t1 = s_root_grid_base + k_ref * period;
+            if (!t1_exact) t1 = s_zone_grid_base + k_ref * period;
 
             if (r1 != 0 && t1 != 0 && t1_exact) {
                 /* The child's turnaround, in the child's clock.  Both stamps
@@ -2679,9 +2668,9 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
     /* ── F: the grid residual of this neighbour (Root side) ───────────────
      * See the comment on s_gr_resid[] above.  Only the Root owns a grid, so
      * only the Root can compute this. */
-    if (g_anchor.cs_level == 0 && s_root_grid_base != 0 && s_tx_delay_valid
-        && rx_local >= s_root_grid_base
-        && sender_level >= 1 && slot >= 0 && slot < ANCHOR_MAX_NEIGHBORS) {
+    if (am_zone_ref() && s_zone_grid_base != 0 && s_tx_delay_valid
+        && rx_local >= s_zone_grid_base
+        && !sender_is_ref && slot >= 0 && slot < ANCHOR_MAX_NEIGHBORS) {
         const TwrLinkState *L = &s_twr_link[slot];
         uint8_t  tslot = find_my_slot(src_rank);
         uint16_t cyc   = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
@@ -2694,14 +2683,14 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
          * 16 bit id has just wrapped). */
         if (L->corr_valid && tslot != 255 && tslot != 0) {
             uint64_t period = (uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME;
-            uint64_t k_est  = (rx_local - s_root_grid_base) / period;
+            uint64_t k_est  = (rx_local - s_zone_grid_base) / period;
             uint32_t dlt    = (uint32_t)((k_est - (uint64_t)cyc) & 0xFFFFu);
             if (dlt <= 1u) {
                 uint64_t cyc_abs = k_est - dlt;
                 double   f_root  = g_anchor.neighbors[slot].factor;
                 /* corr_dtu is in the CHILD's clock units -> back to ours. */
                 double   p_root  = (double)L->corr_dtu * f_root;
-                uint64_t nominal = s_root_grid_base + cyc_abs * period
+                uint64_t nominal = s_zone_grid_base + cyc_abs * period
                                  + (uint64_t)s_tx_delay_dtu
                                  + (uint64_t)tslot * (uint64_t)ANCHOR_SLOT_DTU_US
                                    * UUS_TO_DWT_TIME;
@@ -2986,56 +2975,13 @@ static void anchor_loop(void)
         }
 
         /* ── Hierarchical state machine (manual: triggered by NETWORK_START) ─────── */
-        switch (g_anchor.run_state) {
-            case STATE_SCAN: {
-                /* Manual mode: SCAN is only entered on FORCE_RESET.
-                 * Stay here silently until NETWORK_START received (which sets run_state=STATE_SYNC). */
-                break;
-            }
-            case STATE_ELECTING: {
-                /* In manual mode, this state is bypassed — NETWORK_START sets run_state=STATE_SYNC.
-                 * If we somehow end up here, transition to SYNC immediately. */
-                g_anchor.run_state = STATE_SYNC;
-                DBG_PRINT("ELECT→SYNC (manual)\r\n");
-                break;
-            }
-            case STATE_SYNC: {
-                /* Check if our parent has gone silent for > 30s → orphan */
-                if (g_anchor.parent_rank != 0 &&
-                    (now_ms - g_anchor.last_parent_rx_ms) >= DL_PARENT_LOST_TIMEOUT_MS) {
-                    g_anchor.run_state = STATE_ORPHAN;
-                    DBG_PRINT("PARENT_LOST→ORPHAN\r\n");
-                }
-                break;
-            }
-            case STATE_ORPHAN: {
-                /* No parent heard for 30s — re-enter SCAN and reset network */
-                if ((now_ms - g_anchor.last_parent_rx_ms) >= DL_PARENT_LOST_TIMEOUT_MS) {
-                    g_anchor.run_state = STATE_SCAN;
-                    g_anchor.scan_start_ms = now_ms;
-                    g_anchor.parent_rank = 0;
-                    g_anchor.cs_level = 1;
-                    anchor_clear_slot("ORPHAN");
-                    s_net_state = NET_IDLE;  /* wait for new NETWORK_START */
-                    DBG_PRINT("ORPHAN→SCAN\r\n");
-                }
-                break;
-            }
-            default:
-                break;
-        }
-
-        /* ── NET state machine ──────────────────────────────────────────────── */
-        /* NET_STARTING: Child waits NET_CHILD_TX_DELAY_MS before TX */
-        if (s_net_state == NET_STARTING) {
-            if ((HAL_GetTick() - s_net_start_ms) >= NET_CHILD_TX_DELAY_MS) {
-                /* Transition to NET_WAIT_CONFIRM: Child will send one ALOHA TX
-                 * (via tdma_may_tx) then wait for Root beacon to confirm slot. */
-                s_net_state = NET_WAIT_CONFIRM;
-                s_confirm_wait_ms = HAL_GetTick();
-                s_aloha_sent_ms = 0;
-                { char dbg[32]; sprintf(dbg, "NET_STARTING→WAIT_CONFIRM\r\n"); DBG_PRINT(dbg); }
-            }
+        /* ── Run state (M3) ────────────────────────────────────────────────
+         * There is no hierarchy any more, so there is no state machine: an
+         * anchor is either configured (on the zone's grid) or not.  The
+         * configuration comes from the gateway's NETWORK_START and is
+         * replaced by the next one. */
+        if (g_anchor.run_state == STATE_IDLE && s_net_state == NET_RUNNING) {
+            g_anchor.run_state = STATE_SYNC;
         }
 
         /* ── TX: only in NET_RUNNING state ─────────────────────────────────
@@ -3046,52 +2992,23 @@ static void anchor_loop(void)
         uint16_t tx_cycle  = 0;
         bool     tx_armed  = false;
         if (s_net_state == NET_RUNNING
-            && (g_anchor.run_state == STATE_SYNC || g_anchor.run_state == STATE_ELECTING)
+            && g_anchor.run_state == STATE_SYNC
             && !gw_ota_is_active()
-            && !s_aloha_mode
             && tdma_may_tx(&tx_target, &tx_cycle)) {
             tx_armed = true;
         }
 
-        /* ── NET_WAIT_CONFIRM TX: ALOHA to announce to Root ───────────────
-         * Retried every 500 ms until the Root confirms our slot (or the
-         * 3 s confirmation window expires and we fall back to ALOHA mode).
-         * A single lost ALOHA would otherwise cost a full 3 s stall.
-         *
-         * P1-2: the ALOHA beacon goes out with slot = 255 (we are not in the
-         * Root's table yet), so the Tag excludes us from the TDOA solve
-         * instead of pairing us against a slot instant we do not own. */
-        if (s_net_state == NET_WAIT_CONFIRM
-            && (HAL_GetTick() - s_net_start_ms) >= (NET_CHILD_TX_DELAY_MS + 50)
-            && (s_aloha_sent_ms == 0 ||
-                (HAL_GetTick() - s_aloha_sent_ms) >= NET_ALOHA_RETRY_MS)) {
-            /* ALOHA bootstrap — must go out immediately, not on the TDMA
-             * schedule (the schedule may already be in the past). */
-            anchor_tx_timesync(0, 0);
-            s_aloha_sent_ms = HAL_GetTick();
-        }
-
-        /* ── ALOHA fallback TX (Root never confirmed our slot) ─────────────
-         * Off-grid beacon every 500 ms so the Root can hear us again.
-         * slot = 255 keeps us out of the Tag's TDOA solve. */
-        if (s_net_state == NET_RUNNING && s_aloha_mode && !gw_ota_is_active()
-            && (s_aloha_sent_ms == 0 ||
-                (HAL_GetTick() - s_aloha_sent_ms) >= NET_ALOHA_RETRY_MS)) {
-            anchor_tx_timesync(0, 0);
-            s_aloha_sent_ms = HAL_GetTick();
-        }
-
-        /* ── Root bootstrap beacon (P0-3) ───────────────────────────────────
-         * The Root's FIRST beacon defines the cycle origin of the whole
-         * network: every child schedules its own slot against that instant
-         * (s_root_grid_base).  Without a bootstrap the Root would have no
-         * grid instant to schedule against — tdma_grid_target() returns
-         * false while the base is zero — so the Root would never transmit
-         * at all and the whole network would stay silent.
+        /* ── Reference bootstrap beacon (P0-3) ──────────────────────────────
+         * The zone reference's FIRST beacon defines the cycle origin of the
+         * zone: every member schedules its own slot against that instant
+         * (s_zone_grid_base).  Without a bootstrap the reference would have
+         * no grid instant to schedule against — tdma_grid_target() returns
+         * false while the base is zero — so it would never transmit at all
+         * and the whole zone would stay silent.
          * The bootstrap goes out immediately; the first grid beacon follows
          * one period later. */
-        if (s_net_state == NET_RUNNING && g_anchor.cs_level == 0
-            && s_root_grid_base == 0 && !s_aloha_mode && !gw_ota_is_active()) {
+        if (s_net_state == NET_RUNNING && am_zone_ref()
+            && s_zone_grid_base == 0 && !gw_ota_is_active()) {
             anchor_tx_timesync(0, 0);
         }
 
@@ -3254,13 +3171,17 @@ static void anchor_loop(void)
               for (ni = 0; ni < ANCHOR_MAX_NEIGHBORS; ni++) {
                   if (g_anchor.neighbors[ni].initialized) n_neigh++;
               }
-              sprintf(dbg, "A_STATE R=%u st=%u lv=%u sl=%u n_neigh=%d tdma_ref=%u\r\n",
+              sprintf(dbg, "A_STATE R=%u st=%u role=%u sl=%u n_neigh=%d "
+                           "zone=%u ref=R%u q=%u have_ref=%u\r\n",
                   (unsigned)g_anchor.rank,
                   (unsigned)g_anchor.run_state,
-                  (unsigned)g_anchor.cs_level,
+                  (unsigned)(am_zone_ref() ? 0 : 1),
                   (unsigned)g_anchor.my_slot_idx,
                   n_neigh,
-                  g_tdma_ref.have_root_ref ? 1 : 0);
+                  (unsigned)g_anchor.zone_id,
+                  (unsigned)g_anchor.zone_ref_rank,
+                  (unsigned)g_anchor.zone_link_quality,
+                  g_tdma_ref.have_ref ? 1 : 0);
               DBG_PRINT(dbg);
             }
 
@@ -3288,9 +3209,9 @@ static void anchor_loop(void)
                 s_prev_heard[i] = now_ms;
                 double factor_ppm = (s->factor - 1.0) * 1e6;
                 char line[160];
-                sprintf(line, "SYNC[R=%u,L=%u→R=%u] F=%.10f(%.3fppm) Q=%03u%% upd=%05lu elaps=%05lums loss=%lu/%lu(%u%%) rx=%lu/%lu frz=%lu dly=%lu out=%lu\r\n",
+                sprintf(line, "SYNC[R=%u,Z=%u→R=%u] F=%.10f(%.3fppm) Q=%03u%% upd=%05lu elaps=%05lums loss=%lu/%lu(%u%%) rx=%lu/%lu frz=%lu dly=%lu out=%lu\r\n",
                     (unsigned)g_anchor.rank,
-                    (unsigned)g_anchor.cs_level,
+                    (unsigned)g_anchor.zone_id,
                     g_anchor.neighbors[i].neighbor_rank,
                     s->factor,
                     (double)factor_ppm,
@@ -3355,8 +3276,8 @@ static int anchor_init(void)
 {
     uint32_t uid32 = compute_uid32();
     g_anchor.rank = compute_rank_from_uid();  /* CRC16 over the full 96-bit UID */
-    g_anchor.cs_level = 1;                  /* Initial: assume child, root will be elected */
-    g_anchor.parent_eui64 = 0;
+    g_anchor.cs_level = 1;                  /* M3: a member until the gateway says
+                                             * otherwise (0 = the zone reference) */
     g_anchor.my_eui64 = (uint64_t)uid32;
     g_anchor.seq = 0;
     g_anchor.tx_count = 0;
@@ -3374,6 +3295,8 @@ static int anchor_init(void)
     g_anchor.zone_link_quality = 0;
     g_anchor.zone_time_base = 0;
     g_anchor.zone_time_base_valid = 0;
+    g_anchor.zone_ref_ts = 0;
+    g_anchor.zone_ref_ts_valid = 0;
     {
         int zi;
         for (zi = 0; zi < DL_ZONE_MAX_MEMBERS; zi++) s_zone_slot_table[zi] = 0xFFFFu;
@@ -3381,12 +3304,10 @@ static int anchor_init(void)
         for (zi = 0; zi < ANCHOR_MAX_NEIGHBORS; zi++) s_neighbor_zone[zi] = DL_ZONE_ID_NONE;
     }
 
-    /* Hierarchical sync: start in SCAN state */
-    g_anchor.run_state = STATE_SCAN;
-    g_anchor.scan_start_ms = HAL_GetTick();
-    g_anchor.parent_rank = 0;
-    g_anchor.last_parent_rx_ms = HAL_GetTick();  /* avoid immediate PARENT_LOST on first SYNC entry */
-    g_anchor.electing_start_ms = 0;  /* Will be set when entering ELECTING */
+    /* M3: no hierarchy, no election, no parent.  The anchor starts IDLE —
+     * silent, with no zone — until the gateway's NETWORK_START gives it
+     * one. */
+    g_anchor.run_state = STATE_IDLE;
     {
         int i;
         for (i = 0; i < ANCHOR_MAX_SLOTS; i++) g_anchor.slot_owners[i] = 0;
@@ -3394,16 +3315,21 @@ static int anchor_init(void)
     g_anchor.my_slot_idx = 255;       /* 255 = no slot assigned yet */
     g_anchor.last_schedule_rx_ms = 0;
 
-    /* TDMA reference state: updated when we receive Root's beacon */
-    g_tdma_ref.have_root_ref = false;
-    g_tdma_ref.root_slot = 0;
-    g_tdma_ref.root_tx_ts = 0;
-    g_tdma_ref.root_local_ts = 0;
-    g_tdma_ref.root_rx_ms = 0;
+    /* TDMA reference state: updated when we receive the zone reference's
+     * beacon */
+    g_tdma_ref.have_ref = false;
+    g_tdma_ref.ref_slot = 0;
+    g_tdma_ref.ref_tx_ts = 0;
+    g_tdma_ref.ref_local_ts = 0;
+    g_tdma_ref.ref_rx_ms = 0;
+    g_tdma_ref.ref_cycle_id = 0;
+    g_tdma_ref.base_origin = 0;
+    g_tdma_ref.base_local_time = 0;
+    s_zone_grid_base = 0;
 
     /* Manual network state: start in NET_IDLE (silent, waiting for Gateway command) */
     s_net_state = NET_IDLE;
-    s_net_root_rank = 0;
+    s_zone_ref_rank = 0;
     s_net_slot_idx = 255;
     s_net_start_ms = 0;
 

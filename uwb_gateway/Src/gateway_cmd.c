@@ -3173,11 +3173,11 @@ void gateway_poll_uart(void)
                 return;
             }
             /* Keep our own copy so the presence mask can be decoded later */
-            /* The Root is always a member of the network (it owns slot 0), so
-             * make sure it is part of the roster even when the host listed
-             * only the other participants.  The order must stay identical to
-             * the order inside the frame — bit N of the presence mask refers
-             * to roster[N] on every node. */
+            /* The zone's clock reference is always a member of the zone (it
+             * owns slot 0), so make sure it is part of the roster even when
+             * the host listed only the other participants.  The order must
+             * stay identical to the order inside the frame — bit N of the
+             * presence mask refers to roster[N] on every node. */
             {
                 int has_root = 0;
                 for (i = 0; i < roster_n; i++)
@@ -3186,6 +3186,23 @@ void gateway_poll_uart(void)
                     for (i = roster_n; i > 0; i--) roster[i] = roster[i - 1];
                     roster[0] = (uint16_t)root_rank;
                     roster_n++;
+                } else if (!has_root) {
+                    /* The roster is full and the reference is not in it.
+                     *
+                     * The zone's clock reference has to be a MEMBER of the
+                     * zone: it is the anchor whose clock the others put
+                     * their slot instants on, and it is the anchor that
+                     * closes their DS-TWR round trips.  A reference outside
+                     * the roster would leave the zone with no time axis at
+                     * all -- every member would sit outside the grid and
+                     * the whole zone would go silent.
+                     *
+                     * Refuse rather than silently drop one of the members
+                     * the operator picked. */
+                    static const char no_ref[] = "+NETSTART_ERR,ROOTNOTINROSTER\r\n";
+                    test_run_info((unsigned char *)no_ref);
+                    gateway_rx_flush();
+                    return;
                 }
             }
             for (i = 0; i < roster_n; i++) gw_net_roster[i] = roster[i];
@@ -3236,7 +3253,7 @@ void gateway_poll_uart(void)
                 payload[off]     = (uint8_t)(r & 0xFF);
                 payload[off + 1] = (uint8_t)((r >> 8) & 0xFF);
             }
-            /* The zone slot table: roster[i] owns slot i.
+            /* The zone slot table: entry i is the TDMA slot of roster[i].
              *
              * The old design gave slot 0 to the Root and let every anchor
              * GUESS the rest out of the neighbours it happened to hear
@@ -3244,12 +3261,34 @@ void gateway_poll_uart(void)
              * with two different tables for one grid -- and a beacon that
              * arrives late then lands in the wrong slot, which the tag
              * charges to the TDOA as a real time difference.  The gateway
-             * hands the whole table out instead: one table, one zone. */
-            for (i = 0; i < (int)DL_ZONE_MAX_MEMBERS; i++) {
-                int off = GW_PAY_OFF(DL_TS_NET_SLOT_TBL_IDX) + i * 2;
-                uint16_t sl = (i < n_slots) ? (uint16_t)i : 0xFFFFu;
-                payload[off]     = (uint8_t)(sl & 0xFF);
-                payload[off + 1] = (uint8_t)((sl >> 8) & 0xFF);
+             * hands the whole table out instead: one table, one zone.
+             *
+             * The zone's CLOCK REFERENCE is pinned to slot 0 -- always.
+             * The Tag's uplink guard window is the interval right after
+             * the reference's beacon, and the Tag recognises the reference
+             * by (slot == 0 && level == 0).  Give the reference any other
+             * slot and the Tag loses its grid origin and its report
+             * window.  The remaining members take slots 1.. in roster
+             * order. */
+            {
+                int ref_idx = -1;
+                int next_slot = 1;
+                for (i = 0; i < n_slots; i++) {
+                    if (roster[i] == (uint16_t)root_rank) { ref_idx = i; break; }
+                }
+                for (i = 0; i < (int)DL_ZONE_MAX_MEMBERS; i++) {
+                    int off = GW_PAY_OFF(DL_TS_NET_SLOT_TBL_IDX) + i * 2;
+                    uint16_t sl;
+                    if (i >= n_slots) {
+                        sl = 0xFFFFu;                 /* not a member      */
+                    } else if (i == ref_idx) {
+                        sl = 0u;                     /* the reference     */
+                    } else {
+                        sl = (uint16_t)next_slot++;  /* members, in order */
+                    }
+                    payload[off]     = (uint8_t)(sl & 0xFF);
+                    payload[off + 1] = (uint8_t)((sl >> 8) & 0xFF);
+                }
             }
             /* The zone's common time origin.
              *
@@ -3261,6 +3300,22 @@ void gateway_poll_uart(void)
              * the axis has not been established yet instead of trusting a
              * number that means nothing. */
             for (i = 0; i < 5; i++) payload[GW_PAY_OFF(DL_TS_NET_ZTBASE_IDX) + i] = 0;
+            /* The zone's clock reference (M3).
+             *
+             * In the old design ONE anchor was the Root of the WHOLE
+             * network, and its clock defined the one grid everybody shared.
+             * Now every zone has its own reference: the anchor whose clock
+             * the members of THIS zone place their slot instants on.  The
+             * gateway passes it down, so the choice is the HOST's (the
+             * host's "pick the Root" control becomes "pick the zone
+             * reference"), and not the outcome of a boot-time election race
+             * between anchors that may not even hear each other.
+             *
+             * For now the reference is the root rank the host named in
+             * AT+NETSTART — the same anchor, but now it is the reference of
+             * ONE zone instead of the master of the whole network. */
+            payload[GW_PAY_OFF(DL_TS_NET_ZREF_IDX)]     = (uint8_t)(root_rank & 0xFF);
+            payload[GW_PAY_OFF(DL_TS_NET_ZREF_IDX) + 1] = (uint8_t)((root_rank >> 8) & 0xFF);
             plen = (int)FUNC_NETWORK_START_LEN - GW_HDR_LEN;
 #undef GW_PAY_OFF
 

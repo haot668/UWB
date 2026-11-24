@@ -187,6 +187,13 @@ extern "C" {
  *   [48-52] zone_time_base   (5 bytes, 40-bit DTU — the zone's common time
  *                             origin, the axis every member's slot instants
  *                             are placed on)
+ *   [53-54] zone_ref_rank    (uint16 LE, M3) — the anchor that provides the
+ *                             ZONE's clock reference.  In the old design
+ *                             this was the global Root (byte 10); now every
+ *                             zone has its own reference and the gateway
+ *                             picks it from the roster, so the choice is the
+ *                             HOST's and not the result of a boot-time
+ *                             election race.
  *
  * The roster solves P1-1: a Root that only learns its neighbours from the
  * frames it happens to hear can never complete the network when one link is
@@ -199,7 +206,7 @@ extern "C" {
  * slot table starts.  The region is padded to NET_MAX_PARTICIPANTS instead,
  * and the unused entries are 0xFFFF.
  *============================================================================*/
-#define FUNC_NETWORK_START_LEN    53u     /* the whole frame — fixed length  */
+#define FUNC_NETWORK_START_LEN    55u     /* the whole frame — fixed length  */
 #define FUNC_NETWORK_START_MAX    FUNC_NETWORK_START_LEN
 #define NET_FLAG_FORCE_RESET     0x01u
 /* The zone_time_base field carries a MEANINGFUL origin.  The gateway has no
@@ -218,6 +225,7 @@ extern "C" {
 #define DL_TS_NET_SLOT_TBL_IDX  32u
 #define DL_TS_NET_SLOT_TBL_LEN  (DL_ZONE_MAX_MEMBERS * 2u)    /* 16 bytes   */
 #define DL_TS_NET_ZTBASE_IDX    48u     /* 5 bytes, 40-bit DTU              */
+#define DL_TS_NET_ZREF_IDX      53u     /* uint16 LE, the zone's clock ref  */
 
 /*============================================================================
  * NETWORK_ACK frame (Anchor → Gateway, unicast to rank 0)

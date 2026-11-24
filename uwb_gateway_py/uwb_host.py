@@ -422,6 +422,17 @@ def parse_line(line: str):
         if hasattr(S, "_netstart_btn") and S._netstart_btn:
             S._netstart_btn.config(text="开始组网", state="normal", bg=C["card"])
             S._netstart_btn = None
+    elif head == "+NETSTART_ERR" and len(parts) >= 2 and parts[1].strip() == "ROOTNOTINROSTER":
+        # M3: the zone's clock reference has to be a member of the zone
+        set_status("组网启动被拒绝 — 参考锚点不在名单里", "error")
+        messagebox.showerror("组网启动被拒绝",
+            "区的时钟参考锚点必须是该区的成员。\n\n"
+            "名单已满（8 个），网关无法把参考锚点也放进去，"
+            "于是拒绝组网，而不是悄悄丢掉一个你选中的基站。\n\n"
+            "请减少名单成员，或换一个参考锚点。", parent=root)
+        if hasattr(S, "_netstart_btn") and S._netstart_btn:
+            S._netstart_btn.config(text="开始组网", state="normal", bg=C["card"])
+            S._netstart_btn = None
     elif head == "+NETSTART_ERR":
         set_status("组网启动失败 — 基站未响应", "error")
         if hasattr(S, "_netstart_btn") and S._netstart_btn:
