@@ -321,7 +321,7 @@ P,SEQ,X=<m>,Y=<m>,Z=<m>,Q=<0..1000>,ZV=<0|1>,R=<残差 m>,M=<2D|3D>
 ├── uwb_gateway_py/          上位机（uwb_host.py）
 ├── bootloader/              Bootloader
 ├── docs/                    架构、方案、评审文档
-├── test/                    测试脚本
+├── test/                    宿主端测试（`solver_host_test.c`：求解器可执行回归）
 └── API/                     ⚠️ DW3000 官方示例 + **陈旧副本**，勿改
 ```
 
@@ -340,6 +340,7 @@ P,SEQ,X=<m>,Y=<m>,Z=<m>,Q=<0..1000>,ZV=<0|1>,R=<残差 m>,M=<2D|3D>
 | [`docs/UWB_TDOA3_Optimization_Plan.md`](docs/UWB_TDOA3_Optimization_Plan.md) | 优化方案 v1，**已降为历史备份**，其三条主要结论已被 v2 推翻 |
 | [`docs/粮库UWB定位系统技术方案.md`](docs/粮库UWB定位系统技术方案.md) | 应用侧方案 |
 | [`docs/代码审查报告.md`](docs/代码审查报告.md) | 2026-11-20 代码审查轮：11 项已修复 + 16 项未修复清单（含位置、后果、优先级） |
+| [`docs/Zone_Mesh_Plan_Review.md`](docs/Zone_Mesh_Plan_Review.md) | 2026-11-24：Zone Mesh 方案评审 —— 5 项待拍板事项的结论 + 方案 3 处前提更正 + 求解器退化保护的宿主端实测 |
 | [`docs/DW3000_Delayed_TX技术手册.md`](docs/DW3000_Delayed_TX技术手册.md) | 延迟发送机制 |
 
 **活文档约定**：任何改动影响到流程或算法的提交，必须**同一次提交**更新 `docs/系统架构与算法说明.md`。

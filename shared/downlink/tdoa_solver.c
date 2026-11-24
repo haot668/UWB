@@ -11,6 +11,27 @@
  *
  *          cm per DWT time unit = CM_PER_DTU_F (shared_defines.h)
  *            = 0.46907 cm/dtu
+ *
+ *          ON THE "THE POSITION IS ALWAYS THE CENTROID" SYMPTOM
+ *          ----------------------------------------------------
+ *          The centroid of the anchors is one of the two seeds of the
+ *          multi-start, so every failure of the iteration leaves the
+ *          answer sitting exactly on it — and a fit that never moved has
+ *          a small residual, so the quality score (which is computed
+ *          from the residual) rated it as a GOOD fix.  The guards in this
+ *          file (too few anchors, coincident anchors, a singular or badly
+ *          conditioned normal matrix, a residual outside the physical
+ *          range of the geometry) turn those failures into a REFUSED
+ *          solve instead of a position.
+ *
+ *          What is NOT fixable here: if the measurements themselves carry
+ *          no information (every TDOA difference is zero), the only fit is
+ *          the equidistant point — which for a symmetric layout IS the
+ *          centroid.  That input is indistinguishable from the perfectly
+ *          legitimate case of a tag that really does stand at the
+ *          centroid, so no test inside the solver can tell them apart.
+ *          The discrimination has to be made where the provenance of the
+ *          measurement is known — in the tag's TDOA assembly.
  *============================================================================*/
 #include <math.h>
 #include <shared_defines.h>
@@ -30,6 +51,54 @@ extern void test_run_info(unsigned char *data);
 #define DAMP_DIVERGING   0.15f   /* stronger damping when diverging */
 #define OUTLIER_THRESH   3.0f     /* outlier = |residual| > OUTLIER_THRESH * rms */
 #define MIN_WEIGHT_KEEP  0.1f     /* minimum weight to keep anchor in solve */
+
+/*============================================================================
+ * The three guards below all serve one rule: 宁可不出，也不输出质心.
+ *
+ * "Never publish a position you cannot justify" — in particular never
+ * publish the anchor centroid.  The centroid is one of the two seeds of
+ * the multi-start, so ANY failure of the iteration leaves the answer
+ * sitting exactly on it, and the residual of a degenerate fit is small
+ * (a fit that never moved has no residual) — which means the quality
+ * score, which is computed from the residual, happily rated it as a
+ * GOOD fix.  That is how "the position is always the centroid" can
+ * happen with a healthy-looking quality number.
+ *
+ * The three ways it can happen are closed here:
+ *
+ *   1. too few anchors        -> underdetermined, the step is arbitrary
+ *   2. coincident anchors     -> duplicate equations, same as (1)
+ *   3. a singular normal matrix -> the step vanishes, the answer stays
+ *                                   on the seed
+ *
+ * All three now make the solve FAIL (-1) instead of returning a number.
+ *==========================================================================*/
+
+/* Two anchors closer than this to each other stand at the same spot: they
+ * produce the same TDOA equation, so they add no information.  10 cm is far
+ * below any sane anchor spacing (UWB anchors are metres apart) and far
+ * above the 1 cm quantisation of the coordinate field. */
+#define COINCIDENT_CM     10.0f
+
+/* The smallest eigenvalue's share of the trace of the horizontal normal
+ * matrix.  It measures how much of the fit the WEAKEST direction carries:
+ * at a share of 0.01 the worst direction is amplified 100x over the best
+ * one, i.e. the noise in that direction is multiplied by ten.
+ *
+ * Measured on the host test (test/solver_host_test.c), at the true tag
+ * position:
+ *   four anchors on a square, tag inside    -> 0.200  (well conditioned)
+ *   four anchors on a square, tag at centre  -> 0.250
+ *   six anchors in a ring, tag inside        -> 0.217
+ *   three anchors in a triangle              -> 0.142
+ *   four anchors in a LINE, tag off the line -> 0.020  (still usable: a
+ *        corridor locates the tag across the line, and the fit was 4 cm
+ *        off — the weak direction is the along-the-corridor one)
+ *   four anchors in a LINE, tag ON the line  -> 0.000  (the two equations
+ *        are parallel there: the fit was 65 cm off while claiming a 2.8 cm
+ *        residual, i.e. a confident wrong answer)
+ * The threshold sits between the last two. */
+#define COND_MIN_RATIO    0.010f
 
 /* P2-10: when every anchor stands at the same height the vertical direction
  * carries no information at all: the 3D normal equations are singular in z
@@ -158,6 +227,13 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
 
     float prev_rms = 1e9f;
     int diverge_count = 0;
+    /* Was the last POSITION UPDATE made with a singular normal matrix? */
+    int last_step_singular = 0;
+    /* The conditioning of the horizontal normal matrix of the last
+     * iteration (see COND_MIN_RATIO). */
+    float cond_ratio = 1.0f;
+    /* The horizontal normal matrix of the last iteration. */
+    float Hlast[3][3];
 
     /* 3. Gauss-Newton iteration with outlier rejection */
     for (iter = 0; iter < MAX_ITER; iter++)
@@ -223,6 +299,15 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
         H[2][0] = H[0][2];
         H[2][1] = H[1][2];
 
+        /* Keep the last normal matrix: its conditioning is judged after the
+         * loop, when it is known which step produced the final position. */
+        {
+            int rr, cc;
+            for (rr = 0; rr < 3; rr++)
+                for (cc = 0; cc < 3; cc++)
+                    Hlast[rr][cc] = H[rr][cc];
+        }
+
         /* How much of the normal matrix belongs to the vertical direction,
          * and how many anchors are still in the fit.  See Z_INFO_MIN. */
         {
@@ -282,8 +367,28 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
                 det = H2[0][0] * H2[1][1] - H2[0][1] * H2[1][0];
                 if (fabsf(det) < SING_THRESH)
                 {
+                    /* The normal matrix is singular: the measurements do not
+                     * determine the position in one direction (the classic
+                     * case is the tag standing on the line through the
+                     * anchors, where the two TDOA equations have parallel
+                     * gradients).
+                     *
+                     * The OLD code added 1e-3 to the diagonal and carried on.
+                     * That turns the step into a tiny nudge, so the solution
+                     * stays wherever the seed was — and one of the seeds is
+                     * the anchor centroid.  The fit was then published as a
+                     * position, with a small residual and a good quality
+                     * score, while being up to a metre off.  The iteration
+                     * is still kept alive below (a bad step can be
+                     * recovered from), but the singularity is remembered and
+                     * the run is FAILED if the last step still used one. */
+                    last_step_singular = 1;
                     H2[0][0] += 1e-3f; H2[1][1] += 1e-3f;
                     det = H2[0][0] * H2[1][1] - H2[0][1] * H2[1][0];
+                }
+                else
+                {
+                    last_step_singular = 0;
                 }
 
                 float inv = 1.0f / det;
@@ -326,6 +431,35 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
         prev_rms = w_rms;
     }
 
+    /* ── The verdict on the geometry ──────────────────────────────────────
+     *
+     * Two things are checked here, and both of them end in the solve
+     * FAILING rather than in a number being returned:
+     *
+     * 1. The last position update used a SINGULAR normal matrix.  That is
+     *    the "the iteration had nothing to work with" case: the answer is
+     *    the seed, and the seed is the anchor centroid.
+     *
+     * 2. The horizontal normal matrix is badly CONDITIONED: the weakest
+     *    direction carries less than COND_MIN_RATIO of the information, so
+     *    the noise in that direction is amplified far beyond what a
+     *    position is worth.  The fit stays plausible-looking (a small
+     *    residual) while being half a metre off. */
+    {
+        float tr  = Hlast[0][0] + Hlast[1][1];
+        float det = Hlast[0][0] * Hlast[1][1] - Hlast[0][1] * Hlast[1][0];
+        float disc = tr * tr - 4.0f * det;
+        if (disc < 0.0f) disc = 0.0f;
+        {
+            float lmin = 0.5f * (tr - sqrtf(disc));
+            cond_ratio = (tr > 1e-12f) ? (lmin / tr) : 0.0f;
+        }
+    }
+    if (last_step_singular)
+        return -1;
+    if (cond_ratio < COND_MIN_RATIO)
+        return -1;
+
     *x_out = x;
     *y_out = y;
     *z_out = z;
@@ -364,7 +498,10 @@ static int gn_solve(const dl_anchor_entry_t *anchors,
  *   Returns  1 on success AND the height carries information,
  *            0 on success but the height carries NO information
  *              (coplanar anchors, or fewer than 5 anchors for a 3D fit),
- *           -1 on singular matrix, -2 on too few anchors.
+ *           -1 on a geometry that cannot support a position (singular or
+ *              badly conditioned normal matrix, coincident anchors, or a
+ *              residual outside the physical range of the geometry),
+ *           -2 on too few anchors.
  *
  *   The caller MUST NOT read the height as a measured one when the return
  *   value is 0 -- in that case the height is the plane of the anchors and
@@ -394,12 +531,21 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
     float tdoa_cm[DL_MAX_ANCHORS];
     float x = 0.0f, y = 0.0f, z = 0.0f;
     float cx = 0.0f, cy = 0.0f, cz = 0.0f;
-    int k;
+    int k, j;
     uint8_t n = num_anchors;
     int use_2d = 0;
     int z_valid = 0;
+    /* The largest distance between two anchors: no TDOA can exceed it. */
+    float spread = 0.0f;
 
-    if (n < 2)
+    /* Two anchors make ONE TDOA, and one TDOA cannot place a tag in a
+     * plane.  The old guard was "n < 2", which let a two-anchor call
+     * through: the system was underdetermined, the normal matrix was
+     * singular, and the answer came back as a position with an infinite
+     * residual.  (The tag never made such a call — it checks n_valid < 3
+     * itself — but the solver is a public API and must not hand out a
+     * position it cannot justify.) */
+    if (n < 3)
         return -2;
 
     /* 1. Convert TDOA to cm */
@@ -424,6 +570,57 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
         cx = sx / (float)n;
         cy = sy / (float)n;
         cz = sz / (float)n;
+    }
+
+    /* 2b. The geometry has to be able to carry a position.
+     *
+     * Two anchors that stand at the same spot produce the SAME TDOA
+     * equation, so they carry no information that the first one did not
+     * already carry.  A set of four anchors of which three stand together
+     * is therefore a TWO-anchor system wearing a four-anchor hat: the
+     * normal matrix is singular, the step vanishes, and the answer stays
+     * on the seed — the anchor centroid.  The old code published that.
+     *
+     * So the number of DISTINCT positions is what counts, not the number
+     * of anchors. */
+    {
+        int n_distinct = 0;
+        for (k = 0; k < (int)n; k++)
+        {
+            int dup = 0;
+            for (j = 0; j < k; j++)
+            {
+                float dx = (float)anchors[k].x_cm - (float)anchors[j].x_cm;
+                float dy = (float)anchors[k].y_cm - (float)anchors[j].y_cm;
+                float dz = (float)anchors[k].z_cm - (float)anchors[j].z_cm;
+                if (dx * dx + dy * dy + dz * dz
+                    < COINCIDENT_CM * COINCIDENT_CM) { dup = 1; break; }
+            }
+            if (!dup) n_distinct++;
+        }
+        /* Two independent TDOAs are the minimum for a horizontal fix. */
+        if (n_distinct < 3)
+            return -1;
+        /* A 3D fit needs three independent equations, i.e. four distinct
+         * anchors.  With fewer, the horizontal solve is the only one that
+         * can work. */
+        if (n_distinct < 4)
+            use_2d = 1;
+    }
+
+    /* 2c. The largest distance between two anchors.  It is the physical
+     * bound of every TDOA, so it is also the bound of a meaningful
+     * residual. */
+    for (k = 0; k < (int)n; k++)
+    {
+        for (j = k + 1; j < (int)n; j++)
+        {
+            float dx = (float)anchors[k].x_cm - (float)anchors[j].x_cm;
+            float dy = (float)anchors[k].y_cm - (float)anchors[j].y_cm;
+            float dz = (float)anchors[k].z_cm - (float)anchors[j].z_cm;
+            float d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (d > spread) spread = d;
+        }
     }
 
     /* 3. 2D or 3D?
@@ -501,6 +698,16 @@ int tdoa_solve(const dl_anchor_entry_t *anchors,
             }
         }
         if (!have)
+            return -1;
+
+        /* The residual has to be a number, and it has to be a plausible
+         * one: no TDOA between two anchors can be larger than the
+         * distance between them, so a residual beyond that spread is not
+         * a fit to this network but the aftermath of a failed one.  (The
+         * degenerate runs produced a residual of 1e9 cm — an infinite
+         * one — and it was published as a position with a good-looking
+         * quality score.) */
+        if (!(br >= 0.0f) || !(br <= spread))
             return -1;
 
         /* The height is meaningful only if the solve was a 3D one. */
