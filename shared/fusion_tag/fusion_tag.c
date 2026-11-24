@@ -213,29 +213,107 @@ static TagAnchorTracker s_trackers[DL_MAX_TRACKED_ANCHORS];
 static uint32_t s_n_pair = 0;             /* beacons used in a TDOA pair      */
 static uint32_t s_n_cycle_mismatch = 0;   /* beacons dropped: wrong cycle id  */
 
-/* The Root (cs_level = 0) defines the grid; our rate relative to the Root's
- * clock scales the slot spacing in the slot compensation. */
-static uint16_t s_root_rank      = 0;
-static double   s_root_rate      = 1.0;    /* (our clock)/(Root's clock)       */
-static uint8_t  s_root_rate_valid = 0;
-
-/* The Root is the reference of everything: it owns slot 0, it defines the
- * round origin, and the tag's report goes out in the guard time that
- * follows ITS beacon.  So a tag that stops hearing the Root cannot solve
- * and cannot report — it just disappears, which on the bench is
- * indistinguishable from a tag that is switched off.
+/*============================================================================
+ * Zone buckets (M4)
  *
- * These two keep track of the Root's last beacon so that the tag can say
- * what is wrong instead of going silent. */
-static uint32_t s_root_last_rx_ms = 0;
-static uint8_t  s_root_seen       = 0;
+ * A ZONE is one clock domain and one slot grid.  The TDOA between two
+ * anchors of DIFFERENT zones is a distance difference of tens of metres
+ * -- it passes every sanity window and drags the solution to a place the
+ * tag has never been.  So the tag never differences across zones: it
+ * buckets the anchors by their zone and solves each bucket on its own.
+ *
+ * Each bucket carries the state of ONE zone's clock reference (the anchor
+ * with cs_level = 0, which owns slot 0 of that zone's grid):
+ *
+ *   ref_rank    which anchor is the reference of this zone
+ *   rate        (our clock)/(reference's clock) -- the slot compensation
+ *               needs the slot duration expressed in OUR clock
+ *   ref_toa_eq  the reference's slot-compensated TOA of the cycle in
+ *               flight -- the anchor TDOAs are differenced against
+ *
+ * P1-4: how many rate samples the median is taken over.
+ *
+ * The rate is measured on its own channel, straight from the interval
+ * between two successive reference beacons:
+ *
+ *     rate = (rx_local[n] - rx_local[n-1]) / (tx_remote[n] - tx_remote[n-1])
+ *
+ * Both intervals are exact (the two frames' own TX and RX instants), so a
+ * single cycle already yields the ratio; the median over the last few
+ * cycles removes the jitter of a single frame.  This channel is updated on
+ * EVERY reference frame -- accepted or rejected by the clock filter --
+ * because a frozen rate is exactly what the slot compensation must not
+ * use. */
+#define TAG_RATE_SAMPLES 5
+
+typedef struct {
+    uint8_t  zone_id;
+    uint16_t ref_rank;           /* the zone's clock reference             */
+    uint8_t  ref_seen;
+    uint32_t ref_rx_ms;          /* when the reference was heard last      */
+    int64_t  ref_toa_eq;         /* slot-compensated TOA of the reference  */
+    uint16_t ref_cycle;          /* the cycle that TOA belongs to         */
+    uint8_t  ref_toa_valid;
+    double   rate;               /* (our clock)/(reference's clock)        */
+    uint8_t  rate_valid;
+    double   rate_buf[TAG_RATE_SAMPLES];
+    uint8_t  rate_n;             /* valid entries in the ring              */
+    uint8_t  rate_idx;           /* next slot to write                     */
+    uint64_t rate_rx_prev;
+    uint64_t rate_tx_prev;
+    uint8_t  rate_have_prev;
+    uint32_t last_rx_ms;         /* last frame of ANY anchor of the zone  */
+    uint8_t  seen;
+} TagZoneBucket;
+
+static TagZoneBucket s_zones[DL_MAX_ZONES];
+
+/* The zone whose reference drives the uplink grid (the guard window the
+ * report goes out in).  It is sticky: the grid is only handed over to
+ * another zone when this one's reference has gone silent -- otherwise the
+ * report would jump between two grids at every boundary beacon. */
+static uint8_t  s_uplink_zone   = DL_ZONE_ID_NONE;
+static uint32_t s_uplink_ref_ms = 0;   /* when the uplink zone's ref was heard */
+
+/* The last time ANY zone's reference was heard.  "No zone reference at
+ * all" is the degraded state: the tag has no grid to place its report in
+ * and no reference to difference its TDOAs against. */
+static uint32_t s_ref_last_rx_ms = 0;
+static uint8_t  s_ref_seen       = 0;
 
 /* P1-3: the age of the last frame of ANY kind, next to the age of the
- * Root's last beacon.  "The Root is silent" and "the whole network is
- * silent" are two different faults, and the operator has to be able to
+ * last zone reference.  "The reference is silent" and "the whole network
+ * is silent" are two different faults, and the operator has to be able to
  * tell them apart -- so the two are tracked separately. */
 static uint32_t s_any_last_rx_ms = 0;
 static uint8_t  s_any_seen       = 0;
+
+/* The bucket of a zone, or -1 if that zone has none. */
+static int zone_bucket_find(uint8_t zone_id)
+{
+    int i;
+    for (i = 0; i < DL_MAX_ZONES; i++)
+        if (s_zones[i].seen && s_zones[i].zone_id == zone_id) return i;
+    return -1;
+}
+
+/* The bucket of a zone, creating it if needed.  -1 when every bucket is
+ * taken by another zone: the anchors of that zone are then tracked (the
+ * operator can see them) but they cannot be solved, because the zone has
+ * no reference and no clock ratio. */
+static int zone_bucket_get(uint8_t zone_id)
+{
+    int i, free_i = -1;
+    for (i = 0; i < DL_MAX_ZONES; i++) {
+        if (s_zones[i].seen && s_zones[i].zone_id == zone_id) return i;
+        if (!s_zones[i].seen && free_i < 0) free_i = i;
+    }
+    if (free_i < 0) return -1;
+    memset(&s_zones[free_i], 0, sizeof(s_zones[free_i]));
+    s_zones[free_i].zone_id = zone_id;
+    s_zones[free_i].rate    = 1.0;
+    return free_i;
+}
 
 /*============================================================================
  * The uplink grid (P1-1)
@@ -371,16 +449,17 @@ static void tag_build_pos_report(uint8_t *pkt)
         rms_mm = (rms_mm_val > 255u) ? 255u : (uint8_t)rms_mm_val;
     }
 
-    /* The Root down means there is no solve any more: the TDOA is
-     * referenced to the Root's beacon, so without it the tag cannot
-     * produce a position.  The report says so right away instead of
-     * repeating a stale fix for another 500 ms.
+    /* All the zone references down means there is no solve any more: the
+     * TDOA is referenced to a zone reference's beacon, so without any of
+     * them the tag cannot produce a position.  The report says so right
+     * away instead of repeating a stale fix for another 500 ms.
      *
      * The DEGRADED flag says "this report comes from a tag that is alive
      * but has no network".  The consumer must not read the gaps in the
      * sequence number as lost frames: while it is degraded the tag
      * deliberately slows down. */
-    if ((HAL_GetTick() - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
+    if (!s_ref_seen ||
+        (HAL_GetTick() - s_ref_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
         x = 0; y = 0; z = 0;
         q = TAG_REPORT_QUALITY_NONE;
         flags = DL_POS_FLAG_DEGRADED;
@@ -445,38 +524,18 @@ static uint32_t s_last_uplink_ms = 0;
 #define TAG_TX_RETRIES        2
 #define TAG_TX_RETRY_STEP_US  200u
 
-/* P1-4: independent Root-rate estimator.
- *
- * The Root's clock rate is needed to express a slot duration in OUR clock
- * (the slot compensation).  Taking it from the clock-sync filter's factor
- * ties it to the outlier gate: a Root frame that the filter rejects does
- * not update the factor, so the rate freezes — and a frozen rate is
- * exactly what the slot compensation must not use.
- *
- * The rate is therefore measured here, on its own channel, straight from
- * the interval between two successive Root beacons:
- *
- *     rate = (rx_local[n] - rx_local[n-1]) / (tx_remote[n] - tx_remote[n-1])
- *
- * Both intervals are exact (the two frames' own TX and RX instants), so a
- * single cycle already yields the ratio; the median over the last few
- * cycles removes the jitter of a single frame.  This channel is updated on
- * EVERY Root frame — accepted or rejected by the clock filter. */
-#define TAG_RATE_SAMPLES 5
-static double   s_rate_buf[TAG_RATE_SAMPLES];
-static uint8_t  s_rate_n    = 0;   /* valid entries in the ring           */
-static uint8_t  s_rate_idx  = 0;   /* next slot to write                    */
-static uint64_t s_rate_rx_prev = 0;
-static uint64_t s_rate_tx_prev = 0;
-static uint8_t  s_rate_have_prev = 0;
+/* The zone's clock ratio (our clock / the zone reference's clock) is
+ * measured per zone, inside the zone bucket — see the bucket definition
+ * above.  The rate estimator is NOT taken from the clock-sync filter's
+ * factor: that factor is tied to the outlier gate, so a frame the filter
+ * rejects does not update it and the rate freezes — and a frozen rate is
+ * exactly what the slot compensation must not use. */
 
-/* P1-2: the Root's slot-compensated TOA of the cycle currently in flight.
- * The Root transmits in slot 0, so its beacon of a cycle always arrives
- * before the other anchors' beacons of the same cycle — which is what
- * makes the per-anchor TDOA against the Root computable in the RX path. */
-static int64_t  s_root_toa_eq    = 0;
-static uint16_t s_root_toa_cycle = 0;
-static uint8_t  s_root_toa_valid = 0;
+/* P1-2: the zone reference's slot-compensated TOA of the cycle currently
+ * in flight.  The reference transmits in slot 0, so its beacon of a cycle
+ * always arrives before the other anchors' beacons of the same cycle —
+ * which is what makes the per-anchor TDOA against the reference computable
+ * in the RX path.  Per zone: see the zone bucket above. */
 
 /*============================================================================
  * Output and protocol helpers
@@ -514,96 +573,47 @@ static int match_header(uint8_t *rx, uint8_t *pattern, uint8_t len,
  * factor below. */
 #define TAG_NET_READY_ANCHORS 3
 
-static void tag_solve(void)
+/*============================================================================
+ * One zone's solve
+ *
+ * M4: the anchors are bucketed by zone and each bucket is solved on its
+ * own.  Two anchors of DIFFERENT zones live on different grids and in
+ * different clock domains, so their TDOA is a distance difference of tens
+ * of metres -- it passes every sanity window and drags the solution to a
+ * place the tag has never been.  A bucket is therefore a CLOSED set: the
+ * reference, the slot compensation and the clock ratio all come from the
+ * SAME zone.
+ *==========================================================================*/
+typedef struct {
+    bool     valid;
+    int16_t  x_cm, y_cm, z_cm;
+    uint16_t rms_cm;
+    uint16_t q;
+    uint8_t  flags;
+    uint8_t  zone;
+    int      n_valid;
+} TagZoneFix;
+
+/* Solve one zone's anchor set.  Returns true when the zone produced a
+ * usable fix; the fix is written into *out either way. */
+static bool tag_solve_zone(int zb, const int *set, int n_set, TagZoneFix *out)
 {
     int i;
     uint32_t now_ms = HAL_GetTick();
+    TagZoneBucket *z = &s_zones[zb];
+
+    memset(out, 0, sizeof(*out));
+    out->zone = z->zone_id;
 
     /* Solve counter for the diagnostic decimation (TAG_DIAG_DETAIL_EVERY).
      * The solve itself runs at 20 Hz; the detailed TDOA dump is 1 in 4. */
-    static uint32_t s_solve_diag_ctr;
-    uint32_t solve_n = s_solve_diag_ctr++;
+    static uint32_t s_zone_diag_ctr;
+    uint32_t solve_n = s_zone_diag_ctr++;
     bool detail = ((solve_n % TAG_DIAG_DETAIL_EVERY) == 0);
-
-    /* Find fresh active trackers (within FRESH_MS_MAX ms) */
-    int n_active = 0;
-    int n_desync = 0;
-    int active_idx[DL_MAX_TRACKED_ANCHORS];
-    for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
-        if (!s_trackers[i].is_active) continue;
-        /* P1-1: an anchor that failed the grid self-check is EXCLUDED from
-         * the solve — its beacon no longer sits on the grid, so its slot
-         * compensation would shift the whole solution. */
-        if (s_trackers[i].desynced) { n_desync++; continue; }
-        uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
-                          : (now_ms - s_trackers[i].last_seen_ms);
-        if (age_ms > TAG_TRACKER_FRESH_MS) continue;  /* measurement too stale */
-        active_idx[n_active++] = i;
-    }
-    /* F4: THE ROOT IS SILENT.
-     *
-     * Everything the tag does hangs on the Root's beacon: the round origin,
-     * the slot spacing, the reference of the TDOA and the guard time the
-     * report goes out in.  When the Root stops sending, the tag has nothing
-     * to say and — without this diagnostic — says NOTHING AT ALL, which on
-     * the bench is indistinguishable from a dead tag.
-     *
-     * So say it: once a second, as long as the Root stays silent. */
-    {
-        /* P1-2 / P1-3: the age of the last Root beacon AND the age of the
-         * last frame of any kind.
-         *
-         * The Root's age is reported even when the Root has NEVER been
-         * heard: until now the diagnostic only appeared after a Root
-         * beacon had been seen, so a tag that never joined the network
-         * said nothing at all and looked exactly like a dead tag. */
-        static uint32_t s_last_diag_ms;
-        uint32_t root_age = now_ms - s_root_last_rx_ms;
-        uint32_t any_age  = now_ms - s_any_last_rx_ms;
-        if ((now_ms - s_last_diag_ms) >= 1000u) {
-            s_last_diag_ms = now_ms;
-            if (root_age > TAG_ROOT_TIMEOUT_MS) {
-                char dbg[80];
-                sprintf(dbg, "NO ROOT FRAME age=%ums n_act=%d\r\n",
-                        (unsigned)root_age, n_active);
-                TAG_DIAG_SOLVE(dbg);
-            }
-            if (s_any_seen && any_age > TAG_ROOT_TIMEOUT_MS) {
-                char dbg[80];
-                sprintf(dbg, "NO NETWORK FRAME age=%ums\r\n",
-                        (unsigned)any_age);
-                TAG_DIAG_SOLVE(dbg);
-            }
-        }
-    }
-
-    if (n_active < 3) {
-        { char dbg[72]; int pos = 0;
-          pos += sprintf(dbg + pos, "TSUM n_act=%d SKIP need 3 anchors", n_active);
-          if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
-          pos += sprintf(dbg + pos, "\r\n");
-          TAG_DIAG_SOLVE(dbg); }
-        return;
-    }
-
-    /* Choose ref = highest quality + newest
-     * Score = quality * 1000 - age_ms (higher is better) */
-    int ref = active_idx[0];
-    uint32_t ref_age = now_ms - s_trackers[ref].last_seen_ms;
-    float ref_score = s_trackers[ref].quality * 1000.0f - (float)ref_age;
-    for (i = 1; i < n_active; i++) {
-        int idx = active_idx[i];
-        uint32_t age = now_ms - s_trackers[idx].last_seen_ms;
-        float score = s_trackers[idx].quality * 1000.0f - (float)age;
-        if (score > ref_score) {
-            ref_score = score;
-            ref = idx;
-        }
-    }
 
     /* Build packed arrays for tdoa_solve:
      * Slot-based TDOA: toa_equiv = rx - slot × 6.25ms
-     * This normalizes all beacons to slot=0 (Root's TX time).
+     * This normalizes all beacons to slot=0 (the zone reference's TX time).
      * No anchor clock sync needed: Tag's local clock is the common reference.
      *
      * DTU bookkeeping (P0-4): one DW3000 device time unit is 15.65 ps, so
@@ -631,18 +641,18 @@ static void tag_solve(void)
     #define TDOA_MAX_PATH_M        150LL     /* ±150 m of path difference    */
     #define TDOA_MAX_DTU           ((TDOA_MAX_PATH_M * TDOA_DTU_PER_M_MILLI) / 1000LL)
 
-    /* ── Slot spacing is defined in the ROOT's clock, not in ours ──────────
-     * The anchors place their beacons on the Root's grid: anchor k transmits
-     * at  G + slot_k × 6.25 ms  where G and the 6.25 ms are the ROOT's clock.
-     * Our own crystal differs from the Root's by up to ±20 ppm, so 6.25 ms is
-     * 6.25 ms × f in our clock, where f is the rate ratio (our clock)/(Root's
-     * clock).  Subtracting the nominal 6.25 ms instead would leave a
-     * per-anchor error of slot × 6.25 ms × 20 ppm = up to 875 ns ≈ 262 m at
-     * slot 7 — far above the 0.67 ns the 20 cm target needs.  f is measured from the
-     * Root's own beacon (its in-frame TX timestamp vs. our RX timestamp),
-     * which is exactly the clock_sync factor of the Root's tracker. */
-    double slot_rate = 1.0;
-    if (s_root_rate_valid) slot_rate = s_root_rate;
+    /* ── Slot spacing is defined in the zone reference's clock, not ours ────
+     * The anchors place their beacons on the reference's grid: anchor k
+     * transmits at  G + slot_k × 6.25 ms  where G and the 6.25 ms are the
+     * REFERENCE's clock.  Our own crystal differs from the reference's by
+     * up to ±20 ppm, so 6.25 ms is 6.25 ms × f in our clock, where f is the
+     * rate ratio (our clock)/(reference's clock).  Subtracting the nominal
+     * 6.25 ms instead would leave a per-anchor error of
+     * slot × 6.25 ms × 20 ppm = up to 875 ns ≈ 262 m at slot 7 — far above
+     * the 0.67 ns the 20 cm target needs.  f is measured from the
+     * reference's own beacon (its in-frame TX timestamp vs. our RX
+     * timestamp) — one ratio per zone, never shared between zones. */
+    double slot_rate = z->rate;
     if (!(slot_rate > 0.5 && slot_rate < 2.0)) slot_rate = 1.0;
     const int64_t slot_dtu_eff = (int64_t)((double)DTU_PER_SLOT * slot_rate);
 
@@ -661,8 +671,8 @@ static void tag_solve(void)
     int sel_idx[DL_MAX_TRACKED_ANCHORS];
     int n_sel = 0;
     int n_nocoord = 0;
-    for (i = 0; i < n_active; i++) {
-        int idx = active_idx[i];
+    for (i = 0; i < n_set; i++) {
+        int idx = set[i];
         if (s_trackers[idx].slot == 255) continue;
         if (!s_trackers[idx].coord_valid) { n_nocoord++; continue; }
         sel_idx[n_sel++] = idx;
@@ -670,8 +680,9 @@ static void tag_solve(void)
     if (n_nocoord) {
         static uint32_t s_n_nocoord_ctr;
         if ((s_n_nocoord_ctr++ % 20u) == 0u) {
-            char dbg[64];
-            sprintf(dbg, "NO_COORD n=%d excluded from the solve\r\n", n_nocoord);
+            char dbg[72];
+            sprintf(dbg, "NO_COORD z=%u n=%d excluded from the solve\r\n",
+                    z->zone_id, n_nocoord);
             TAG_DIAG_SOLVE(dbg);
         }
     }
@@ -683,38 +694,39 @@ static void tag_solve(void)
      * round — one round of skew is 50 ms = 3.19 M DTU and would poison every
      * pair it enters.
      *
-     * The Root-reference path (the normal case) does NOT need a cycle
+     * The zone-reference path (the normal case) does NOT need a cycle
      * filter on the anchor SET: the per-anchor tdoa_avg was built in the
      * RX path out of pairs of the SAME round (there an anchor is only
-     * paired with the Root's TOA of an identical cycle_id), so every
-     * sample inside the average is a round-consistent difference.
+     * paired with its own zone reference's TOA of an identical cycle_id),
+     * so every sample inside the average is a round-consistent difference.
      *
      * Filtering the set by the cycle of each anchor's LAST frame used to
      * throw away every anchor whose last frame is one round old.  At
      * 20 Hz that is roughly half of them at any moment — and worse, it
-     * could filter the ROOT out, which pushed the solve onto the
+     * could filter the REFERENCE out, which pushed the solve onto the
      * absolute-TOA path where rounds ARE mixed and the geometry is
      * meaningless. */
     int i2, j2, k2;
     uint16_t best_cycle_all = 0;
     int best_cnt_all = 0;
 
-    /* Is the Root (slot 0) among the slot-known anchors?  Its beacon
-     * defines the round origin, so it is the reference of the good path. */
-    int root_idx = -1;
+    /* Is the zone's reference (slot 0) among the slot-known anchors?  Its
+     * beacon defines the round origin, so it is the reference of the good
+     * path. */
+    int ref_idx = -1;
     for (i2 = 0; i2 < n_sel; i2++) {
-        if (s_trackers[sel_idx[i2]].rank == s_root_rank) {
-            root_idx = sel_idx[i2];
+        if (s_trackers[sel_idx[i2]].rank == z->ref_rank) {
+            ref_idx = sel_idx[i2];
             break;
         }
     }
 
-    /* The legacy paths (no Root in the set) still need the cycle filter:
-     * there the absolute TOAs are differenced, and only beacons of the
-     * same round may be differenced against each other. */
+    /* The legacy paths (no reference in the set) still need the cycle
+     * filter: there the absolute TOAs are differenced, and only beacons of
+     * the same round may be differenced against each other. */
     uint16_t best_cycle_sel = 0;
     int best_cnt_sel = 0;
-    if (root_idx < 0) {
+    if (ref_idx < 0) {
         for (i2 = 0; i2 < n_sel; i2++) {
             uint16_t c = s_trackers[sel_idx[i2]].cycle_id;
             int cnt = 0;
@@ -734,15 +746,14 @@ static void tag_solve(void)
         n_sel = k2;
     }
 
-    for (i2 = 0; i2 < n_active; i2++) {
-        uint16_t c = s_trackers[active_idx[i2]].cycle_id;
+    for (i2 = 0; i2 < n_set; i2++) {
+        uint16_t c = s_trackers[set[i2]].cycle_id;
         int cnt = 0;
-        for (j2 = 0; j2 < n_active; j2++)
-            if (s_trackers[active_idx[j2]].cycle_id == c) cnt++;
+        for (j2 = 0; j2 < n_set; j2++)
+            if (s_trackers[set[j2]].cycle_id == c) cnt++;
         if (cnt > best_cnt_all) { best_cnt_all = cnt; best_cycle_all = c; }
     }
 
-    int ref_idx;
     int n_valid;
     bool use_slot_compensation = (n_sel >= 3);
     /* P1-2: were the TDOA values taken from the multi-cycle average? */
@@ -751,13 +762,14 @@ static void tag_solve(void)
     if (use_slot_compensation) {
         /* ── Slot-compensated TDOA ────────────────────────────────────────
          * toa_equiv = rx - slot × 6.25 ms (normalizes all to slot=0)
-         * Works when anchors are in Root's TDMA table. */
+         * Works when the anchors are in the zone reference's TDMA table. */
 
-        /* Reference = the Root when it is in the set (its beacon defines
-         * the round origin); otherwise the anchor with the lowest slot. */
-        bool ref_is_root = (root_idx >= 0);
-        if (ref_is_root) {
-            ref_idx = root_idx;
+        /* Reference = the zone reference when it is in the set (its beacon
+         * defines the round origin); otherwise the anchor with the lowest
+         * slot. */
+        bool ref_is_zoneref = (ref_idx >= 0);
+        if (ref_is_zoneref) {
+            ref_idx = ref_idx;
         } else {
             ref_idx = sel_idx[0];
             for (i = 1; i < n_sel; i++) {
@@ -769,13 +781,14 @@ static void tag_solve(void)
 
         uint8_t ref_slot = s_trackers[ref_idx].slot;
 
-        if (ref_is_root) {
-            /* Every value is a difference against the Root, so the Root is
-             * the origin and the solver sees the same TDOAs as before.
+        if (ref_is_zoneref) {
+            /* Every value is a difference against the zone reference, so the
+             * reference is the origin and the solver sees the same TDOAs as
+             * before.
              *
              * The value used is the multi-round average (P1-2): each of its
-             * samples was paired with the Root's TOA of the SAME round in
-             * the RX path, so the average is round-consistent by
+             * samples was paired with the reference's TOA of the SAME round
+             * in the RX path, so the average is round-consistent by
              * construction and needs no cycle filter — while it also
              * removes the per-frame RX jitter, which is the dominant noise
              * term at a 6.25 ms slot spacing. */
@@ -800,7 +813,7 @@ static void tag_solve(void)
                 n_valid++;
             }
         } else {
-            /* The reference is not the Root: the absolute TOAs have to be
+            /* The reference is not in the set: the absolute TOAs have to be
              * used (no averaging possible). */
             /* The departure error is taken off here as well, so that the
              * reference anchor and the others are on the same footing. */
@@ -839,23 +852,23 @@ static void tag_solve(void)
         }
     } else {
         /* ── Fallback: raw RX TDOA (no slot compensation) ─────────────────
-         * The anchors have no known slot (slot = 255 — the Root never
-         * confirmed them, or they are in ALOHA fallback mode), so the slot
+         * The anchors have no known slot (slot = 255 — the zone reference
+         * has not closed the DS-TWR round trip with them yet), so the slot
          * offset cannot be subtracted.  The raw difference is only valid
          * within ONE cycle, so the same-cycle filter is applied here too. */
         if (best_cnt_all < 3) {
             /* Fewer than three anchors in one cycle — a solve would be
              * geometrically degenerate, so report and wait for the next
              * cycle instead of mixing cycles. */
-            { char dbg[48];
-              sprintf(dbg, "TDOA_CYCLE_WAIT n=%d\r\n", best_cnt_all);
+            { char dbg[56];
+              sprintf(dbg, "TDOA_CYCLE_WAIT z=%u n=%d\r\n", z->zone_id, best_cnt_all);
               TAG_DIAG_SOLVE(dbg); }
-            return;
+            return false;
         }
 
         ref_idx = -1;
-        for (i = 0; i < n_active; i++) {
-            int idx = active_idx[i];
+        for (i = 0; i < n_set; i++) {
+            int idx = set[i];
             if (s_trackers[idx].cycle_id == best_cycle_all
                 && s_trackers[idx].slot == 255) {
                 ref_idx = idx;
@@ -865,18 +878,18 @@ static void tag_solve(void)
         if (ref_idx < 0) {
             /* No off-grid anchor in the dominant cycle — the raw fallback
              * would mix a slot-compensated anchor into the difference. */
-            { char dbg[48];
-              sprintf(dbg, "TDOA_CYCLE_WAIT n=%d\r\n", best_cnt_all);
+            { char dbg[56];
+              sprintf(dbg, "TDOA_CYCLE_WAIT z=%u n=%d\r\n", z->zone_id, best_cnt_all);
               TAG_DIAG_SOLVE(dbg); }
-            return;
+            return false;
         }
         toa_dtu[0] = s_trackers[ref_idx].last_rx_ts;
         anchors[0] = s_trackers[ref_idx].pos;
         valid_idx[0] = ref_idx;
 
         n_valid = 1;
-        for (i = 0; i < n_active; i++) {
-            int idx = active_idx[i];
+        for (i = 0; i < n_set; i++) {
+            int idx = set[i];
             if (idx == ref_idx) continue;
             if (s_trackers[idx].cycle_id != best_cycle_all) {
                 s_n_cycle_mismatch++;
@@ -885,11 +898,11 @@ static void tag_solve(void)
             /* Only OFF-GRID anchors may take part in the raw difference.
              *
              * The raw RX difference contains the TX departure error of BOTH
-             * beacons (the Root's tx_err alone is up to 255 DTU = 1.2 m of
-             * path), and the slot compensation is exactly what removes it.
-             * Mixing an on-grid anchor (the Root has slot 0) into the
-             * difference therefore injects a pseudo TDOA of up to a metre
-             * that passes the +-150 m window and poisons the solve. */
+             * beacons (the reference's tx_err alone is up to 255 DTU = 1.2 m
+             * of path), and the slot compensation is exactly what removes
+             * it.  Mixing an on-grid anchor (the reference has slot 0) into
+             * the difference therefore injects a pseudo TDOA of up to a
+             * metre that passes the +-150 m window and poisons the solve. */
             if (s_trackers[idx].slot != 255) continue;
 
             int64_t tdoa_dtu = (int64_t)(s_trackers[idx].last_rx_ts - toa_dtu[0]);
@@ -913,8 +926,8 @@ static void tag_solve(void)
      * ~220 bytes — the old 128-byte buffer could overflow it. */
     if (detail) {
       char dbg[288]; int pos = 0;
-      pos += sprintf(dbg + pos, "TDOA_DBG REF=R%d TOA=%llu",
-          s_trackers[ref_idx].rank, (unsigned long long)toa_dtu[0]);
+      pos += sprintf(dbg + pos, "TDOA_DBG Z=%u REF=R%d TOA=%llu",
+          z->zone_id, s_trackers[ref_idx].rank, (unsigned long long)toa_dtu[0]);
       for (i = 1; i < n_valid; i++) {
           int idx = valid_idx[i];
           pos += sprintf(dbg + pos, " R%d=%lld",
@@ -927,14 +940,13 @@ static void tag_solve(void)
     /* P0-4 summary: how many pairs were formed and how many beacons had to
      * be dropped because they belonged to a different TDMA cycle.  A rising
      * mismatch counter means the anchors are not on one common grid. */
-    { char dbg[128]; int pos = 0;
-      pos += sprintf(dbg + pos, "TSUM n_act=%d n_sel=%d n=%d pair=%u mism=%u cyc=%u ref=R%d",
-          n_active, n_sel, n_valid, (unsigned)s_n_pair,
+    { char dbg[144]; int pos = 0;
+      pos += sprintf(dbg + pos, "TSUM Z=%u n_act=%d n_sel=%d n=%d pair=%u mism=%u cyc=%u ref=R%d",
+          z->zone_id, n_set, n_sel, n_valid, (unsigned)s_n_pair,
           (unsigned)s_n_cycle_mismatch,
           (unsigned)s_trackers[ref_idx].cycle_id,
           s_trackers[ref_idx].rank);
       if (n_nocoord) pos += sprintf(dbg + pos, " nocoord=%d", n_nocoord);
-      if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
       pos += sprintf(dbg + pos, " avg=%d\r\n", use_avg ? 1 : 0);
       TAG_DIAG_SOLVE(dbg); }
 
@@ -942,7 +954,7 @@ static void tag_solve(void)
      * which anchor is one round behind.  Sampled 1 solve in 4. */
     if (detail) {
       char dbg[128]; int pos = 0;
-      pos += sprintf(dbg + pos, "TSUM_CYC");
+      pos += sprintf(dbg + pos, "TSUM_CYC Z=%u", z->zone_id);
       for (i = 0; i < n_sel && pos < 100; i++) {
           int idx = sel_idx[i];
           pos += sprintf(dbg + pos, " R%u:c%u",
@@ -952,10 +964,10 @@ static void tag_solve(void)
       TAG_DIAG_FRAME(dbg); }
 
     if (n_valid < 3) {
-        { char dbg[64];
-          sprintf(dbg, "TSUM n=%d SKIP need 3 anchors\r\n", n_valid);
+        { char dbg[72];
+          sprintf(dbg, "TSUM Z=%u n=%d SKIP need 3 anchors\r\n", z->zone_id, n_valid);
           TAG_DIAG_SOLVE(dbg); }
-        return;
+        return false;
     }
 
     /* P1-4: the network is only "ready" when enough anchors are on the
@@ -971,20 +983,20 @@ static void tag_solve(void)
         int wait_slot = 255;
         for (i2 = 0; i2 < n_sel; i2++) {
             int sl = s_trackers[sel_idx[i2]].slot;
-            if (sl < wait_slot) wait_slot = sl;   /* the lowest slot = the Root */
+            if (sl < wait_slot) wait_slot = sl;   /* the lowest slot = the reference */
         }
-        { char dbg[72];
-          sprintf(dbg, "WAIT NET n=%d/%d slot=%d nocoord=%d\r\n",
-                  n_sel, TAG_NET_READY_ANCHORS, wait_slot, n_nocoord);
+        { char dbg[88];
+          sprintf(dbg, "WAIT NET Z=%u n=%d/%d slot=%d nocoord=%d\r\n",
+                  z->zone_id, n_sel, TAG_NET_READY_ANCHORS, wait_slot, n_nocoord);
           TAG_DIAG_SOLVE(dbg); }
-        return;
+        return false;
     }
 
     float x_cm = 0, y_cm = 0, z_cm = 0, rms = 0;
     uint8_t n_inlier = 0;
     int ret = tdoa_solve(anchors, toa_dtu, (uint8_t)n_valid,
                          &x_cm, &y_cm, &z_cm, &rms, &n_inlier);
-    if (ret < 0) return;
+    if (ret < 0) return false;
 
     /* THE QUALITY SCALE.
      *
@@ -1042,51 +1054,197 @@ static void tag_solve(void)
         if (q < 0.0f) q = 0.0f;
         if (q > 1000.0f) q = 1000.0f;
 
-        s_solve_q = (uint16_t)q;
+        out->q = (uint16_t)q;
     }
 
-    /* Hand the solution to the UWB uplink: the report goes out once per
-     * TDMA round, in the guard time of slot 0. */
-    s_solve_x_cm  = (int16_t)x_cm;
-    s_solve_y_cm  = (int16_t)y_cm;
-    s_solve_z_cm  = (int16_t)z_cm;
-    s_solve_rms_cm = (uint16_t)((rms > 0.0f) ? rms : 0.0f);
-
-    /* ── Zone mesh (M2): which zone was this fix solved in? ───────────────
-     * The anchors that took part in the solve must all live in ONE zone:
-     * two zones are two time axes, and a TDOA between them is a distance
-     * difference of tens of metres — it passes every sanity window and
-     * pulls the solution somewhere the tag has never been.
-     *
-     * So: if the set spans more than one zone, the zone is NONE and the
-     * consumer knows the fix is not from a single clock domain.  (M4 goes
-     * further and solves each zone on its own instead of mixing them.)
-     *
-     * The zone of the ROUND ORIGIN anchor (valid_idx[0], the reference) is
-     * what decides: it is the anchor whose beacon defines the grid the
-     * others were placed on. */
-    {
-        uint8_t z = s_trackers[valid_idx[0]].zone_id;
-        int k;
-        bool mixed = false;
-        for (k = 1; k < n_valid; k++) {
-            if (s_trackers[valid_idx[k]].zone_id != z) { mixed = true; break; }
-        }
-        s_solve_zone = mixed ? (uint8_t)DL_ZONE_ID_NONE : z;
-    }
+    out->x_cm    = (int16_t)x_cm;
+    out->y_cm    = (int16_t)y_cm;
+    out->z_cm    = (int16_t)z_cm;
+    out->rms_cm  = (uint16_t)((rms > 0.0f) ? rms : 0.0f);
+    out->n_valid = n_valid;
 
     /* The flags say what the numbers mean.  Z_VALID is the honest answer
      * to "was the height measured, or is it just the plane of the
      * anchors?" -- with coplanar anchors it is the latter, and the flag
      * says so instead of the consumer having to guess. */
-    s_solve_flags = DL_POS_FLAG_SOLVE_VALID;
+    out->flags = DL_POS_FLAG_SOLVE_VALID;
     if (ret == 1) {
         /* A 3D solve that carried real vertical information. */
-        s_solve_flags |= DL_POS_FLAG_Z_VALID | DL_POS_FLAG_3D_SOLVED;
+        out->flags |= DL_POS_FLAG_Z_VALID | DL_POS_FLAG_3D_SOLVED;
     }
-    s_solve_valid = true;
-    s_solve_ms    = HAL_GetTick();
+    out->valid = true;
+    (void)now_ms;
+    return true;
+}
 
+/*============================================================================
+ * tag_solve — bucket the anchors by zone, solve each bucket on its own
+ *
+ * M4: the tag NEVER differences two zones against each other and NEVER
+ * publishes a fix that is not anchored in a declared zone.  If no zone
+ * yields a valid solve, the tag publishes NOTHING: no position, no
+ * quality, no zone — never the centroid of the anchors (which looks like
+ * a position on the map but is not one).
+ *==========================================================================*/
+static void tag_solve(void)
+{
+    int i, zi;
+    uint32_t now_ms = HAL_GetTick();
+
+    /* Collect the fresh, non-desynced trackers and bucket them by zone. */
+    int zone_set[DL_MAX_ZONES][DL_MAX_TRACKED_ANCHORS];
+    int zone_n[DL_MAX_ZONES];
+    int n_active = 0;
+    int n_desync = 0;
+    int n_nozone = 0;
+
+    for (zi = 0; zi < DL_MAX_ZONES; zi++) zone_n[zi] = 0;
+
+    for (i = 0; i < DL_MAX_TRACKED_ANCHORS; i++) {
+        if (!s_trackers[i].is_active) continue;
+        /* P1-1: an anchor that failed the grid self-check is EXCLUDED from
+         * the solve — its beacon no longer sits on the grid, so its slot
+         * compensation would shift the whole solution. */
+        if (s_trackers[i].desynced) { n_desync++; continue; }
+        uint32_t age_ms = (s_trackers[i].last_seen_ms == 0) ? 0
+                          : (now_ms - s_trackers[i].last_seen_ms);
+        if (age_ms > TAG_TRACKER_FRESH_MS) continue;  /* measurement too stale */
+        n_active++;
+        /* An anchor without a zone has no declared grid: it cannot be
+         * placed on one, so it cannot take part in any solve. */
+        int zb = zone_bucket_find(s_trackers[i].zone_id);
+        if (zb < 0) { n_nozone++; continue; }
+        if (zone_n[zb] < DL_MAX_TRACKED_ANCHORS) {
+            zone_set[zb][zone_n[zb]++] = i;
+        }
+    }
+
+    /* F4: NO ZONE REFERENCE IS SILENT.
+     *
+     * Everything the tag does hangs on a zone reference's beacon: the round
+     * origin, the slot spacing, the reference of the TDOA and the guard
+     * time the report goes out in.  When the reference stops sending, the
+     * tag has nothing to say and — without this diagnostic — says NOTHING
+     * AT ALL, which on the bench is indistinguishable from a dead tag.
+     *
+     * So say it: once a second, as long as the reference stays silent. */
+    {
+        /* P1-2 / P1-3: the age of the last reference beacon AND the age of
+         * the last frame of any kind.
+         *
+         * The reference's age is reported even when it has NEVER been heard:
+         * until now the diagnostic only appeared after a reference beacon
+         * had been seen, so a tag that never joined the network said
+         * nothing at all and looked exactly like a dead tag. */
+        static uint32_t s_last_diag_ms;
+        uint32_t ref_age = now_ms - s_ref_last_rx_ms;
+        uint32_t any_age  = now_ms - s_any_last_rx_ms;
+        if ((now_ms - s_last_diag_ms) >= 1000u) {
+            s_last_diag_ms = now_ms;
+            if (ref_age > TAG_ROOT_TIMEOUT_MS) {
+                char dbg[80];
+                sprintf(dbg, "NO ZONE REF age=%ums n_act=%d nozone=%d\r\n",
+                        (unsigned)ref_age, n_active, n_nozone);
+                TAG_DIAG_SOLVE(dbg);
+            }
+            if (s_any_seen && any_age > TAG_ROOT_TIMEOUT_MS) {
+                char dbg[80];
+                sprintf(dbg, "NO NETWORK FRAME age=%ums\r\n",
+                        (unsigned)any_age);
+                TAG_DIAG_SOLVE(dbg);
+            }
+        }
+    }
+
+    if (n_active < 3) {
+        { char dbg[80]; int pos = 0;
+          pos += sprintf(dbg + pos, "TSUM n_act=%d SKIP need 3 anchors", n_active);
+          if (n_desync) pos += sprintf(dbg + pos, " desync=%d", n_desync);
+          if (n_nozone) pos += sprintf(dbg + pos, " nozone=%d", n_nozone);
+          pos += sprintf(dbg + pos, "\r\n");
+          TAG_DIAG_SOLVE(dbg); }
+        s_solve_valid = false;
+        s_solve_zone  = DL_ZONE_ID_NONE;
+        return;
+    }
+
+    /* Solve every zone on its own. */
+    TagZoneFix fixes[DL_MAX_ZONES];
+    bool fix_ok[DL_MAX_ZONES];
+    for (zi = 0; zi < DL_MAX_ZONES; zi++) {
+        fix_ok[zi] = false;
+        memset(&fixes[zi], 0, sizeof(fixes[zi]));
+        if (zone_n[zi] < 3) continue;
+        fix_ok[zi] = tag_solve_zone(zi, zone_set[zi], zone_n[zi], &fixes[zi]);
+    }
+
+    /* Which zone's fix do we publish?
+     *
+     * 1. The zone we are already publishing, as long as it still solves.
+     *    The tag is physically in ONE place; it is normally served by one
+     *    zone, and switching back and forth at a zone boundary would make
+     *    the position jump for no physical reason.
+     * 2. Otherwise the zone with the MOST anchors in the solve (the zone
+     *    that surrounds the tag), and on a tie the better quality. */
+    int pick = -1;
+    if (s_solve_valid && s_solve_zone != (uint8_t)DL_ZONE_ID_NONE) {
+        for (zi = 0; zi < DL_MAX_ZONES; zi++) {
+            if (fix_ok[zi] && fixes[zi].zone == s_solve_zone) { pick = zi; break; }
+        }
+    }
+    if (pick < 0) {
+        for (zi = 0; zi < DL_MAX_ZONES; zi++) {
+            if (!fix_ok[zi]) continue;
+            if (pick < 0) { pick = zi; continue; }
+            if (fixes[zi].n_valid > fixes[pick].n_valid) {
+                pick = zi;
+            } else if (fixes[zi].n_valid == fixes[pick].n_valid
+                       && fixes[zi].q > fixes[pick].q) {
+                pick = zi;
+            }
+        }
+    }
+
+    if (pick < 0) {
+        /* NO VALID ZONE => NO OUTPUT.
+         *
+         * The tag must not publish a position it cannot anchor to a
+         * declared zone: a mixed-zone solve is a distance difference of
+         * tens of metres, and a solve with too few anchors collapses onto
+         * the centroid — which looks like a position on the map but is
+         * not one.  The report goes out with the "no quality" marker, so
+         * the tag stays visible on the host as an online device that has
+         * no position. */
+        s_solve_valid = false;
+        s_solve_zone  = DL_ZONE_ID_NONE;
+        s_solve_q     = TAG_REPORT_QUALITY_NONE;
+        s_solve_flags = 0;
+        s_solve_ms    = HAL_GetTick();
+        { char dbg[88]; int pos = 0;
+          pos += sprintf(dbg + pos, "TSUM NO_ZONE n_act=%d zones=", n_active);
+          for (zi = 0; zi < DL_MAX_ZONES; zi++) {
+              if (zone_n[zi]) pos += sprintf(dbg + pos, "%d:", zone_n[zi]);
+          }
+          if (n_nozone) pos += sprintf(dbg + pos, " nozone=%d", n_nozone);
+          pos += sprintf(dbg + pos, "\r\n");
+          TAG_DIAG_SOLVE(dbg); }
+        return;
+    }
+
+    /* Hand the solution to the UWB uplink: the report goes out once per
+     * TDMA round, in the guard time of slot 0. */
+    s_solve_x_cm   = fixes[pick].x_cm;
+    s_solve_y_cm   = fixes[pick].y_cm;
+    s_solve_z_cm   = fixes[pick].z_cm;
+    s_solve_rms_cm = fixes[pick].rms_cm;
+    s_solve_q      = fixes[pick].q;
+    s_solve_flags  = fixes[pick].flags;
+    /* The zone travels WITH the position: the same (x,y) means different
+     * things in different zones, so a consumer that ignores the zone mixes
+     * two coordinate systems. */
+    s_solve_zone   = fixes[pick].zone;
+    s_solve_valid  = true;
+    s_solve_ms     = HAL_GetTick();
 }
 
 /*============================================================================
@@ -1428,12 +1586,47 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
     /* P0-4: TDMA cycle id of this beacon */
     s_trackers[tracker_slot].cycle_id = (uint16_t)(rx_buf[DL_TS_CYCLE_IDX]
                                 | ((uint16_t)rx_buf[DL_TS_CYCLE_IDX + 1] << 8));
-    /* Zone mesh (M2): which zone the sender is in.  A beacon from the old
-     * 67-byte firmware carries no zone byte — it counts as "no zone", which
-     * is the conservative answer (it matches no bucket). */
+    /* Zone mesh (M2/M4): which zone the sender is in.  A beacon from the old
+     * 67-byte firmware carries no zone byte — it counts as "no zone".
+     *
+     * M4: "no zone" is NOT a bucket.  An anchor without a zone has no
+     * known grid, so it cannot be placed on one and cannot take part in a
+     * solve — the tag refuses to publish a position that is not anchored
+     * to a declared zone.  The anchor is still tracked (the operator sees
+     * it in the summary) and it is still counted in the diagnostics. */
+    if (s_trackers[tracker_slot].zone_id !=
+        ((frame_len >= DL_TS_ZONE_IDX + 1) ? rx_buf[DL_TS_ZONE_IDX]
+                                           : (uint8_t)DL_ZONE_ID_NONE)) {
+        /* The anchor changed its zone (or the tracker slot was recycled for
+         * a different anchor).  Its averaged TDOA was measured against the
+         * OLD zone's reference, so it is meaningless now — drop it rather
+         * than feed a TDOA from one clock domain into another zone's
+         * solve. */
+        s_trackers[tracker_slot].tdoa_now   = 0;
+        s_trackers[tracker_slot].tdoa_valid = 0;
+        s_trackers[tracker_slot].tdoa_avg   = 0;
+        s_trackers[tracker_slot].tdoa_n     = 0;
+    }
     s_trackers[tracker_slot].zone_id =
         (frame_len >= DL_TS_ZONE_IDX + 1) ? rx_buf[DL_TS_ZONE_IDX]
                                           : (uint8_t)DL_ZONE_ID_NONE;
+
+    /* The bucket this beacon's zone belongs to (-1 = no bucket: the zone is
+     * unknown, or every bucket is taken by other zones). */
+    int zb = -1;
+    if (s_trackers[tracker_slot].zone_id != (uint8_t)DL_ZONE_ID_NONE) {
+        zb = zone_bucket_get(s_trackers[tracker_slot].zone_id);
+        if (zb < 0) {
+            static uint32_t s_zone_full_ctr;
+            if ((s_zone_full_ctr++ % 50u) == 0u) {
+                char dbg[64];
+                sprintf(dbg, "ZONE_FULL z=%u buckets=%u\r\n",
+                        s_trackers[tracker_slot].zone_id,
+                        (unsigned)DL_MAX_ZONES);
+                TAG_DIAG_SOLVE(dbg);
+            }
+        }
+    }
 
     int16_t cfo_raw = dwt_readclockoffset();
 
@@ -1535,106 +1728,129 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * so its clock is the reference for the slot spacing.  Our clock_sync
      * factor towards the Root is the rate ratio (our clock)/(Root's clock)
      * that the slot compensation needs (see the TDOA block). */
-    if (frame_len >= DL_TS_LEVEL_IDX + 1 && rx_buf[DL_TS_LEVEL_IDX] == 0) {
-        s_root_rank = src_rank;
-        /* The Root is alive — remember when it was heard last. */
-        s_root_last_rx_ms = HAL_GetTick();
-        s_root_seen = 1;
-
-        /* P1-4: the Root's clock rate on its own channel (see
-         * s_rate_buf).  Updated on every Root frame, outlier or not. */
-        {
-            uint64_t d_rx = rx_local - s_rate_rx_prev;
-            uint64_t d_tx = (tx_remote - s_rate_tx_prev) & 0xFFFFFFFFFFULL;
-            if (s_rate_have_prev && d_tx > 0u && d_rx > 0u
-                && d_tx < (1ULL << 30) && d_rx < (1ULL << 30)) {
-                double r = (double)d_rx / (double)d_tx;
-                /* A round is 50 ms; anything outside 1 % is not a clock
-                 * ratio but a lost or duplicated frame. */
-                if (r > 0.99 && r < 1.01) {
-                    s_rate_buf[s_rate_idx] = r;
-                    s_rate_idx = (uint8_t)((s_rate_idx + 1u) % TAG_RATE_SAMPLES);
-                    if (s_rate_n < TAG_RATE_SAMPLES) s_rate_n++;
-                }
-            }
-            s_rate_rx_prev = rx_local;
-            s_rate_tx_prev = tx_remote;
-            s_rate_have_prev = 1;
-        }
-        if (s_rate_n >= 3u) {
-            /* Median of the last cycles (insertion sort, n <= 5). */
-            double tmp[TAG_RATE_SAMPLES];
-            uint8_t i, j;
-            for (i = 0; i < s_rate_n; i++) tmp[i] = s_rate_buf[i];
-            for (i = 1; i < s_rate_n; i++) {
-                double v = tmp[i];
-                for (j = i; j > 0u && tmp[j - 1u] > v; j--) tmp[j] = tmp[j - 1u];
-                tmp[j] = v;
-            }
-            s_root_rate = tmp[s_rate_n / 2u];
-            s_root_rate_valid = 1;
-        } else if (s_rate_n > 0u) {
-            s_root_rate = s_rate_buf[0];
-            s_root_rate_valid = 1;
-        } else {
-            /* Nothing measured yet — fall back to the clock filter's factor
-             * (which needs a few updates before it is trustworthy). */
-            s_root_rate = s_trackers[tracker_slot].sync.factor;
-            s_root_rate_valid = (s_trackers[tracker_slot].sync.update_count >= 8)
-                                ? 1 : 0;
-        }
-    }
-
-    /* ── P1-2: TDOA against the Root, averaged over several cycles ───────
-     * toa_equiv = rx_local - slot x 6.25 ms removes the TDMA slot from the
-     * arrival instant.  Against the Root's beacon of the SAME cycle the
-     * cycle origin cancels as well, so the difference is the pure TDOA —
-     * and, unlike the absolute TOA, it is comparable across cycles and
-     * can therefore be averaged (which removes the RX timestamp jitter
-     * and the per-frame grid jitter, the dominant error terms).
+    /* ── M4: the zone's clock reference and its clock ratio ───────────────
+     * cs_level = 0 marks the REFERENCE of the sender's zone (M3 renamed
+     * the byte: it is the zone role, not a level in a tree).  The
+     * reference owns slot 0 of the zone's grid, so its beacon defines the
+     * round origin and the slot spacing of that zone.
      *
-     * The Root's own beacon is stored separately; the other anchors pair
-     * with it as long as the cycle id matches. */
+     * Everything about it is kept PER ZONE: two zones are two grids with
+     * two clock ratios, and using one zone's ratio for the other zone's
+     * beacons would put their TDOAs off by a multiple of the slot
+     * duration. */
     {
-        TagAnchorTracker *t = &s_trackers[tracker_slot];
-        bool is_root = (frame_len >= DL_TS_LEVEL_IDX + 1
-                        && rx_buf[DL_TS_LEVEL_IDX] == 0);
-        if (t->slot != 255 && s_root_rate_valid) {
-            int64_t slot_eff = (int64_t)((double)DTU_PER_SLOT * s_root_rate);
-            int64_t toa_eq   = (int64_t)rx_local - (int64_t)t->slot * slot_eff;
-            /* Remove the anchor's own departure error.
-             *
-             * The beacon did not leave the antenna at the grid instant the
-             * anchor aimed at: the DX_TIME register can only express
-             * multiples of 256 DTU, so the programmed instant is the grid
-             * instant FLOORED (the beacon leaves up to 255 DTU = 1.2 m of
-             * path early), and the device TX delay adds on top of that.
-             * The anchor publishes both in tx_err, per frame, and it is a
-             * DEVIATION from the sender's own grid — so it carries no
-             * clock offset and can be applied to any anchor.  (A raw TX
-             * timestamp could not be: it lives in the sender's clock, whose
-             * offset absorbs the Root→child propagation delay.)
-             *
-             * What this does NOT fix is the anchor's grid PLACEMENT error
-             * (how far its grid origin sits from the Root's) — that is a
-             * per-anchor constant and the Root's self-calibration deals
-             * with it. */
-            if (t->tx_err_valid) toa_eq -= (int64_t)t->tx_err;
-            if (is_root) {
-                s_root_toa_eq    = toa_eq;
-                s_root_toa_cycle = t->cycle_id;
-                s_root_toa_valid = 1;
-            } else if (s_root_toa_valid && s_root_toa_cycle == t->cycle_id) {
-                t->tdoa_now   = toa_eq - s_root_toa_eq;
-                t->tdoa_valid = 1;
-                if (t->tdoa_n == 0) {
-                    t->tdoa_avg = t->tdoa_now;
-                    t->tdoa_n   = 1;
-                } else {
-                    uint32_t w = (t->tdoa_n < TAG_TOA_AVG_N) ? t->tdoa_n
-                                                             : TAG_TOA_AVG_N;
-                    t->tdoa_avg += (t->tdoa_now - t->tdoa_avg) / (int64_t)w;
-                    t->tdoa_n++;
+        TagZoneBucket *z = (zb >= 0) ? &s_zones[zb] : NULL;
+        bool is_ref = (frame_len >= DL_TS_LEVEL_IDX + 1
+                       && rx_buf[DL_TS_LEVEL_IDX] == 0);
+        if (z) {
+            z->last_rx_ms = HAL_GetTick();
+            z->seen = 1;
+        }
+        if (z && is_ref) {
+            z->ref_rank = src_rank;
+            z->ref_seen = 1;
+            z->ref_rx_ms = HAL_GetTick();
+            /* Some zone's reference is alive — this is what the degraded
+             * state is measured against. */
+            s_ref_last_rx_ms = HAL_GetTick();
+            s_ref_seen = 1;
+
+            /* P1-4: the zone's clock ratio on its own channel.  Updated on
+             * every reference frame, outlier or not. */
+            {
+                uint64_t d_rx = rx_local - z->rate_rx_prev;
+                uint64_t d_tx = (tx_remote - z->rate_tx_prev) & 0xFFFFFFFFFFULL;
+                if (z->rate_have_prev && d_tx > 0u && d_rx > 0u
+                    && d_tx < (1ULL << 30) && d_rx < (1ULL << 30)) {
+                    double r = (double)d_rx / (double)d_tx;
+                    /* A round is 50 ms; anything outside 1 % is not a clock
+                     * ratio but a lost or duplicated frame. */
+                    if (r > 0.99 && r < 1.01) {
+                        z->rate_buf[z->rate_idx] = r;
+                        z->rate_idx = (uint8_t)((z->rate_idx + 1u) % TAG_RATE_SAMPLES);
+                        if (z->rate_n < TAG_RATE_SAMPLES) z->rate_n++;
+                    }
+                }
+                z->rate_rx_prev = rx_local;
+                z->rate_tx_prev = tx_remote;
+                z->rate_have_prev = 1;
+            }
+            if (z->rate_n >= 3u) {
+                /* Median of the last cycles (insertion sort, n <= 5). */
+                double tmp[TAG_RATE_SAMPLES];
+                uint8_t i, j;
+                for (i = 0; i < z->rate_n; i++) tmp[i] = z->rate_buf[i];
+                for (i = 1; i < z->rate_n; i++) {
+                    double v = tmp[i];
+                    for (j = i; j > 0u && tmp[j - 1u] > v; j--) tmp[j] = tmp[j - 1u];
+                    tmp[j] = v;
+                }
+                z->rate = tmp[z->rate_n / 2u];
+                z->rate_valid = 1;
+            } else if (z->rate_n > 0u) {
+                z->rate = z->rate_buf[0];
+                z->rate_valid = 1;
+            } else {
+                /* Nothing measured yet — fall back to the clock filter's factor
+                 * (which needs a few updates before it is trustworthy). */
+                z->rate = s_trackers[tracker_slot].sync.factor;
+                z->rate_valid = (s_trackers[tracker_slot].sync.update_count >= 8)
+                                ? 1 : 0;
+            }
+        }
+
+        /* ── P1-2: TDOA against the zone reference, averaged over cycles ──
+         * toa_equiv = rx_local - slot x 6.25 ms removes the TDMA slot from
+         * the arrival instant.  Against the reference's beacon of the SAME
+         * cycle the cycle origin cancels as well, so the difference is the
+         * pure TDOA — and, unlike the absolute TOA, it is comparable
+         * across cycles and can therefore be averaged (which removes the
+         * RX timestamp jitter and the per-frame grid jitter, the dominant
+         * error terms).
+         *
+         * The reference's own beacon is stored separately; the other
+         * anchors pair with it as long as the cycle id matches.  The
+         * pairing is INSIDE the zone: an anchor is only ever differenced
+         * against the reference of its own zone. */
+        {
+            TagAnchorTracker *t = &s_trackers[tracker_slot];
+            if (z && t->slot != 255 && z->rate_valid) {
+                int64_t slot_eff = (int64_t)((double)DTU_PER_SLOT * z->rate);
+                int64_t toa_eq   = (int64_t)rx_local - (int64_t)t->slot * slot_eff;
+                /* Remove the anchor's own departure error.
+                 *
+                 * The beacon did not leave the antenna at the grid instant the
+                 * anchor aimed at: the DX_TIME register can only express
+                 * multiples of 256 DTU, so the programmed instant is the grid
+                 * instant FLOORED (the beacon leaves up to 255 DTU = 1.2 m of
+                 * path early), and the device TX delay adds on top of that.
+                 * The anchor publishes both in tx_err, per frame, and it is a
+                 * DEVIATION from the sender's own grid — so it carries no
+                 * clock offset and can be applied to any anchor.  (A raw TX
+                 * timestamp could not be: it lives in the sender's clock, whose
+                 * offset absorbs the reference→member propagation delay.)
+                 *
+                 * What this does NOT fix is the anchor's grid PLACEMENT error
+                 * (how far its grid origin sits from the reference's) — that is
+                 * a per-anchor constant and the reference's self-calibration
+                 * deals with it. */
+                if (t->tx_err_valid) toa_eq -= (int64_t)t->tx_err;
+                if (is_ref) {
+                    z->ref_toa_eq    = toa_eq;
+                    z->ref_cycle     = t->cycle_id;
+                    z->ref_toa_valid = 1;
+                } else if (z->ref_toa_valid && z->ref_cycle == t->cycle_id) {
+                    t->tdoa_now   = toa_eq - z->ref_toa_eq;
+                    t->tdoa_valid = 1;
+                    if (t->tdoa_n == 0) {
+                        t->tdoa_avg = t->tdoa_now;
+                        t->tdoa_n   = 1;
+                    } else {
+                        uint32_t w = (t->tdoa_n < TAG_TOA_AVG_N) ? t->tdoa_n
+                                                                 : TAG_TOA_AVG_N;
+                        t->tdoa_avg += (t->tdoa_now - t->tdoa_avg) / (int64_t)w;
+                        t->tdoa_n++;
+                    }
                 }
             }
         }
@@ -1847,24 +2063,51 @@ static void tag_tx_pos_report(uint64_t guard_hw)
 }
 
 /*============================================================================
- * The uplink grid — one report per round, Root or no Root
+ * The uplink grid — one report per round, zone reference or no zone
  *
- * tag_uplink_on_root_beacon() is called when the Root's beacon arrives:
- * the beacon is the ground truth of the grid, so it corrects the phase
- * and the guard start.  tag_uplink_poll() then fires the report once per
- * round, whether or not the beacon arrived.
+ * tag_uplink_on_root_beacon() is called when a ZONE REFERENCE's beacon
+ * arrives: the beacon is the ground truth of the grid, so it corrects the
+ * phase and the guard start.  tag_uplink_poll() then fires the report once
+ * per round, whether or not the beacon arrived.
  *
  * The guard start of the next uplink is s_guard_hw -- corrected by the
- * last Root beacon -- and it stays there until the next beacon corrects
- * it again.  The extrapolation of a lost beacon is the 50 ms round of
- * the tag's own clock.
+ * last reference beacon -- and it stays there until the next beacon
+ * corrects it again.  The extrapolation of a lost beacon is the 50 ms
+ * round of the tag's own clock.
+ *
+ * M4: THE UPLINK BELONGS TO ONE ZONE.
+ *
+ * The guard grid is the reference's grid, so a report sent on the grid of
+ * zone A while the position comes from zone B lands on top of an anchor
+ * of zone A -- spoiling that anchor's reception.  The uplink zone is
+ * therefore STICKY: it is only handed over when the current zone's
+ * reference has gone silent for more than TAG_ROOT_TIMEOUT_MS.  A tag that
+ * sees the references of two zones at the zone boundary stays on the zone
+ * it was publishing, and the handover happens once, cleanly, when the old
+ * reference really is gone.
  *==========================================================================*/
-static void tag_uplink_on_root_beacon(uint64_t hw_ts)
+static void tag_uplink_on_root_beacon(uint64_t hw_ts, uint8_t zone_id)
 {
     uint32_t now = HAL_GetTick();
 
+    /* Is the uplink zone still served by a live reference? */
+    if (s_uplink_zone != (uint8_t)DL_ZONE_ID_NONE &&
+        s_uplink_zone != zone_id) {
+        if ((uint32_t)(now - s_uplink_ref_ms) <= TAG_ROOT_TIMEOUT_MS) {
+            /* The current zone is still alive — keep it.  The other zone's
+             * reference is heard but ignored for the uplink. */
+            return;
+        }
+        /* The old zone's reference is gone: hand the uplink over. */
+        s_uplink_zone = zone_id;
+        s_uplink_on   = 0;   /* the grid restarts on the new reference */
+    } else if (s_uplink_zone == (uint8_t)DL_ZONE_ID_NONE) {
+        s_uplink_zone = zone_id;
+    }
+    s_uplink_ref_ms = now;
+
     if (!s_uplink_on) {
-        /* The first Root beacon: the grid starts here. */
+        /* The first reference beacon: the grid starts here. */
         s_uplink_on  = 1;
         s_guard_hw   = hw_ts;
         s_uplink_ms  = now + TAG_UPLINK_LEAD_MS;
@@ -1897,17 +2140,17 @@ static void tag_uplink_poll(void)
     s_uplink_ms      += DL_SOLVE_INTERVAL_MS;
     s_last_tick_ms  = now;
 
-    /* The Root is the reference of the guard time.  Without it the grid
-     * is an extrapolation of a grid that no longer exists: the anchors
-     * fall back to their ALOHA slot negotiation after a few seconds and
+    /* The zone reference is the reference of the guard time.  Without it
+     * the grid is an extrapolation of a grid that no longer exists: the
+     * anchors fall back to their slot negotiation after a few seconds and
      * the extrapolation would drop the report on top of an anchor's
      * slot -- spoiling that anchor's reception.
      *
      * So the degraded path takes over: the report goes out right after a
      * received beacon, which is always in the gap between two slots.
      * The tag stays visible on the map without a position. */
-    if (!s_root_seen ||
-        (uint32_t)(now - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS) {
+    if (s_uplink_zone == (uint8_t)DL_ZONE_ID_NONE ||
+        (uint32_t)(now - s_uplink_ref_ms) > TAG_ROOT_TIMEOUT_MS) {
         return;
     }
 
@@ -1985,8 +2228,9 @@ static void tag_keepalive_poll(void)
 {
     uint32_t now = HAL_GetTick();
 
-    /* The Root is alive -> the uplink grid takes care of the reports. */
-    if ((uint32_t)(now - s_root_last_rx_ms) <= TAG_ROOT_TIMEOUT_MS) return;
+    /* A zone reference is alive -> the uplink grid takes care of the reports. */
+    if (s_uplink_zone != (uint8_t)DL_ZONE_ID_NONE &&
+        (uint32_t)(now - s_uplink_ref_ms) <= TAG_ROOT_TIMEOUT_MS) return;
 
     /* Something went out recently -> the tag is visible already. */
     if ((uint32_t)(now - s_last_uplink_ms) < TAG_ALIVE_KEEPALIVE_MS) return;
@@ -2117,26 +2361,39 @@ int fusion_tag(void)
             if (rx_buf[9] == FUNC_DOWNLINK_BEACON) {
                 tag_rx_timesync(rx_buf, frame_len, rx_hw_ts);
 
-                /* The Root's beacon (slot 0, level 0) defines the round
-                 * origin.  The tag reports its position in the guard time
-                 * that follows it — the one interval of the round in which
-                 * no anchor is transmitting, whatever the anchor count is. */
+                /* The zone reference's beacon (slot 0, level 0) defines the
+                 * round origin.  The tag reports its position in the guard
+                 * time that follows it — the one interval of the round in
+                 * which no anchor is transmitting, whatever the anchor
+                 * count is. */
+                uint8_t bzone = (frame_len >= DL_TS_ZONE_IDX + 1)
+                                ? rx_buf[DL_TS_ZONE_IDX]
+                                : (uint8_t)DL_ZONE_ID_NONE;
                 if (frame_len >= DL_TIMESYNC_MIN_LEN
                     && rx_buf[DL_TS_SLOT_IDX] == 0
                     && rx_buf[DL_TS_LEVEL_IDX] == 0) {
-                    /* The Root's beacon: the ground truth of the grid.
+                    /* The zone reference's beacon: the ground truth of the
+                     * grid.
                      *
                      * P1-1: the report itself does NOT go out from here --
                      * it goes out from the uplink grid, so that one lost
                      * beacon does not silence the tag for a round.  The
-                     * beacon only corrects the phase and the guard start. */
-                    tag_uplink_on_root_beacon(rx_hw_ts);
+                     * beacon only corrects the phase and the guard start.
+                     *
+                     * M4: the grid belongs to the beacon's ZONE, and the
+                     * uplink zone is sticky (see tag_uplink_on_root_beacon).
+                     * A beacon without a zone cannot define a grid: it is
+                     * ignored here, and the tag falls back to the degraded
+                     * path until a zoned reference shows up. */
+                    if (bzone != (uint8_t)DL_ZONE_ID_NONE) {
+                        tag_uplink_on_root_beacon(rx_hw_ts, bzone);
+                    }
                 } else {
-                    /* F4: THE ROOT IS DOWN.
+                    /* F4: NO ZONE REFERENCE IS DOWN.
                      *
                      * The report normally rides in the guard time of slot
-                     * 0; without the Root there is no grid to extrapolate
-                     * (the anchors fall back to their ALOHA negotiation
+                     * 0; without a reference there is no grid to extrapolate
+                     * (the anchors fall back to their slot negotiation
                      * after a few seconds).  So the degraded report goes
                      * out right AFTER a received beacon -- that interval
                      * is the gap between two anchor slots, so it is safe.
@@ -2145,11 +2402,12 @@ int fusion_tag(void)
                      * heard the Root at all stayed COMPLETELY silent, and
                      * on the bench that is indistinguishable from a dead
                      * tag.  Now the degraded report goes out whenever the
-                     * Root has been silent for too long -- including when
-                     * it was never heard at all. */
+                     * reference has been silent for too long -- including
+                     * when it was never heard at all. */
                     uint32_t now2 = HAL_GetTick();
                     static uint32_t s_last_deg_ms = 0;
-                    if ((now2 - s_root_last_rx_ms) > TAG_ROOT_TIMEOUT_MS
+                    if ((!s_ref_seen ||
+                         (now2 - s_ref_last_rx_ms) > TAG_ROOT_TIMEOUT_MS)
                         && (now2 - s_last_deg_ms) >= TAG_DEGRADED_REPORT_MS) {
                         s_last_deg_ms = now2;
                         tag_tx_pos_report_degraded();
