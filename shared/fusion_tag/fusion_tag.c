@@ -223,7 +223,7 @@ static uint32_t s_n_cycle_mismatch = 0;   /* beacons dropped: wrong cycle id  */
  * buckets the anchors by their zone and solves each bucket on its own.
  *
  * Each bucket carries the state of ONE zone's clock reference (the anchor
- * with zone role = 0, which owns slot 0 of that zone's grid):
+ * with zone role = DL_ZONE_ROLE_REF, which owns slot 0 of that zone's grid):
  *
  *   ref_rank    which anchor is the reference of this zone
  *   rate        (our clock)/(reference's clock) -- the slot compensation
@@ -1586,6 +1586,29 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         return;
     }
 
+    /* M7/P0-1: the role byte's ENCODING changed — byte [27] used to say
+     * "0 = the zone's reference" and now says "1 = the zone's reference",
+     * to match the zone role at [67].  A beacon WITHOUT the ROLE_V2 bit
+     * comes from a firmware that still uses the old polarity, so its role
+     * byte cannot be read with the new encoding: reading it would take a
+     * MEMBER for the reference and build the TDOA baseline on the wrong
+     * anchor (silently wrong positions).
+     *
+     * The Tag therefore REFUSES such a frame and says so.  (The anchor
+     * and the gateway read both encodings — only the Tag's TDOA baseline
+     * is irrecoverable.)  A half-flashed network has to be reflashed
+     * completely; this bit makes that visible instead of mysterious. */
+    if (!(ts_flags & DL_TS_FLAG_ROLE_V2)) {
+        static uint32_t s_n_old_role;
+        if ((s_n_old_role++ % 20) == 0) {
+            char dbg[64];
+            sprintf(dbg, "TS_ROLEV1 R=%u refused (old role encoding)\r\n",
+                    src_rank);
+            TAG_DIAG_SOLVE(dbg);
+        }
+        return;
+    }
+
     /* The sender's departure error for THIS frame (int16, sender's DTU).
      * Only the new 67-byte frame carries it, and only when the sender says
      * the value is usable. */
@@ -1784,16 +1807,17 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         s_trackers[tracker_slot].quality *= 0.5f;
     }
 
-    /* The zone reference (zone role = 0) owns the grid the other anchors
-     * are placed on, so its clock is the reference for the slot spacing.
-     * Our clock_sync factor towards the reference is the rate ratio
-     * (our clock)/(reference's clock) that the slot compensation needs
-     * (see the TDOA block). */
+    /* The zone reference (zone role = DL_ZONE_ROLE_REF) owns the grid the
+     * other anchors are placed on, so its clock is the reference for the
+     * slot spacing.  Our clock_sync factor towards the reference is the
+     * rate ratio (our clock)/(reference's clock) that the slot compensation
+     * needs (see the TDOA block). */
     /* ── M4: the zone's clock reference and its clock ratio ───────────────
-     * zone role = 0 marks the REFERENCE of the sender's zone (M3 renamed
-     * the byte: it is the zone role, not a level in a tree).  The
-     * reference owns slot 0 of the zone's grid, so its beacon defines the
-     * round origin and the slot spacing of that zone.
+     * DL_ZONE_ROLE_REF marks the REFERENCE of the sender's zone (M3 renamed
+     * the byte: it is the zone role, not a level in a tree; M7/P0-1 aligned
+     * its encoding with the zone role at [67]).  The reference owns slot 0
+     * of the zone's grid, so its beacon defines the round origin and the
+     * slot spacing of that zone.
      *
      * Everything about it is kept PER ZONE: two zones are two grids with
      * two clock ratios, and using one zone's ratio for the other zone's
@@ -1801,8 +1825,8 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
      * duration. */
     {
         TagZoneBucket *z = (zb >= 0) ? &s_zones[zb] : NULL;
-        bool is_ref = (frame_len >= DL_TS_LEVEL_IDX + 1
-                       && rx_buf[DL_TS_LEVEL_IDX] == 0);
+        bool is_ref = (frame_len >= DL_TS_ROLE_IDX + 1
+                       && rx_buf[DL_TS_ROLE_IDX] == DL_ZONE_ROLE_REF);
         if (z) {
             z->last_rx_ms = HAL_GetTick();
             z->seen = 1;
@@ -2501,7 +2525,8 @@ int fusion_tag(void)
             if (rx_buf[9] == FUNC_DOWNLINK_BEACON) {
                 tag_rx_timesync(rx_buf, frame_len, rx_hw_ts);
 
-                /* The zone reference's beacon (slot 0, level 0) defines the
+                /* The zone reference's beacon (slot 0, DL_ZONE_ROLE_REF)
+                 * defines the
                  * round origin.  The tag reports its position in the guard
                  * time that follows it — the one interval of the round in
                  * which no anchor is transmitting, whatever the anchor
@@ -2511,7 +2536,7 @@ int fusion_tag(void)
                                 : (uint8_t)DL_ZONE_ID_NONE;
                 if (frame_len >= DL_TIMESYNC_MIN_LEN
                     && rx_buf[DL_TS_SLOT_IDX] == 0
-                    && rx_buf[DL_TS_LEVEL_IDX] == 0) {
+                    && rx_buf[DL_TS_ROLE_IDX] == DL_ZONE_ROLE_REF) {
                     /* The zone reference's beacon: the ground truth of the
                      * grid.
                      *

@@ -340,7 +340,8 @@ static int      gw_net_present_valid = 0;
  * roster order (bit N = roster[N]).
  *
  * "On the grid" means: the anchor's own beacon says it has a slot
- * (slot != 255) or that it IS the Root (level 0).  That is the only
+ * (slot != 255) or that it IS the zone's reference (DL_ZONE_ROLE_REF).
+ * That is the only
  * honest criterion -- the slot in the NETWORK_ACK is a BOOTSTRAP estimate
  * that the anchor computes from the rank distance, and it is reported
  * before the Root has confirmed the anchor, so it cannot be used to claim
@@ -1573,22 +1574,32 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
          *
          * The gateway HEARS every beacon of the grid, so it knows which
          * anchors are really on it — no extra uplink is needed:
-         *   level 0                → the Root, running
-         *   level 1, slot != 255   → admitted to the grid, running
-         *   level 1, slot == 255   → still waiting for the Root to confirm
+         *   the zone's reference     → running
+         *   a member, slot != 255   → admitted to the grid, running
+         *   a member, slot == 255   → still waiting for the zone to confirm
          *
          * Nothing ever emitted +NETSTATE before, so the host's post-
          * formation check reported EVERY member as "未上报" and the map
          * could not tell who was in the network.  The line is sent only
          * when the state CHANGES, so the UART stays quiet.
          */
-        if (len >= (uint16_t)(DL_TS_LEVEL_IDX + 1)) {
+        if (len >= (uint16_t)(DL_TS_ROLE_IDX + 1)) {
             uint8_t st = GW_NETSTATE_IDLE;
-            uint8_t level = frame[DL_TS_LEVEL_IDX];
-            uint8_t slot  = frame[DL_TS_SLOT_IDX];
+            uint8_t role = frame[DL_TS_ROLE_IDX];
+            uint8_t slot = frame[DL_TS_SLOT_IDX];
+            /* M7/P0-1: the role byte's ENCODING depends on the sender's
+             * firmware — with the ROLE_V2 flag it is the DL_ZONE_ROLE_*
+             * encoding (1 = the zone's reference), without it the old
+             * polarity (0 = the zone's reference).  The gateway reads both
+             * so a half-flashed network still reports a sensible state. */
+            uint8_t bflags = (len >= (uint16_t)(DL_TS_FLAGS_IDX + 1))
+                           ? frame[DL_TS_FLAGS_IDX] : 0;
+            uint8_t is_ref = (bflags & DL_TS_FLAG_ROLE_V2)
+                           ? (uint8_t)(role == DL_ZONE_ROLE_REF)
+                           : (uint8_t)(role == 0u);
             gw_dev_t *d;
 
-            if (level == 0)        st = GW_NETSTATE_RUNNING;
+            if (is_ref)            st = GW_NETSTATE_RUNNING;
             else if (slot != 255u) st = GW_NETSTATE_RUNNING;
             else                   st = GW_NETSTATE_WAIT;
 
@@ -1612,8 +1623,8 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
          *
          * The gateway hears every beacon of the grid, so it knows this
          * without any extra uplink.  The criterion is the anchor's own
-         * beacon: it has a slot (slot != 255) or it IS the Root
-         * (level 0).
+         * beacon: it has a slot (slot != 255) or it IS the zone's
+         * reference (DL_ZONE_ROLE_REF).
          *
          * The slot in the NETWORK_ACK would NOT do: the anchor computes a
          * BOOTSTRAP slot from the rank distance and reports it before the
@@ -1626,9 +1637,17 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         if (gw_net_roster_n > 0 && len >= (uint16_t)(DL_TS_SLOT_IDX + 1)) {
             int idx = gw_net_roster_index(src_addr);
             if (idx >= 0) {
-                uint8_t lv = frame[DL_TS_LEVEL_IDX];
+                /* M7/P0-1: the role byte's encoding depends on the sender
+                 * (ROLE_V2 -> DL_ZONE_ROLE_*, otherwise the old polarity).
+                 * The gateway reads both. */
+                uint8_t bflags = (len >= (uint16_t)(DL_TS_FLAGS_IDX + 1))
+                               ? frame[DL_TS_FLAGS_IDX] : 0;
+                uint8_t rv = frame[DL_TS_ROLE_IDX];
+                uint8_t is_ref = (bflags & DL_TS_FLAG_ROLE_V2)
+                               ? (uint8_t)(rv == DL_ZONE_ROLE_REF)
+                               : (uint8_t)(rv == 0u);
                 uint8_t sl = frame[DL_TS_SLOT_IDX];
-                int on  = (lv == 0 || sl != 255u);
+                int on  = (is_ref || sl != 255u);
                 uint16_t bit = (uint16_t)(1u << idx);
                 int was = (gw_net_on_grid & bit) ? 1 : 0;
                 if (was != on) {

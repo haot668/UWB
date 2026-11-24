@@ -58,6 +58,11 @@
 
 方案提议复用 `DL_TS_LEVEL_IDX`（原 `cs_level`）当 `zone_id`、并删掉 `parent_eui64`（8 字节）。
 
+> **M7/P0-1 的结论（已落地）**：这个字节**最终既不是 `zone_id` 也不是旧的 `cs_level`**，而是统一成了**区角色** `DL_ZONE_ROLE_*`（**1 = 区参考锚点，0 = 区成员**，与信标 [67] 的 `zone_role` 同义同极性）。
+> `zone_id` 另开在帧尾（[65]），`parent_eui64` **保留未删**（帧长 67 → 75）。
+> 旧名 `DL_TS_LEVEL_IDX` / `DL_TS_NETACK_LEVEL_IDX` **已删除**，现名 `DL_TS_ROLE_IDX` / `DL_TS_NETACK_ROLE_IDX`。
+> ⚠️ 角色位极性翻转是**破坏性协议变更**，必须**全量刷写**（详见 `docs/系统架构与算法说明.md` §5 的 P0-1 条目）。
+
 - **LEVEL 字节不能直接当 zone_id**：它现在的语义是 `cs_level`（时钟同步等级），
   锚点用它来挑参考锚点/父站。改成 zone_id 就等于改语义 → **三端都要改**，
   "只加字段不改逻辑"不成立。要么保留 cs_level 另开字段，要么明确接受语义变更并同步改三端。

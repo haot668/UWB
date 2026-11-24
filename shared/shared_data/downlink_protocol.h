@@ -3,7 +3,8 @@
  * @brief   BD8NCF-style mesh sync protocol for UWB TDOA positioning.
  *
  *          Architecture: ONE TDMA grid PER ZONE.  Each zone has its own
- *          REFERENCE ANCHOR (role byte 27 = 0) that owns slot 0; its
+ *          REFERENCE ANCHOR (role byte 27 = DL_ZONE_ROLE_REF = 1) that owns
+ *          slot 0; its
  *          beacon defines the origin of every round of that zone.  The
  *          members of a zone place their slots on that zone's own time
  *          axis — two zones are two independent axes and their TDOAs are
@@ -110,6 +111,16 @@ extern "C" {
  * reference instant so the others can check they share the axis). */
 #define DL_ZONE_ROLE_MEMBER     0u
 #define DL_ZONE_ROLE_REF        1u
+
+/* M7/P0-1: the role byte at [27] and the zone role at [67] MUST use the
+ * SAME encoding — 0 = member, 1 = reference.  A mismatch would silently
+ * invert the role of every anchor on the air (the reference would be taken
+ * for a member and vice versa), and nothing downstream could tell.
+ *
+ * armcc5 has no _Static_assert, so the check is a typedef whose array size
+ * is negative when the condition does not hold. */
+typedef char dl_zone_role_polarity_check[
+    ((DL_ZONE_ROLE_MEMBER == 0u) && (DL_ZONE_ROLE_REF == 1u)) ? 1 : -1];
 
 /*============================================================================
  * Manual network configuration
@@ -243,8 +254,12 @@ extern "C" {
  *   [7-8]   source_addr      (Anchor rank)
  *   [9]     func             (0xE9)
  *   [10-11] root_rank        (confirmed root rank, uint16 LE)
- *   [12]    reserved         (the old hierarchy level — M3 deleted the
- *                             hierarchy; the zone role is at [15])
+ *   [12]    role             (uint8, DL_ZONE_ROLE_*) — M7/P0-1 flipped the
+ *                             encoding (it used to be "0 = the zone's
+ *                             reference, 1 = a member"); the hierarchy it
+ *                             once described is gone (M3).  Nothing on the
+ *                             wire reads it — the gateway derives the state
+ *                             from the beacons.
  *   [13]    slot_idx         (TDMA slot, 255=unassigned)
  *   [14]    n_neighbors      (discovered neighbor count)
  *   [15]    zone_id          (uint8, the zone I joined)
@@ -254,7 +269,10 @@ extern "C" {
  *============================================================================*/
 #define FUNC_NETWORK_ACK_LEN      20u
 #define DL_TS_NETACK_ROOT_IDX    10u
-#define DL_TS_NETACK_LEVEL_IDX   12u
+#define DL_TS_NETACK_ROLE_IDX    12u    /* DL_ZONE_ROLE_* — M7/P0-1 flipped the
+                                           * encoding (it used to be "0 = the
+                                           * zone's reference, 1 = a member").
+                                           * Nothing reads it on the wire.     */
 #define DL_TS_NETACK_SLOT_IDX    13u
 #define DL_TS_NETACK_NNEIGH_IDX  14u
 #define DL_TS_NETACK_ZONE_IDX    15u
@@ -313,7 +331,11 @@ extern "C" {
  *   [16-17] reserved
  *   [18]    slot             (own TDMA slot, 255 = unassigned/ALOHA)
  *   [19-26] reserved         (the old parent EUI64 — no tree any more)
- *   [27]    zone role        (0 = the zone's reference, 1 = a member) <-- P0-1
+ *   [27]    zone role        (DL_ZONE_ROLE_*: 0 = a member, 1 = the zone's
+ *                             reference) — the MIRROR of [67].  M7/P0-1
+ *                             flipped the polarity (it used to be
+ *                             "0 = reference, 1 = member"); see
+ *                             DL_TS_FLAG_ROLE_V2.                        <-- P0-1
  *   [28-43] slot_table       (8 × uint16 rank, 0 = empty)      <-- P0-2
  *   [44-51] x/y/z coords (int16 each) + 2 pad bytes
  *   [52-53] cycle_id         (uint16, TDMA cycle counter)      <-- P0-4
@@ -333,7 +355,9 @@ extern "C" {
  *                             clock-reference edge (0..255).  0 = no
  *                             reference edge yet.
  *   [67]    zone_role        (uint8, M2) — DL_ZONE_ROLE_MEMBER (0) or
- *                             DL_ZONE_ROLE_REF (1).
+ *                             DL_ZONE_ROLE_REF (1).  M7/P0-1: byte [27]
+ *                             now carries the SAME encoding, so the two
+ *                             can no longer disagree.
  *   [68-72] zone_ref_ts      (5 bytes, 40-bit DTU, M2) — the TX instant of
  *                             THIS anchor's reference anchor's last beacon,
  *                             mapped onto the ZONE time base.  The tag uses
@@ -364,12 +388,30 @@ extern "C" {
  * are the freed bytes reclaimed, and by then the zone fields' offsets have
  * been frozen by the M2 release.
  *
- * M6: the hierarchy IS gone now, and byte 27 keeps its wire value
+ * M6: the hierarchy IS gone now, and byte 27 kept its wire value
  * (0 = the zone's reference, 1 = a member) — the tag and the gateway
- * both key on "== 0", so the encoding stays.  What went away is the
- * NAME: the field in the anchor is `zone_role`, and the constant is
- * DL_TS_LEVEL_IDX.  The zone id itself lives in its own byte at the end
- * of the frame ([65]).
+ * both keyed on "== 0", so the encoding stayed.  What went away is the
+ * NAME: the field in the anchor is `zone_role`, and the constant was named
+ * after the old hierarchy level.  The zone id itself lives in its own byte
+ * at the end of the frame ([65]).
+ *
+ * M7/P0-1: byte 27 is now the MIRROR of the zone role at [67] — same
+ * DL_ZONE_ROLE_* values, same polarity.  Two bytes with the same meaning
+ * used to disagree on their encoding (27: 0 = reference; 67: 1 =
+ * reference), which is exactly the kind of trap that survives review
+ * because each side is internally consistent.  The constant is renamed
+ * DL_TS_ROLE_IDX (the old name is DELETED, so a missed reader fails to
+ * COMPILE instead of silently reading the wrong byte), the polarity is
+ * pinned by a compile-time check, and DL_TS_FLAG_ROLE_V2 tells a receiver
+ * which encoding the sender used.
+ *
+ * ⚠️ THIS IS A BREAKING WIRE CHANGE: every node has to be reflashed.
+ * A new anchor + an old tag ⇒ the tag reads the role byte with the old
+ * polarity and the zone never gets a reference (no TDOA pairs at all).
+ * An old anchor + a new tag ⇒ the new tag would take the member for the
+ * reference and build its TDOA baseline on the wrong anchor (silently
+ * wrong positions).  The ROLE_V2 bit makes the new tag REFUSE an
+ * old-format beacon (and say so) instead of inverting the role.
  *
  * WHY THE FRAME USED TO BE 63 BYTES (a real bug, fixed):
  *   The frame was 63 bytes and [61-62] carried rx_ref_cycle — live data
@@ -478,7 +520,11 @@ extern "C" {
 #define DL_TS_TX_ERR_IDX          63u    /* int16 LE: this frame's TX departure
                                            * error in the sender's DTU             */
 #define DL_TS_SLOT_IDX            18u    /* own TDMA slot (255 = unassigned)        */
-#define DL_TS_LEVEL_IDX           27u    /* zone role: 0 = reference, 1 = member    */
+#define DL_TS_ROLE_IDX            27u    /* zone role: DL_ZONE_ROLE_MEMBER (0) or
+                                           * DL_ZONE_ROLE_REF (1) — the MIRROR
+                                           * of the zone role at [67].  M7/P0-1
+                                           * flipped the encoding: it used to be
+                                           * "0 = reference, 1 = member".        */
 #define DL_TS_SLOT_TABLE_IDX      28u    /* 8 × uint16_t rank, 0 = empty            */
 #define DL_TS_COORD_IDX           44u    /* x/y/z coords appended after slot table  */
 #define DL_TS_CYCLE_IDX           52u    /* uint16 TDMA cycle counter                */
@@ -509,6 +555,17 @@ extern "C" {
                                            * meaningless — receivers must drop the
                                            * frame from the TDOA pairing instead of
                                            * poisoning the average with it.        */
+#define DL_TS_FLAG_ROLE_V2        0x20u  /* M7/P0-1: the role byte at [27] uses
+                                           * the DL_ZONE_ROLE_* encoding (0 =
+                                           * member, 1 = reference).  Firmware
+                                           * that predates the flip used the
+                                           * opposite polarity (0 = reference),
+                                           * so a receiver MUST look at this bit
+                                           * before it interprets [27] — a
+                                           * half-flashed network would
+                                           * otherwise invert every role.
+                                           * Set in EVERY beacon this firmware
+                                           * sends.                            */
 #define DL_TS_FLAG_ZONE_REF_VALID 0x10u  /* M2: zone_ref_ts40 holds a usable
                                            * reference instant on the zone
                                            * time axis.  When this bit is

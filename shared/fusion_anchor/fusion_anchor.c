@@ -1212,12 +1212,18 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
      * every receiver saw a corrupted field.
      *
      * M3: the role byte no longer describes a hierarchy level — there is no
-     * hierarchy any more.  It is the ZONE ROLE: 0 = the zone's reference
-     * (the anchor whose clock defines the zone's axis), 1 = a member.
-     * The Tag reads this byte to find the reference of the zone it is in
-     * (M4 buckets the anchors per zone and pairs each zone's members with
-     * that zone's reference). */
-    pkt[DL_TS_LEVEL_IDX] = am_zone_ref() ? 0 : 1;
+     * hierarchy any more.  It is the ZONE ROLE.
+     *
+     * M7/P0-1: the role byte now carries the SAME DL_ZONE_ROLE_* values as
+     * the zone role at [67] (0 = a member, 1 = the zone's reference).  It
+     * used to be the opposite polarity (0 = the reference), which the
+     * ROLE_V2 flag in the flags byte now advertises.  The Tag reads this
+     * byte to find the reference of the zone it is in (M4 buckets the
+     * anchors per zone and pairs each zone's members with that zone's
+     * reference). */
+    pkt[DL_TS_ROLE_IDX] = am_zone_ref() ? DL_ZONE_ROLE_REF : DL_ZONE_ROLE_MEMBER;
+    /* Tell every receiver which encoding this frame's role byte uses. */
+    pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_ROLE_V2;
 
     /* The slot the TAG compensates this beacon with.
      *
@@ -2098,8 +2104,9 @@ static void anchor_send_network_ack(void)
     /* the zone's clock reference, confirmed */
     ack[DL_TS_NETACK_ROOT_IDX]   = (uint8_t)(s_zone_ref_rank & 0xFF);
     ack[DL_TS_NETACK_ROOT_IDX+1] = (uint8_t)(s_zone_ref_rank >> 8);
-    /* role (0 = the zone's reference, 1 = a member) and my slot */
-    ack[DL_TS_NETACK_LEVEL_IDX] = am_zone_ref() ? 0 : 1;
+    /* role (M7/P0-1: DL_ZONE_ROLE_* — 0 = a member, 1 = the zone's
+     * reference; the encoding used to be the opposite) and my slot */
+    ack[DL_TS_NETACK_ROLE_IDX] = am_zone_ref() ? DL_ZONE_ROLE_REF : DL_ZONE_ROLE_MEMBER;
     ack[DL_TS_NETACK_SLOT_IDX]  = s_net_slot_idx;
     /* neighbor count */
     { uint8_t nn = 0; int ni;
@@ -2285,15 +2292,26 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * it buckets together really do share ONE axis.  Two anchors of
      * different zones carry different stamps — which is exactly the
      * cross-zone mixing the zone split exists to prevent. */
-    uint8_t sender_level = rx_buf[DL_TS_LEVEL_IDX];
+    uint8_t sender_role = rx_buf[DL_TS_ROLE_IDX];
     bool sender_is_ref = (src_rank == s_zone_ref_rank);
 
-    /* The sender's own role byte has to agree with the designation: 0 means
-     * "I am the zone's reference".  A sender that is designated as the
-     * reference but claims the member role is running a different
-     * configuration — its beacon must not be taken for the zone's axis.
-     * Reported once, it is a configuration error, not a link error. */
-    if (sender_is_ref && sender_level != 0) {
+    /* The sender's own role byte has to agree with the designation.
+     *
+     * M7/P0-1: the role byte's ENCODING depends on the sender's firmware:
+     * with ROLE_V2 it is the DL_ZONE_ROLE_* encoding (1 = the zone's
+     * reference), without it the old polarity (0 = the zone's reference).
+     * The anchor reads BOTH, so a half-flashed network still works here —
+     * only the Tag refuses an old-format beacon (it would otherwise build
+     * its TDOA baseline on the wrong anchor). */
+    bool sender_says_ref = (ts_flags & DL_TS_FLAG_ROLE_V2)
+                           ? (sender_role == DL_ZONE_ROLE_REF)
+                           : (sender_role == 0u);
+
+    /* A sender that is designated as the reference but claims the member
+     * role is running a different configuration — its beacon must not be
+     * taken for the zone's axis.  Reported once, it is a configuration
+     * error, not a link error. */
+    if (sender_is_ref && !sender_says_ref) {
         static uint8_t s_role_warned;
         if (!s_role_warned) {
             s_role_warned = 1;
