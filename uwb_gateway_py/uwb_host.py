@@ -149,6 +149,25 @@ class State:
         self.grid_w: float = 100.0
         self.grid_h: float = 100.0
 
+        # ── M5: 区域管理 ────────────────────────────────────────────────
+        # A zone is a group of anchors with its OWN clock reference and its
+        # OWN TDMA grid.  The tag solves every zone separately, so the
+        # host has to be able to define more than one of them.
+        #   {zone_id: {"ref": int, "members": [rank], "sent": bool,
+        #               "ack": int, "note": str}}
+        self.zones: dict[int, dict] = {}
+        # The zone whose NETWORK_START is on the air right now.  The
+        # gateway broadcasts one zone at a time (the burst is one state
+        # machine), so the zones are sent one after the other.
+        self.zone_sending: int | None = None
+        self.zone_queue: list[int] = []
+        self.zone_dispatch_deadline: float = 0.0
+        self._zone_selected: int | None = None
+        # The zone of the network that is currently on the air.  The
+        # gateway broadcasts one zone at a time, so this is the zone the
+        # +NETSTART_OK answer and the +NETMISS list belong to.
+        self.net_zone: int | None = None
+
 S = State()
 rx_queue = queue.Queue()
 root: tk.Tk | None = None
@@ -302,6 +321,8 @@ def parse_line(line: str):
         handle_ota_error(parts)
     elif head == "+LINK" and len(parts) >= 3:
         handle_link(parts)
+    elif head == "+ZONE" and len(parts) >= 3:
+        handle_zone(parts)
     elif head == "+FIND" and len(parts) >= 2:
         if len(parts) >= 3:
             uid = parts[1].strip()
@@ -397,6 +418,8 @@ def parse_line(line: str):
         else:
             set_status(f"组网启动成功 → {ack_count} 个基站响应 (Root=R{root_rank})", "success")
             S.net_missing_ranks = set()
+        # M5: the answer belongs to the zone that is on the air right now.
+        zone_on_netstart_ok(ack_count, root_rank, miss_ranks)
         if hasattr(S, "_netstart_btn") and S._netstart_btn:
             # NOT "✓ 组网成功".  The ACK count says only that an anchor
             # HEARD the broadcast — the anchor still needs up to 3 s to get
@@ -1895,15 +1918,61 @@ def _show_fwv_popup():
     refresh_lists()
 
 def handle_link(parts):
-    """Store inter-anchor link quality: +LINK,<uid1>,<uid2>,<quality>"""
+    """The link diagnostic of one anchor: +LINK,<uid>,<beacons per second>.
+
+    M5.  The gateway hears EVERY beacon of every zone, so the beacon rate
+    is the one link-health number that needs no extra uplink: an anchor
+    whose beacons stop is an anchor the tag can no longer hear, and the tag
+    cannot tell that from a geometric problem.
+
+    An anchor that is on the grid sends 20 beacons per second (one per
+    50 ms round).  A rate far below that means the anchor is only
+    intermittently heard — the beacon is then often NOT the one the tag
+    pairs with, which shows up as a TDOA that jumps around.
+
+    (The old format of this line was +LINK,<uid1>,<uid2>,<quality>, a
+    pairwise link score.  NOTHING ever emitted it — the gateway had no
+    pairwise link measurement — so the line is used for the beacon rate
+    instead, which the gateway really does measure.)
+    """
     try:
-        u1 = parts[1].strip()
-        u2 = parts[2].strip()
-        q = int(parts[3].strip()) if len(parts) > 3 else 5
+        uid = parts[1].strip()
+        rate = int(parts[2].strip())
     except (ValueError, IndexError):
         return
-    key = tuple(sorted([u1, u2]))
-    S.link_quality[key] = max(0, min(10, q))
+    rate = max(0, min(255, rate))
+    d = S.devices.get(uid)
+    if d is not None:
+        d["beacon_rate"] = rate
+
+
+def handle_zone(parts):
+    """The zone and the slot of one anchor: +ZONE,<uid>,<zone>,<slot>.
+
+    M5.  Both fields come from the anchor's own beacon, so the gateway
+    learns the zone layout just by listening.  The host needs them to draw
+    the zones, to colour the anchors by zone and to tell the operator which
+    anchor holds which slot.
+
+    zone 255 (DL_ZONE_ID_NONE) = the anchor is in no zone.
+    slot  255 = the anchor has no slot yet (it has not closed its DS-TWR
+    round trip with the zone reference).
+    """
+    try:
+        uid = parts[1].strip()
+        zone = int(parts[2].strip())
+        slot = int(parts[3].strip()) if len(parts) > 3 else 255
+    except (ValueError, IndexError):
+        return
+    d = S.devices.get(uid)
+    if d is None:
+        return
+    changed = (d.get("zone") != zone) or (d.get("slot") != slot)
+    d["zone"] = zone
+    d["slot"] = slot
+    if changed:
+        S._dirty = True
+        refresh_lists()
 
 def on_disconnected():
     for d in S.devices.values():
@@ -2060,6 +2129,505 @@ def save_anchor_config():
             }, f, indent=2)
     except Exception:
         pass
+
+# ══════════════════════════════════════════════
+#  M5 — 区域管理（zone management）
+# ══════════════════════════════════════════════
+#
+# 一个"区" = 一组基站 + 一个**区参考锚点** + 一张自己的时隙表 + 一条
+# 自己的时间轴。标签按区分桶解算，所以上位机必须能划出不止一个区。
+#
+# 网关一次只能广播一个区的 NETWORK_START（突发是一个状态机），所以
+# 多个区只能**一个一个下发**：AT+ZONE=<z> 然后 AT+NETSTART=…，等这一
+# 个区的 2 秒突发窗口过去再发下一个。基站侧按 zone_id 过滤广播，所以
+# 后面的区不会把前面的区重置掉。
+
+MAX_ZONES = 4          # 与固件的 DL_MAX_ZONES 一致
+
+
+def zone_anchor_list():
+    """[(rank, label)] — the anchors the host knows, by rank."""
+    out = []
+    for uid, d in S.devices.items():
+        if d.get("type") != "ANCHOR":
+            continue
+        try:
+            r = int(d.get("rank") or 0)
+        except (TypeError, ValueError):
+            continue
+        if r > 0:
+            out.append((r, get_label(uid), uid))
+    out.sort()
+    return out
+
+
+def zone_get(zid):
+    """The zone record, created on demand."""
+    z = S.zones.get(zid)
+    if z is None:
+        z = {"ref": 0, "members": [], "sent": False, "ack": -1, "note": ""}
+        S.zones[zid] = z
+    return z
+
+
+def zone_ranks(zid):
+    """The ranks of a zone: the reference plus the members."""
+    z = S.zones.get(zid)
+    if not z:
+        return []
+    out = []
+    if z.get("ref"):
+        out.append(int(z["ref"]))
+    for r in z.get("members", []):
+        if r not in out:
+            out.append(int(r))
+    return out
+
+
+def zone_coord(rank):
+    """(x, y) of an anchor rank, or None when it has no coordinate."""
+    for uid, d in S.devices.items():
+        if d.get("type") != "ANCHOR":
+            continue
+        try:
+            if int(d.get("rank") or 0) != int(rank):
+                continue
+        except (TypeError, ValueError):
+            continue
+        if d.get("ax") is None or d.get("ay") is None:
+            return None
+        try:
+            return (float(d["ax"]), float(d["ay"]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def zone_check(zid):
+    """The geometric sanity of a zone.
+
+    Two things make a zone unusable, and BOTH are visible from the
+    coordinates the operator entered — no hardware needed:
+
+    * fewer than three anchors: two TDOAs for two unknowns is exactly
+      determined, there is nothing left to check the solution against;
+    * a collinear layout: the TDOA hyperbolas of anchors on one line do
+      not intersect in a unique point, so the solve is degenerate however
+      good the measurements are.
+
+    The collinearity test is the area of the triangle spanned by the
+    anchors against the square of their spread: below 1 % the layout is
+    a line for every practical purpose.
+    """
+    ranks = zone_ranks(zid)
+    pts = [zone_coord(r) for r in ranks]
+    pts = [p for p in pts if p is not None]
+    problems = []
+    if len(ranks) < 3:
+        problems.append(f"只有 {len(ranks)} 个基站（至少 3 个）")
+    missing = [r for r in ranks if zone_coord(r) is None]
+    if missing:
+        problems.append("未设坐标: " + ",".join(f"R{r}" for r in missing))
+    if len(pts) >= 3:
+        # The convex hull (monotone chain).  Collinear points are dropped
+        # from the hull, so a hull of fewer than three points means the
+        # anchors lie on a line — the most common degenerate layout, and
+        # exactly the one a naive "area of the hull" test would miss.
+        hull = convex_hull(pts)
+        if len(hull) < 3:
+            problems.append("基站共线（TDOA 几何退化）")
+        else:
+            a = 0.0
+            for i in range(len(hull)):
+                x1, y1 = hull[i]
+                x2, y2 = hull[(i + 1) % len(hull)]
+                a += x1 * y2 - x2 * y1
+            area = abs(a) / 2.0
+            xs = [p[0] for p in hull]
+            ys = [p[1] for p in hull]
+            span = max(max(xs) - min(xs), max(ys) - min(ys))
+            if span > 0 and area / (span * span) < 0.01:
+                problems.append("基站共线（TDOA 几何退化）")
+    return problems
+
+
+def zone_status(zid):
+    """One line of status for a zone — the text of the zone table."""
+    z = S.zones.get(zid)
+    if not z:
+        return "（空）"
+    parts = []
+    parts.append(f"参考 R{z.get('ref') or '-'}")
+    parts.append(f"成员 {len(z.get('members', []))}")
+    if z.get("sent"):
+        if z.get("ack", -1) >= 0:
+            parts.append(f"已下发 {z['ack']} 应答")
+        else:
+            parts.append("已下发")
+    probs = zone_check(zid)
+    if probs:
+        parts.append("⚠ " + "；".join(probs))
+    return "  ".join(parts)
+
+
+def zone_send_one(zid):
+    """Send ONE zone: AT+ZONE=<z> then AT+NETSTART=<ref>,<members…>.
+
+    The reference has to be inside the roster — the gateway refuses the
+    network otherwise (+NETSTART_ERR,ROOTNOTINROSTER), because a zone
+    without a reference has no time axis at all.
+    """
+    z = zone_get(zid)
+    ranks = zone_ranks(zid)
+    if not z.get("ref"):
+        set_status(f"区 {zid} 没有参考锚点 — 先选一个", "error")
+        return False
+    if z["ref"] not in ranks:
+        ranks = [z["ref"]] + [r for r in ranks if r != z["ref"]]
+    if len(ranks) < 2:
+        set_status(f"区 {zid} 至少要 2 个基站（1 参考 + 1 成员）", "error")
+        return False
+    probs = zone_check(zid)
+    if probs:
+        set_status(f"区 {zid} 几何有问题：{'；'.join(probs)}", "warning")
+    send_cmd(f"AT+ZONE={zid}")
+    send_cmd("AT+NETSTART=" + str(ranks[0]) + "," + ",".join(str(r) for r in ranks[1:]))
+    z["sent"] = True
+    z["ack"] = -1
+    z["note"] = "下发中"
+    S.zone_sending = zid
+    S.net_zone = zid
+    S.net_roster = list(ranks)
+    S.net_root_rank = int(ranks[0])
+    S.net_missing_ranks = set()
+    S.net_phase = NET_PHASE_STARTING
+    set_net_phase(NET_PHASE_STARTING)
+    S.zone_dispatch_deadline = time.time() + 4.0
+    set_status(f"区 {zid} 组网中 — 参考 R{z['ref']}，成员 {len(ranks)} 个…", "info")
+    refresh_zone_panel()
+    # The safety net: if the gateway never answers, the queue still moves.
+    root.after(500, zone_dispatch_tick)
+    return True
+
+
+def zone_send_all():
+    """Send every zone, one after the other.
+
+    The gateway's NETWORK_START is a burst state machine — one zone at a
+    time.  The zones are queued and the next one goes out when the
+    previous burst is over (the gateway answers +NETSTART_OK about two
+    seconds later).
+    """
+    zids = sorted(S.zones.keys())
+    good = []
+    for zid in zids:
+        if zone_get(zid).get("ref") and len(zone_ranks(zid)) >= 2:
+            good.append(zid)
+        else:
+            zone_get(zid)["note"] = "跳过（缺参考或成员太少）"
+    if not good:
+        set_status("没有可下发的区 — 每个区至少要有参考锚点和 1 个成员", "error")
+        return
+    S.zone_queue = list(good)
+    zone_send_next()
+
+
+def zone_send_next():
+    """The next zone of the queue (called when the previous one is done)."""
+    if not S.zone_queue:
+        S.zone_sending = None
+        set_status("全部区下发完成", "success")
+        refresh_zone_panel()
+        return
+    zid = S.zone_queue.pop(0)
+    zone_send_one(zid)
+
+
+def zone_dispatch_tick():
+    """The safety net of the zone queue.
+
+    The gateway answers +NETSTART_OK when the burst is over, and that
+    answer moves the queue on.  But if the gateway never answers (the
+    cable fell out), the queue would stall forever — so this tick gives
+    every zone a deadline.
+    """
+    if S.zone_sending is None and not S.zone_queue:
+        return
+    if time.time() < S.zone_dispatch_deadline:
+        root.after(500, zone_dispatch_tick)
+        return
+    z = S.zones.get(S.zone_sending)
+    if z is not None and z.get("ack", -1) < 0:
+        z["note"] = "网关没有应答"
+        z["ack"] = -1
+    zone_send_next()
+
+
+def zone_on_netstart_ok(ack_count, root_rank, miss):
+    """The gateway answered a zone's NETWORK_START.
+
+    The zone the answer belongs to is the one on the air — the host knows
+    which one it sent last, because it sends them one at a time.
+    """
+    zid = getattr(S, "zone_sending", None)
+    if zid is None:
+        return
+    z = zone_get(zid)
+    z["ack"] = int(ack_count)
+    z["note"] = f"应答 {ack_count}" + (f"，缺 {len(miss)}" if miss else "")
+    refresh_zone_panel()
+    # The burst of this zone is over — the next one may go out.
+    S.zone_sending = None
+    if S.zone_queue:
+        root.after(300, zone_send_next)
+
+
+# ── The zone panel (M5) ───────────────────────────────────────────────────
+#
+# The panel has two halves:
+#   * the EDITOR — the zone being edited (its id, its reference anchor and
+#     its members).  The editor is built ONCE and keeps the operator's
+#     typing; only the LIST below it is rebuilt when something changes.
+#   * the LIST — one row per zone with its status and its own buttons.
+
+def zone_fill_members():
+    """(Re)fill the member listbox from the stored zone.
+
+    The selection is stored live in S.zones (see zone_sync_members), so
+    rebuilding the listbox never loses the operator's picks.
+    """
+    box = getattr(S, "_zone_members_box", None)
+    if box is None:
+        return
+    zid = getattr(S, "_zone_edit_id", 0)
+    members = set(S.zones.get(zid, {}).get("members", []))
+    box.delete(0, "end")
+    for r, label, _uid in zone_anchor_list():
+        box.insert("end", f"R{r:<3d} {label}")
+        if r in members:
+            box.selection_set("end")
+
+
+def zone_sync_members():
+    """The operator changed the member selection — store it right away."""
+    box = getattr(S, "_zone_members_box", None)
+    if box is None:
+        return
+    zid = getattr(S, "_zone_edit_id", 0)
+    z = S.zones.get(zid)
+    if z is None:
+        return
+    anchors = zone_anchor_list()
+    sel = []
+    for i in range(box.size()):
+        if box.selection_includes(i):
+            sel.append(anchors[i][0])
+    ref = z.get("ref") or 0
+    z["members"] = [m for m in sel if m != ref]
+
+
+def zone_load_editor():
+    """Load the zone that is being edited into the editor widgets."""
+    try:
+        zid = int(S._zone_id_var.get())
+    except Exception:
+        zid = 0
+    zid = max(0, min(MAX_ZONES - 1, zid))
+    S._zone_id_var.set(str(zid))
+    S._zone_edit_id = zid
+    z = S.zones.get(zid)
+    ref = str(z.get("ref") or "") if z else ""
+    S._zone_ref_var.set(ref)
+    zone_fill_members()
+    refresh_zone_panel()
+
+
+def zone_save_editor():
+    """Write the editor back into the zone table."""
+    try:
+        zid = int(S._zone_id_var.get())
+    except Exception:
+        zid = 0
+    zid = max(0, min(MAX_ZONES - 1, zid))
+    ref = 0
+    rv = S._zone_ref_var.get().strip()
+    if rv:
+        try:
+            ref = int(rv.split()[0].lstrip("R"))
+        except (ValueError, IndexError):
+            ref = 0
+    members = []
+    box = getattr(S, "_zone_members_box", None)
+    if box:
+        anchors = zone_anchor_list()
+        for i in range(box.size()):
+            if box.selection_includes(i):
+                members.append(anchors[i][0])
+    z = zone_get(zid)
+    z["ref"] = ref
+    z["members"] = [m for m in members if m != ref]
+    set_status(f"区 {zid} 已保存 — 参考 R{ref or '-'}，成员 {len(z['members'])} 个", "info")
+    refresh_zone_panel()
+
+
+def zone_select(zid):
+    """The operator clicked a zone in the list — edit it."""
+    S._zone_id_var.set(str(zid))
+    zone_load_editor()
+
+
+def zone_delete_selected():
+    try:
+        zid = int(S._zone_id_var.get())
+    except Exception:
+        zid = 0
+    if zid not in S.zones:
+        return
+    if not messagebox.askyesno("删除区",
+            f"删除区 {zid}？\n\n"
+            "（已经下发的基站不会因此停下 —— 要停网请用「开始组网」里的停止流程。）",
+            parent=root):
+        return
+    S.zones.pop(zid, None)
+    set_status(f"区 {zid} 已删除", "info")
+    refresh_zone_panel()
+
+
+def zone_send_selected():
+    try:
+        zid = int(S._zone_id_var.get())
+    except Exception:
+        zid = 0
+    zone_save_editor()
+    zone_send_one(zid)
+
+
+def refresh_zone_panel():
+    """Rebuild the zone list (and refresh the editor's anchor list).
+
+    The EDITOR is not rebuilt — the operator may be typing in it.  Only
+    its combobox values are refreshed, because the set of known anchors
+    grows while the network forms.
+    """
+    # The reference anchor combobox: the anchors the host knows.
+    box = getattr(S, "_zone_ref_box", None)
+    if box is not None:
+        vals = [""]
+        for r, label, _uid in zone_anchor_list():
+            vals.append(f"R{r}  {label}")
+        try:
+            box["values"] = vals
+        except Exception:
+            pass
+
+    lf = getattr(S, "_zone_list_frame", None)
+    if lf is None:
+        return
+    # The set of known anchors grows while the network forms — refresh the
+    # member list so the operator sees the new ones.
+    zone_fill_members()
+    for w in lf.winfo_children():
+        w.destroy()
+
+    if not S.zones:
+        tk.Label(lf, text="还没有区 — 在上面填区号、选参考锚点、勾成员，"
+                          "然后点「新建/更新」",
+                 bg=C["bg"], fg=C["muted"], font=("Segoe UI", 8),
+                 justify="left", anchor="w").pack(fill="x")
+        return
+
+    for zid in sorted(S.zones.keys()):
+        row = tk.Frame(lf, bg=C["card"], highlightthickness=1,
+                       highlightbackground=C["border"])
+        row.pack(fill="x", pady=2)
+        head = tk.Frame(row, bg=C["card"])
+        head.pack(fill="x", padx=6, pady=(4, 0))
+        tk.Label(head, text=f"区 {zid}", bg=C["card"], fg=C["accent"],
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        tk.Label(head, text=zone_status(zid), bg=C["card"], fg=C["muted"],
+                 font=("Segoe UI", 8)).pack(side="left", padx=6)
+        act = tk.Frame(row, bg=C["card"])
+        act.pack(fill="x", padx=6, pady=(2, 4))
+        tk.Button(act, text="编辑", bg=C["surface"], fg=C["text"],
+                  font=("Segoe UI", 8), bd=1, relief="solid", padx=8, pady=1,
+                  cursor="hand2", activebackground=C["border"],
+                  command=lambda z=zid: zone_select(z)).pack(side="left")
+        tk.Button(act, text="下发", bg=C["surface"], fg=C["text"],
+                  font=("Segoe UI", 8), bd=1, relief="solid", padx=8, pady=1,
+                  cursor="hand2", activebackground=C["border"],
+                  command=lambda z=zid: (zone_select(z),
+                                         zone_send_selected())).pack(side="left", padx=4)
+
+
+def build_zones():
+    """Build the zone panel (M5).  Called when the 区域 tab is shown."""
+    for w in S._zone_frame.winfo_children():
+        w.destroy()
+
+    tk.Label(S._zone_frame, text="区域管理", bg=C["bg"], fg=C["text"],
+             font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 2))
+    tk.Label(S._zone_frame,
+             text="一个区 = 一组基站 + 一个参考锚点 + 一张自己的时隙表。\n"
+                  "标签按区分别解算 —— 跨区的 TDOA 不会混算。",
+             bg=C["bg"], fg=C["muted"], font=("Segoe UI", 8),
+             justify="left", anchor="w").pack(fill="x", pady=(0, 8))
+
+    # --- the editor ---
+    row1 = tk.Frame(S._zone_frame, bg=C["bg"])
+    row1.pack(fill="x")
+    tk.Label(row1, text="区号", bg=C["bg"], fg=C["muted"],
+             font=("Segoe UI", 9)).pack(side="left")
+    S._zone_id_var = tk.StringVar(value="0")
+    ent = tk.Entry(row1, textvariable=S._zone_id_var, width=4,
+                   bg=C["surface"], fg=C["text"], insertbackground=C["text"],
+                   relief="solid", bd=1, font=("Consolas", 10), justify="right")
+    ent.pack(side="left", padx=(4, 10))
+    ent.bind("<Return>", lambda e: zone_load_editor())
+    tk.Label(row1, text="参考锚点", bg=C["bg"], fg=C["muted"],
+             font=("Segoe UI", 9)).pack(side="left")
+    S._zone_ref_var = tk.StringVar(value="")
+    S._zone_ref_box = ttk.Combobox(row1, textvariable=S._zone_ref_var,
+                                   state="readonly", width=16, font=("Segoe UI", 9))
+    S._zone_ref_box.pack(side="left", padx=4)
+    S._zone_ref_box.bind("<<ComboboxSelected>>", lambda e: zone_save_editor())
+    tk.Button(row1, text="新建/更新", bg=C["surface"], fg=C["text"],
+              font=("Segoe UI", 9), bd=1, relief="solid", padx=10, pady=2,
+              cursor="hand2", activebackground=C["border"],
+              command=zone_save_editor).pack(side="right")
+
+    tk.Label(S._zone_frame, text="成员（Ctrl 多选）", bg=C["bg"], fg=C["muted"],
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(8, 2))
+    lb = tk.Listbox(S._zone_frame, selectmode="multiple", height=7,
+                    exportselection=False, bg=C["surface"], fg=C["text"],
+                    font=("Consolas", 9), relief="solid", bd=1,
+                    highlightthickness=0, activestyle="none")
+    lb.pack(fill="both", expand=True)
+    S._zone_members_box = lb
+    lb.bind("<<ListboxSelect>>", lambda e: zone_sync_members())
+
+    b = tk.Frame(S._zone_frame, bg=C["bg"])
+    b.pack(fill="x", pady=6)
+    tk.Button(b, text="下发此区", bg=C["accent"], fg="#ffffff",
+              font=("Segoe UI", 9, "bold"), bd=0, relief="flat", padx=10, pady=4,
+              cursor="hand2", activebackground="#6cb2ff",
+              command=zone_send_selected).pack(side="left")
+    tk.Button(b, text="下发全部区", bg=C["surface"], fg=C["text"],
+              font=("Segoe UI", 9), bd=1, relief="solid", padx=10, pady=4,
+              cursor="hand2", activebackground=C["border"],
+              command=zone_send_all).pack(side="left", padx=4)
+    tk.Button(b, text="删除此区", bg=C["surface"], fg=C["red"],
+              font=("Segoe UI", 9), bd=1, relief="solid", padx=10, pady=4,
+              cursor="hand2", activebackground=C["border"],
+              command=zone_delete_selected).pack(side="left")
+
+    # --- the list ---
+    tk.Label(S._zone_frame, text="已定义的区", bg=C["bg"], fg=C["muted"],
+             font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(4, 2))
+    S._zone_list_frame = tk.Frame(S._zone_frame, bg=C["bg"])
+    S._zone_list_frame.pack(fill="x")
+
+    zone_load_editor()
+
 
 # ══════════════════════════════════════════════
 #  Root Window
@@ -2304,6 +2872,12 @@ def build_sidebar(parent):
     S._tab_set.pack(side=tk.LEFT, fill=tk.X, expand=True)
     S._tab_set.bind("<Button-1>", lambda e: show_tab("settings"))
 
+    S._tab_zone = tk.Label(tabf, text="区域", bg=C["surface"], fg=C["muted"],
+                           font=("Segoe UI", 11), padx=22, pady=7,
+                           cursor="hand2")
+    S._tab_zone.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    S._tab_zone.bind("<Button-1>", lambda e: show_tab("zones"))
+
     # Device panel
     S._dev_frame = tk.Frame(sb, bg=C["bg"])
     S._dev_frame.pack(fill=tk.BOTH, expand=True)
@@ -2375,17 +2949,24 @@ def build_sidebar(parent):
     # Settings frame (hidden)
     S._set_frame = tk.Frame(sb, bg=C["bg"])
 
+    # Zone frame (hidden) — the zone mesh panel (M5)
+    S._zone_frame = tk.Frame(sb, bg=C["bg"])
+
 def show_tab(tab):
+    for f in (S._dev_frame, S._set_frame, S._zone_frame):
+        f.pack_forget()
+    for t in (S._tab_dev, S._tab_set, S._tab_zone):
+        t.config(bg=C["surface"], fg=C["muted"], font=("Segoe UI", 11))
     if tab == "devices":
-        S._set_frame.pack_forget()
         S._dev_frame.pack(fill=tk.BOTH, expand=True)
         S._tab_dev.config(bg=C["accent"], fg="#ffffff", font=("Segoe UI", 11, "bold"))
-        S._tab_set.config(bg=C["surface"], fg=C["muted"], font=("Segoe UI", 11))
+    elif tab == "zones":
+        S._zone_frame.pack(fill=tk.BOTH, expand=True)
+        S._tab_zone.config(bg=C["accent"], fg="#ffffff", font=("Segoe UI", 11, "bold"))
+        build_zones()
     else:
-        S._dev_frame.pack_forget()
         S._set_frame.pack(fill=tk.BOTH, expand=True)
-        S._tab_set.config(bg=C["accent"], fg="#ffffff", font=("Segoe UI", 10, "bold"))
-        S._tab_dev.config(bg=C["surface"], fg=C["muted"], font=("Segoe UI", 10))
+        S._tab_set.config(bg=C["accent"], fg="#ffffff", font=("Segoe UI", 11, "bold"))
         build_settings()
 
 def build_settings():
@@ -3398,6 +3979,17 @@ def refresh_lists(force_rebuild=False):
                     info += "  ⚠ 掉线"
             if d.get("rank_collision"):
                 info += "  ⚠ rank冲突"
+            # M5: the zone and the slot the anchor is on.  The zone is what
+            # the tag buckets on, and the slot is its place in the zone's
+            # time axis.
+            zn = d.get("zone")
+            if zn is not None and zn != 255:
+                info += f"  区{zn}"
+                sl = d.get("slot")
+                if sl is not None and sl != 255:
+                    info += f"/槽{sl}"
+            elif d.get("slot") not in (None, 255):
+                info += f"  槽{d.get('slot')}"
         elif d.get("x") is not None:
             info = f"{d['x']:.2f}  {d['y']:.2f}  Q:{d.get('q','?')}"
         else:
@@ -3447,6 +4039,10 @@ def refresh_lists(force_rebuild=False):
 
         for uid, d in offline_items:
             render_card(uid, d, is_offline=True)
+
+    # M5: the zone panel shows the anchors too — its member list has to
+    # follow the device list.
+    refresh_zone_panel()
 
 def select_device(uid):
     S.selected_uid = uid
@@ -4389,6 +4985,9 @@ def render_loop():
     # Origin label
     c.create_text(ox_px+8, oy_px+8, text="O", fill=C["muted"], font=("Consolas", 8, "bold"))
 
+    # Draw the zones first — they are the ground the anchors stand on.
+    draw_zone_hulls(c)
+
     # Draw devices
     for uid, d in S.devices.items():
         if d.get("type") == "GATEWAY":
@@ -4428,6 +5027,93 @@ def get_anchor_xy(d):
     y = d.get("ay") if d.get("ay") is not None else d.get("y")
     return x, y
 
+# ── The zones on the map (M5) ─────────────────────────────────────────────
+#
+# A zone is a group of anchors with its own clock reference and its own
+# TDMA grid.  On the map a zone is drawn as the dashed hull of its
+# anchors, in its own colour, so the operator can see that two groups are
+# two separate time axes — and not one mesh that happens to be drawn twice.
+
+ZONE_COLORS = ["#0969da", "#8250df", "#bf3989", "#1a7f37"]
+ZONE_NONE = 255
+
+
+def zone_color(zid):
+    """The colour of a zone (grey for 'no zone')."""
+    if zid is None or zid == ZONE_NONE:
+        return "#8b9096"
+    return ZONE_COLORS[int(zid) % len(ZONE_COLORS)]
+
+
+def zone_groups():
+    """{zone_id: [(x, y), …]} — the anchors of every zone, by position.
+
+    The groups come from what the anchors REPORT (the gateway hears their
+    beacons), not from what the host asked for — a zone that was formed
+    by hand or by an older session still shows up here.
+    """
+    groups: dict[int, list] = {}
+    for _uid, d in S.devices.items():
+        if d.get("type") != "ANCHOR" and not is_anchor_device(d):
+            continue
+        z = d.get("zone")
+        if z is None or z == ZONE_NONE:
+            continue
+        x, y = get_anchor_xy(d)
+        if x is None or y is None:
+            continue
+        groups.setdefault(int(z), []).append((float(x), float(y)))
+    return groups
+
+
+def convex_hull(pts):
+    """The convex hull of a point set (monotone chain)."""
+    pts = sorted(set(pts))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def draw_zone_hulls(c):
+    """Draw the zone hulls, under the devices."""
+    for zid, pts in zone_groups().items():
+        col = zone_color(zid)
+        hull = convex_hull(pts)
+        if len(hull) >= 3:
+            flat = []
+            for x, y in hull:
+                sx, sy = w2s(x, y)
+                flat.extend((sx, sy))
+            c.create_polygon(flat, fill="", outline=col, width=2, dash=(6, 4))
+        elif len(hull) == 2:
+            sx0, sy0 = w2s(*hull[0])
+            sx1, sy1 = w2s(*hull[1])
+            c.create_line(sx0, sy0, sx1, sy1, fill=col, width=2, dash=(6, 4))
+        if not pts:
+            continue
+        # The label at the centre of the group.
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        sx, sy = w2s(cx, cy)
+        t = c.create_text(sx, sy, text=f"区{zid}", fill=col,
+                          font=("Segoe UI", 11, "bold"))
+        c.lift(t)
+
+
 def draw_anchor(c, uid, d):
     x, y = get_anchor_xy(d)
     if x is None or y is None: return
@@ -4459,6 +5145,12 @@ def draw_anchor(c, uid, d):
         # and a muted colour.
         map_label = f"A{rank:02d}·未"
         label_color = "#8b9096"
+    # M5: the zone the anchor belongs to — the tag buckets on it, so it
+    # is the anchor's most important identity besides its rank.
+    azn = d.get("zone")
+    if azn is not None and azn != ZONE_NONE:
+        map_label += f"·z{azn}"
+        label_color = zone_color(azn)
 
     # Colors
     if net_st == "root":
@@ -4633,7 +5325,14 @@ def draw_tag(c, uid, d):
 
     # --- Label badge above pin ---
     if S.show_labels:
-        t = c.create_text(sx, hy-hr-14, text=get_label(uid), fill=C["text"],
+        # M5: the zone the fix was solved in belongs to the label — a
+        # position without its zone is meaningless.
+        tzone = d.get("zone")
+        tl = get_label(uid) + (f"·z{tzone}" if tzone is not None
+                               and tzone != ZONE_NONE else "")
+        t = c.create_text(sx, hy-hr-14, text=tl,
+                          fill=zone_color(tzone) if tzone not in (None, ZONE_NONE)
+                          else C["text"],
                           font=("Segoe UI", 11, "bold"), anchor="s")
         bbox = c.bbox(t)
         if bbox:
@@ -4646,11 +5345,14 @@ def draw_trail(c, d):
     trail = d.get("trail", [])
     if len(trail) < 2: return
     n = len(trail)
+    # M5: the trail is coloured by the zone the fix was solved in — the
+    # same (x,y) means different things in two zones, so a trail that
+    # crosses the zone border is a trail the operator must be able to
+    # read as "this part belongs to zone 1, that part to zone 2".
+    zc = zone_color(d.get("zone"))
     for i in range(1, n):
-        a = int(30 + 120 * i / n)  # alpha 30-150
         p0, p1 = w2s(trail[i-1][0], trail[i-1][1]), w2s(trail[i][0], trail[i][1])
-        color = f"#{a:02x}2040"  # approximate reddish
-        c.create_line(p0[0], p0[1], p1[0], p1[1], fill="#f4cdd1", width=2, capstyle="round")
+        c.create_line(p0[0], p0[1], p1[0], p1[1], fill=zc, width=2, capstyle="round")
 
 def draw_scale(c, w, h):
     mpp = S.grid_w / (S.scale * w)

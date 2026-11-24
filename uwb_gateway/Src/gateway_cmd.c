@@ -303,6 +303,18 @@ typedef struct
     uint8_t  pos_degraded;   /* the previous report was a degraded one   */
     uint32_t pos_rx;         /* the reports received                     */
     uint32_t pos_lost;       /* the reports that never arrived           */
+    /* M5: the zone this anchor belongs to and its slot in that zone —
+     * both come from the anchor's own beacon, so the gateway knows the
+     * zone layout without asking anybody. */
+    uint8_t  zone_id;
+    uint8_t  slot;
+    /* M5: the beacon rate of this anchor (beacons per second).  The
+     * gateway hears every beacon of every zone, so this is the only link
+     * health number available without an extra uplink — and it is the one
+     * that matters: an anchor whose beacons stop is an anchor the tag can
+     * no longer hear. */
+    uint16_t beacon_cnt;     /* beacons since the last report             */
+    uint8_t  beacon_rate;    /* the last reported rate (per second)       */
 } gw_dev_t;
 
 static gw_dev_t gw_devs[GW_MAX_DEVICES];
@@ -402,6 +414,49 @@ static int gw_ns_add_ack(uint16_t rank)
     if (gw_ns.ack_count < GW_MAX_DEVICES)
         gw_ns.ack_ranks[gw_ns.ack_count++] = rank;
     return 1;
+}
+
+/*============================================================================
+ * The link diagnostic — how many beacons each anchor sends per second
+ *
+ * The gateway hears EVERY beacon of EVERY zone.  That makes the beacon
+ * rate the one link-health number that needs no extra uplink: an anchor
+ * whose beacons stop is an anchor the tag can no longer hear, and the tag
+ * cannot tell that from a geometric problem.
+ *
+ * The line is +LINK,<uid>,<beacons per second> and is sent only when the
+ * rate CHANGES, so a healthy grid is silent on the UART.  An anchor that
+ * is on the grid sends 20 beacons per second (one per 50 ms round).
+ *==========================================================================*/
+#define GW_LINK_REPORT_MS 1000u
+static void gateway_link_poll(void)
+{
+    static uint32_t last_ms = 0;
+    uint32_t now = HAL_GetTick();
+    int i;
+
+    if (now - last_ms < GW_LINK_REPORT_MS) return;
+    last_ms = now;
+
+    for (i = 0; i < gw_dev_count; i++) {
+        gw_dev_t *d = &gw_devs[i];
+        uint8_t rate;
+        if (d->type != 'A') { d->beacon_cnt = 0; continue; }
+        rate = (uint8_t)(d->beacon_cnt > 255u ? 255u : d->beacon_cnt);
+        d->beacon_cnt = 0;
+        if (rate == d->beacon_rate) continue;
+        d->beacon_rate = rate;
+        {
+            char out[40]; int p = 0;
+            out[p++]='+'; out[p++]='L'; out[p++]='I'; out[p++]='N';
+            out[p++]='K'; out[p++]=',';
+            p += fmt_str(&out[p], d->uid);
+            out[p++]=',';
+            p += fmt_dec(&out[p], (int)rate);
+            out[p]='\0';
+            test_run_info((unsigned char *)out);
+        }
+    }
 }
 
 /* Send the broadcast frames of an armed NETSTART and, when the burst window
@@ -652,6 +707,10 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
         d->uid_fp_valid = 0;
         d->net_state = GW_NETSTATE_IDLE;
         d->last_type_ms = 0;
+        d->zone_id = DL_ZONE_ID_NONE;
+        d->slot = 255u;
+        d->beacon_cnt = 0;
+        d->beacon_rate = 0;
         /* Do NOT send +ONLINE yet — wait for 2nd sighting */
         return;
     }
@@ -693,6 +752,10 @@ void gateway_device_seen(const char *uid, const char *type, uint16_t rank)
             d->uid_fp_valid = 0;
             d->net_state = GW_NETSTATE_IDLE;
             d->last_type_ms = 0;
+            d->zone_id = DL_ZONE_ID_NONE;
+            d->slot = 255u;
+            d->beacon_cnt = 0;
+            d->beacon_rate = 0;
         }
         /* Like a fresh registration: no +ONLINE until the 2nd sighting. */
         return;
@@ -1469,6 +1532,40 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         if (len >= (uint16_t)(DL_TS_FLAGS_IDX + 1))
             gw_set_coord_state(src_addr,
                 (frame[DL_TS_FLAGS_IDX] & DL_TS_FLAG_COORD_VALID) ? 1 : 0);
+
+        /* M5: THE ZONE AND THE SLOT OF THIS ANCHOR.
+         *
+         * Both are in the anchor's own beacon, so the gateway learns the
+         * zone layout just by listening — no extra uplink, and no answer
+         * to interpret.  The host needs them to draw the zones and to tell
+         * the operator which anchor is where.
+         *
+         * The line is +ZONE,<uid>,<zone>,<slot> and is sent only when
+         * something CHANGES, so the UART stays quiet. */
+        {
+            gw_dev_t *d = gw_find_dev(uid);
+            uint8_t  bz = DL_ZONE_ID_NONE;
+            uint8_t  bs = 255u;
+            if (len >= (uint16_t)(DL_TS_ZONE_IDX + 1)) bz = frame[DL_TS_ZONE_IDX];
+            if (len >= (uint16_t)(DL_TS_SLOT_IDX + 1)) bs = frame[DL_TS_SLOT_IDX];
+            if (d) {
+                d->beacon_cnt++;
+                if (d->zone_id != bz || d->slot != bs) {
+                    char sout[40]; int sp = 0;
+                    d->zone_id = bz;
+                    d->slot    = bs;
+                    sout[sp++]='+'; sout[sp++]='Z'; sout[sp++]='O';
+                    sout[sp++]='N'; sout[sp++]='E'; sout[sp++]=',';
+                    sp += fmt_str(&sout[sp], uid);
+                    sout[sp++]=',';
+                    sp += fmt_dec(&sout[sp], (int)bz);
+                    sout[sp++]=',';
+                    sp += fmt_dec(&sout[sp], (int)bs);
+                    sout[sp]='\0';
+                    test_run_info((unsigned char *)sout);
+                }
+            }
+        }
 
         /* P1-5: derive the anchor's network state from the beacon it just
          * sent, and report it to the host.
@@ -3542,6 +3639,8 @@ int fusion_gateway(void)
          * handler -- one frame every 20 ms, and the radio and the UART are
          * served in between. */
         gateway_netstart_poll();
+        /* M5: the per-anchor link diagnostic (beacons per second). */
+        gateway_link_poll();
 
         /* Heartbeat: LED toggle every ~5s */
         if (++loop_ctr >= 5000) {

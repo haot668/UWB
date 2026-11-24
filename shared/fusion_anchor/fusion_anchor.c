@@ -1800,9 +1800,87 @@ static void anchor_handle_twr_corr(const uint8_t *rx_buf, uint32_t frame_len)
  *============================================================================*/
 static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_len)
 {
+    /* A NETWORK_START shorter than its header is malformed.  The roster,
+     * the zone id and the slot table are all read BY INDEX below, so a
+     * truncated frame would read past the end of the buffer. */
+    if (frame_len < (uint32_t)(DL_TS_NET_ZONE_IDX + 1u)) {
+        DBG_PRINT("NETSTART too short\r\n");
+        return;
+    }
+
     uint16_t designated_root = (uint16_t)rx_buf[DL_TS_NET_ROOT_IDX]
                             | ((uint16_t)rx_buf[DL_TS_NET_ROOT_IDX + 1] << 8);
     uint8_t flags = rx_buf[DL_TS_NET_FLAGS_IDX];
+
+    /* The zone this frame is about (M5).
+     *
+     * NETWORK_START is a BROADCAST, so EVERY anchor in the room receives
+     * EVERY zone's frame.  Without a zone check the second zone's frame
+     * would reset the first zone's anchors (the frame carries
+     * NET_FLAG_FORCE_RESET) and silence them — the anchors of zone A
+     * would end up in NET_IDLE because they are not in zone B's roster.
+     * One zone at a time was all the host could express, so this never
+     * showed; with a zone management UI it would break the other zone
+     * every single time. */
+    uint8_t frame_zone = (frame_len >= DL_TS_NET_ZONE_IDX + 1u)
+                        ? rx_buf[DL_TS_NET_ZONE_IDX]
+                        : (uint8_t)DL_ZONE_ID_NONE;
+
+    /* ── The roster of THIS frame (needed before the zone decision) ────────
+     * P1-1: participant roster.  Every anchor receives the SAME ordered list,
+     * so bit N of the Root's presence bitmap always means the same anchor. */
+    uint16_t roster[NET_MAX_PARTICIPANTS];
+    int roster_n = 0;
+    {
+        uint8_t n = rx_buf[DL_TS_NET_NPART_IDX];
+        int i;
+        if (n > NET_MAX_PARTICIPANTS) n = NET_MAX_PARTICIPANTS;
+        /* Only trust the roster entries that are actually present in the frame */
+        if ((uint32_t)(DL_TS_NET_ROSTER_IDX + (int)n * 2) > frame_len) {
+            n = (uint8_t)((frame_len > DL_TS_NET_ROSTER_IDX)
+                          ? (frame_len - DL_TS_NET_ROSTER_IDX) / 2u : 0u);
+        }
+        for (i = 0; i < (int)n; i++) {
+            int off = DL_TS_NET_ROSTER_IDX + i * 2;
+            roster[i] = (uint16_t)(rx_buf[off] | ((uint16_t)rx_buf[off + 1] << 8));
+        }
+        roster_n = n;
+    }
+    int in_roster = 0;
+    {
+        int i;
+        for (i = 0; i < roster_n; i++)
+            if (roster[i] == g_anchor.rank) { in_roster = 1; break; }
+    }
+    /* The membership of THIS frame — set before the dedup shortcut below,
+     * because the caller decides whether to answer the ACK from it. */
+    s_roster_member = (uint8_t)in_roster;
+
+    /* ── Does this frame concern me? (M5) ──────────────────────────────────
+     * Three cases:
+     *
+     * 1. The frame has NO zone (an old gateway, or the single-network
+     *    flow): it is a GLOBAL command and applies to everybody.  This is
+     *    the legacy behaviour and it is how the operator dissolves the
+     *    zones again.
+     * 2. The frame names MY zone: it applies to me — including when the
+     *    roster no longer contains me (the operator shrank the zone, so I
+     *    have to leave it).
+     * 3. The frame names ANOTHER zone: it does not apply to me.  I keep
+     *    my grid, my slot and my state; I do NOT answer the ACK, because
+     *    answering would tell the gateway "I am in that roster".
+     *
+     * An anchor that has no zone yet adopts the zone of the first frame
+     * it is a MEMBER of — that is how an anchor joins a zone at all. */
+    if (frame_zone != (uint8_t)DL_ZONE_ID_NONE &&
+        frame_zone != g_anchor.zone_id &&
+        !(g_anchor.zone_id == (uint8_t)DL_ZONE_ID_NONE && in_roster)) {
+        /* Another zone's frame: ignore it COMPLETELY. */
+        s_roster_member = 0;
+        { char dbg[64]; sprintf(dbg, "NETSTART z=%u ignored (I am z=%u)\r\n",
+            (unsigned)frame_zone, (unsigned)g_anchor.zone_id); DBG_PRINT(dbg); }
+        return;
+    }
 
     /* ── The zone's clock reference (M3) ───────────────────────────────────
      * The reference is DESIGNATED, not elected.  The gateway hands it down
@@ -1830,6 +1908,7 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
     {
         uint32_t now_ms = HAL_GetTick();
         if (s_net_state != NET_IDLE && s_zone_ref_rank == zone_ref &&
+            g_anchor.zone_id == frame_zone &&
             (int32_t)(now_ms - s_last_start_ms) < NET_START_DEDUP_MS) {
             s_last_start_ms = now_ms;
             return;
@@ -1853,36 +1932,14 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
     }
 
     /* P1-1: participant roster.  Every anchor receives the SAME ordered list,
-     * so bit N of the Root's presence bitmap always means the same anchor. */
+     * so bit N of the Root's presence bitmap always means the same anchor.
+     * (Parsed at the top of this function — the zone decision needs it.) */
     s_roster_n = 0;
     {
-        uint8_t n = rx_buf[DL_TS_NET_NPART_IDX];
         int i;
-        if (n > NET_MAX_PARTICIPANTS) n = NET_MAX_PARTICIPANTS;
-        /* Only trust the roster entries that are actually present in the frame */
-        if ((uint32_t)(DL_TS_NET_ROSTER_IDX + (int)n * 2) > frame_len) {
-            n = (uint8_t)((frame_len > DL_TS_NET_ROSTER_IDX)
-                          ? (frame_len - DL_TS_NET_ROSTER_IDX) / 2u : 0u);
-        }
-        for (i = 0; i < (int)n; i++) {
-            int off = DL_TS_NET_ROSTER_IDX + i * 2;
-            s_roster[i] = (uint16_t)(rx_buf[off] | ((uint16_t)rx_buf[off + 1] << 8));
-        }
-        s_roster_n = n;
-    }
-
-    /* Am I one of the participants the operator picked?
-     *
-     * NETWORK_START is a BROADCAST, so every anchor in the room gets it —
-     * including the ones the operator did NOT tick in the host dialog.  The
-     * roster is the operator's selection, and it is the ONLY thing that
-     * defines the network's membership. */
-    s_roster_member = 0;
-    {
-        int i;
-        for (i = 0; i < (int)s_roster_n; i++) {
-            if (s_roster[i] == g_anchor.rank) { s_roster_member = 1; break; }
-        }
+        for (i = 0; i < roster_n && i < (int)NET_MAX_PARTICIPANTS; i++)
+            s_roster[i] = roster[i];
+        s_roster_n = (uint8_t)roster_n;
     }
 
     s_zone_ref_rank = zone_ref;
