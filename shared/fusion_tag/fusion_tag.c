@@ -233,18 +233,73 @@ static uint32_t s_n_cycle_mismatch = 0;   /* beacons dropped: wrong cycle id  */
  *
  * P1-4: how many rate samples the median is taken over.
  *
- * The rate is measured on its own channel, straight from the interval
- * between two successive reference beacons:
+ * M7: the rate is measured on its own channel, straight from the GRID:
  *
- *     rate = (rx_local[n] - rx_local[n-1]) / (tx_remote[n] - tx_remote[n-1])
+ *     rate = (our clock)/(reference's clock)
+ *          = d_rx / (d_rounds * TAG_ZONE_PERIOD_DTU)
  *
- * Both intervals are exact (the two frames' own TX and RX instants), so a
- * single cycle already yields the ratio; the median over the last few
- * cycles removes the jitter of a single frame.  This channel is updated on
- * EVERY reference frame -- accepted or rejected by the clock filter --
- * because a frozen rate is exactly what the slot compensation must not
- * use. */
+ * The zone reference schedules its beacons on a grid of exactly
+ * DL_TIMESYNC_PERIOD_UUS (the reference branch of tdma_grid_target() in
+ * fusion_anchor.c uses the NOMINAL period, with no rate factor), and every
+ * beacon carries the round number it belongs to (DL_TS_CYCLE_IDX).  So
+ * between two reference beacons the zone axis advanced by exactly
+ *
+ *     d_rounds * TAG_ZONE_PERIOD_DTU
+ *
+ * -- no clock offset, no rate factor, nothing quantised.  Only the
+ * NUMERATOR needs care:
+ *
+ *     d_rx = (rx_local - tx_err)[n] - (rx_local - tx_err)[n-1]
+ *
+ * The beacon does not leave the antenna at the grid instant: the DX_TIME
+ * register can only express multiples of 256 DTU, so the frame leaves up to
+ * 255 DTU (1.2 m of path) EARLY, and the anchor publishes that departure
+ * error per frame in tx_err.  Subtracting it puts the arrival instant back
+ * ON the grid, exactly.  Without that correction the truncation enters the
+ * rate linearly -- up to 80 ppm of a single round, which at slot 7 is
+ * 3.5 us of TDOA, i.e. a kilometre of path difference.
+ *
+ * (The ADVERTISED TX STAMP would have been immune to that particular
+ * error: its truncation is common-mode with the RX instant of the very
+ * same frame, so it cancels in the ratio.  But the stamp is exactly what
+ * this channel is meant NOT to depend on -- it is quantised, and a single
+ * corrupted stamp poisons the rate for a whole window.)
+ *
+ * The estimate is taken against the OLDEST entry of a sliding window of
+ * TAG_RATE_WINDOW reference beacons (16 x 50 ms = 0.8 s): the RX timestamp
+ * jitter of ONE sample (~1 ns) divided by a single 50 ms round would still
+ * be 20 ppm -- 875 ns of TDOA at slot 7 -- while over 0.8 s it is 1.25
+ * ppm.  The median over the last few estimates removes the outliers.
+ * This channel is updated on EVERY reference frame -- accepted or rejected
+ * by the clock filter -- because a frozen rate is exactly what the slot
+ * compensation must not use. */
 #define TAG_RATE_SAMPLES 5
+
+/* M7: the zone grid's period in the REFERENCE's clock.  The reference
+ * anchor schedules its beacons on a grid of exactly this period (the
+ * reference branch of tdma_grid_target() uses the nominal period, without
+ * any rate factor), so a difference of d_rounds grid rounds is exactly
+ * d_rounds * this many DTU on the zone axis -- no truncation, no clock
+ * offset, no rate factor. */
+#define TAG_ZONE_PERIOD_DTU  ((uint64_t)DL_TIMESYNC_PERIOD_UUS * UUS_TO_DWT_TIME)
+
+/* M7: how many reference beacons the rate baseline spans (16 x 50 ms =
+ * 0.8 s).  Same order as the clock filter's own rate window
+ * (CS_RATE_WINDOW_SAMPLES), so the two estimates have the same noise. */
+#define TAG_RATE_WINDOW 16u
+
+/* M7: the smallest round span an estimate may cover.  One sample's RX
+ * timestamp jitter (~1 ns) over 8 rounds (0.4 s) is 2.5 ppm; over a
+ * single round it would be 20 ppm -- 875 ns of TDOA at slot 7.  Until the
+ * baseline is this long the clock filter's factor is used instead (it
+ * needs 8 updates as well). */
+#define TAG_RATE_MIN_ROUNDS 8u
+
+/* M7: the largest round span one estimate may cover.  A gap this large
+ * means the reference restarted (its round counter went back to zero) or
+ * the tag lost it for minutes -- the window then belongs to a grid that no
+ * longer exists and is dropped. */
+#define TAG_RATE_MAX_ROUNDS 1024u
 
 typedef struct {
     uint8_t  zone_id;
@@ -259,9 +314,14 @@ typedef struct {
     double   rate_buf[TAG_RATE_SAMPLES];
     uint8_t  rate_n;             /* valid entries in the ring              */
     uint8_t  rate_idx;           /* next slot to write                     */
-    uint64_t rate_rx_prev;
-    uint64_t rate_tx_prev;
-    uint8_t  rate_have_prev;
+    /* M7: the sliding window of the reference's grid-corrected arrival
+     * instants (rx_local - tx_err) and the grid round each belongs to.
+     * The rate is measured against the OLDEST entry, so the baseline is
+     * as long as the window allows. */
+    uint64_t rate_win_inst[TAG_RATE_WINDOW];
+    uint16_t rate_win_cyc[TAG_RATE_WINDOW];
+    uint8_t  rate_win_head;
+    uint8_t  rate_win_n;
     uint32_t last_rx_ms;         /* last frame of ANY anchor of the zone  */
     uint8_t  seen;
 } TagZoneBucket;
@@ -1748,6 +1808,18 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
             z->seen = 1;
         }
         if (z && is_ref) {
+            /* M7: a different reference anchor means a different grid, a
+             * different round counter and a different clock -- the rate
+             * history belongs to the OLD reference and must not be carried
+             * over (the first sample after the switch would otherwise
+             * divide an interval of the wrong grid). */
+            if (z->ref_seen && z->ref_rank != src_rank) {
+                z->rate_win_n = 0;
+                z->rate_win_head = 0;
+                z->rate_n = 0;
+                z->rate_idx = 0;
+                z->rate_valid = 0;
+            }
             z->ref_rank = src_rank;
             z->ref_seen = 1;
             z->ref_rx_ms = HAL_GetTick();
@@ -1757,24 +1829,91 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
             s_ref_seen = 1;
 
             /* P1-4: the zone's clock ratio on its own channel.  Updated on
-             * every reference frame, outlier or not. */
+             * every reference frame, outlier or not.
+             *
+             * M7: the rate comes from the GRID, not from the advertised TX
+             * stamp.  The zone reference schedules its beacons on a grid of
+             * exactly DL_TIMESYNC_PERIOD_UUS (the reference branch of
+             * tdma_grid_target() uses the nominal period, with no rate
+             * factor), and every beacon carries the round number it
+             * belongs to.  So the zone axis advanced by exactly
+             *
+             *     d_rounds * TAG_ZONE_PERIOD_DTU
+             *
+             * between two reference beacons, and
+             *
+             *     rate = (our clock)/(reference's clock)
+             *          = d_rx / (d_rounds * TAG_ZONE_PERIOD_DTU)
+             *
+             * The NUMERATOR is the grid-corrected arrival instant
+             * (rx_local - tx_err): the beacon leaves the antenna up to
+             * 255 DTU early (the DX_TIME register cannot express the
+             * remainder of the grid instant) and the anchor publishes that
+             * departure error per frame, so subtracting it puts the
+             * arrival instant back ON the grid exactly.  Without the
+             * correction the truncation enters the rate linearly -- up to
+             * 80 ppm of a single round, i.e. 3.5 us of TDOA at slot 7.
+             *
+             * The baseline is the OLDEST entry of the sliding window (see
+             * TAG_RATE_WINDOW): the RX timestamp jitter of one sample
+             * (~1 ns) over a single 50 ms round would still be 20 ppm,
+             * over 0.8 s it is 1.25 ppm. */
             {
-                uint64_t d_rx = rx_local - z->rate_rx_prev;
-                uint64_t d_tx = (tx_remote - z->rate_tx_prev) & 0xFFFFFFFFFFULL;
-                if (z->rate_have_prev && d_tx > 0u && d_rx > 0u
-                    && d_tx < (1ULL << 30) && d_rx < (1ULL << 30)) {
-                    double r = (double)d_rx / (double)d_tx;
-                    /* A round is 50 ms; anything outside 1 % is not a clock
-                     * ratio but a lost or duplicated frame. */
-                    if (r > 0.99 && r < 1.01) {
-                        z->rate_buf[z->rate_idx] = r;
-                        z->rate_idx = (uint8_t)((z->rate_idx + 1u) % TAG_RATE_SAMPLES);
-                        if (z->rate_n < TAG_RATE_SAMPLES) z->rate_n++;
+                uint16_t cyc = s_trackers[tracker_slot].cycle_id;
+                /* The grid-corrected arrival instant of THIS beacon. */
+                int64_t  inst = (int64_t)rx_local - (int64_t)ts_tx_err;
+                /* The newest entry of the window. */
+                uint8_t  last = (uint8_t)((z->rate_win_head + TAG_RATE_WINDOW - 1u)
+                                          % TAG_RATE_WINDOW);
+                /* The same round again -> a duplicated frame, not a new
+                 * sample: it would not advance the baseline. */
+                bool     dup  = (z->rate_win_n > 0u
+                                  && (uint16_t)(cyc - z->rate_win_cyc[last]) == 0u);
+
+                if (ts_tx_err_valid && !dup) {
+                    if (z->rate_win_n > 0u) {
+                        uint8_t  oldest = (uint8_t)((z->rate_win_head + TAG_RATE_WINDOW
+                                                    - z->rate_win_n) % TAG_RATE_WINDOW);
+                        uint16_t dcyc = (uint16_t)(cyc - z->rate_win_cyc[oldest]);
+                        if (dcyc >= TAG_RATE_MIN_ROUNDS
+                            && dcyc <= TAG_RATE_MAX_ROUNDS) {
+                            uint64_t span = (uint64_t)dcyc * TAG_ZONE_PERIOD_DTU;
+                            int64_t  d_rx = inst - (int64_t)z->rate_win_inst[oldest];
+                            if (d_rx > 0 && (uint64_t)d_rx < (1ULL << 40)) {
+                                double r = (double)d_rx / (double)span;
+                                /* A clock ratio is within a few hundred ppm
+                                 * of 1; anything outside 1 % is not a clock
+                                 * ratio but a lost or corrupted frame. */
+                                if (r > 0.99 && r < 1.01) {
+                                    z->rate_buf[z->rate_idx] = r;
+                                    z->rate_idx = (uint8_t)((z->rate_idx + 1u)
+                                                           % TAG_RATE_SAMPLES);
+                                    if (z->rate_n < TAG_RATE_SAMPLES) z->rate_n++;
+                                } else {
+                                    /* The baseline is broken (a corrupted
+                                     * RX timestamp in it).  Drop the oldest
+                                     * entry -- the next frame measures
+                                     * against the next-oldest one, so a
+                                     * single bad sample costs one frame
+                                     * instead of poisoning the whole
+                                     * window. */
+                                    z->rate_win_n--;
+                                }
+                            }
+                        } else if (dcyc > TAG_RATE_MAX_ROUNDS) {
+                            /* The round counter jumped: the reference
+                             * restarted and the window belongs to a grid
+                             * that no longer exists. */
+                            z->rate_win_n = 0;
+                        }
                     }
+                    /* The current sample joins the window. */
+                    z->rate_win_inst[z->rate_win_head] = (uint64_t)inst;
+                    z->rate_win_cyc[z->rate_win_head] = cyc;
+                    z->rate_win_head = (uint8_t)((z->rate_win_head + 1u)
+                                                % TAG_RATE_WINDOW);
+                    if (z->rate_win_n < TAG_RATE_WINDOW) z->rate_win_n++;
                 }
-                z->rate_rx_prev = rx_local;
-                z->rate_tx_prev = tx_remote;
-                z->rate_have_prev = 1;
             }
             if (z->rate_n >= 3u) {
                 /* Median of the last cycles (insertion sort, n <= 5). */
