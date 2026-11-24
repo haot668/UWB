@@ -7,7 +7,7 @@
 
   <Targets>
     <Target>
-      <TargetName>DWS3000_Anchor_Master</TargetName>
+      <TargetName>DWS3000_Anchor</TargetName>
       <ToolsetNumber>0x4</ToolsetNumber>
       <ToolsetName>ARM-ADS</ToolsetName>
       <pCCUsed>5050106::V5.05 update 1 (build 106)::ARMCC</pCCUsed>
@@ -37,7 +37,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
+          <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath></RegisterFilePath>
           <DBRegisterFilePath></DBRegisterFilePath>
@@ -49,7 +49,7 @@
             <InvalidFlash>1</InvalidFlash>
           </TargetStatus>
           <OutputDirectory>.\Output\</OutputDirectory>
-          <OutputName>anchor_master</OutputName>
+          <OutputName>DWS3000_Anchor</OutputName>
           <CreateExecutable>1</CreateExecutable>
           <CreateLib>0</CreateLib>
           <CreateHexFile>1</CreateHexFile>
@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER, STM32L412xx, TEST_FUSION_ANCHOR</Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src;..\shared\gw_ota</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src;..\shared\gw_ota</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -358,7 +358,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\MAC_802_15_4;..\shared\MAC_802_15_8;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
+              <IncludePath>..\shared\Inc;..\shared\Drivers\CMSIS\Include;..\shared\Drivers\CMSIS\Device\ST\STM32L4xx\Include;..\shared\Drivers\STM32L4xx_HAL_Driver\Inc;..\shared\decadriver;..\shared\platform;..\shared\shared_data;..\shared\examples_info;..\shared\config;..\shared\fusion_anchor;..\shared\fusion_tag;..\shared\system;..\shared\downlink;.\Src</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -464,16 +464,6 @@
         <Group>
           <GroupName>MAC</GroupName>
           <Files>
-            <File>
-              <FileName>mac_802_15_4.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\shared\MAC_802_15_4\mac_802_15_4.c</FilePath>
-            </File>
-            <File>
-              <FileName>mac_802_15_8.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\shared\MAC_802_15_8\mac_802_15_8.c</FilePath>
-            </File>
           </Files>
         </Group>
         <Group>

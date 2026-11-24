@@ -2,9 +2,8 @@
 param([switch]$DryRun)
 
 $projects = @(
-    @{Path="D:\Work\UWB_project\UWB_V0.0.1\uwb_anchor\DWS3000_Anchor_Master.uvprojx"; Name="Master"},
-    @{Path="D:\Work\UWB_project\UWB_V0.0.1\uwb_anchor\DWS3000_Anchor_Slave.uvprojx";  Name="Slave"},
-    @{Path="D:\Work\UWB_project\UWB_V0.0.1\uwb_tag\DWS3000_Tag.uvprojx";              Name="Tag"}
+    @{Path="D:\Work\UWB_project\UWB_V0.0.1\uwb_anchor\DWS3000_Anchor.uvprojx"; Name="Anchor"},
+    @{Path="D:\Work\UWB_project\UWB_V0.0.1\uwb_tag\DWS3000_Tag.uvprojx";       Name="Tag"}
 )
 
 $newFileXml = @"

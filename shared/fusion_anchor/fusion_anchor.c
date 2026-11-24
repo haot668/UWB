@@ -38,7 +38,6 @@
 #include <shared_defines.h>
 #include <shared_functions.h>
 #include <example_selection.h>
-#include "auto_anchor.h"
 #include "gateway_protocol.h"
 #include "firmware_version.h"
 #include "../gw_ota/gw_ota.h"
@@ -174,9 +173,6 @@ typedef enum {
  *============================================================================*/
 typedef struct {
     uint16_t           rank;             /* Anchor rank (0..15) — same as SRC addr */
-    uint8_t            cs_level;         /* 0 = zone reference, 1 = member (M3:
-                                         * no longer a hierarchy level — it is
-                                         * only "am I the zone's clock origin") */
     uint64_t           my_eui64;         /* This anchor's EUI64 */
     dl_anchor_entry_t  my_pos;           /* My position, broadcast in TimeSync */
     uint64_t           prev_tx_ts;       /* Last actual TX timestamp (40-bit, latched) */
@@ -318,31 +314,31 @@ static uint8_t  s_neighbor_zone[ANCHOR_MAX_NEIGHBORS];
 /*============================================================================
  * DS-TWR state
  *
- * The child's beacon is placed on the Root's grid by mapping the Root's TX
- * instant into the child's clock with the sync model
+ * The child's beacon is placed on the zone reference's grid by mapping the
+ * reference's TX instant into the child's clock with the sync model
  *     local = factor * root + offset_dtu.
- * The offset estimate absorbs the Root→Child propagation delay (a one-way
- * observation cannot separate clock offset from path length), so the child's
- * beacon lands one propagation delay LATE on the grid.  That delay is a
- * constant per-anchor bias in the Tag's slot-compensated TDOA — 30 ns
+ * The offset estimate absorbs the reference→child propagation delay (a
+ * one-way observation cannot separate clock offset from path length), so the
+ * child's beacon lands one propagation delay LATE on the grid.  That delay is
+ * a constant per-anchor bias in the Tag's slot-compensated TDOA — 30 ns
  * (≈ 1 m) at 10 m — which no amount of clock filtering can remove.
  *
  * The round trip removes it:
- *   forward leg  Root TX at T1 → child RX at r1
- *   reverse leg  child TX at T2 → Root RX at r2
+ *   forward leg  reference TX at T1 → child RX at r1
+ *   reverse leg  child TX at T2 → reference RX at r2
  *     (r2 - T1) = prop_R->X + factor_root * (T2 - r1) + prop_X->R
- * The Root solves 2*prop and unicasts the correction (FUNC_TWR_CORR); the
- * child shifts its slot instant back onto the grid.
+ * The reference solves 2*prop and unicasts the correction (FUNC_TWR_CORR);
+ * the child shifts its slot instant back onto the grid.
  *==========================================================================*/
 
-/* The instant WE received the Root frame we used as clock reference, and the
- * cycle id that frame carried.  Reported in every beacon so the Root can
- * close the round trip. */
+/* The instant WE received the reference frame we used as clock reference,
+ * and the cycle id that frame carried.  Reported in every beacon so the
+ * reference can close the round trip. */
 static uint64_t s_ref_rx_ts   = 0;    /* our clock */
 static uint16_t s_ref_cycle   = 0;
 
-/* Correction (DTU) received from the Root: how much our beacon is late on
- * the grid.  Subtracted from our slot instant. */
+/* Correction (DTU) received from the zone reference: how much our beacon is
+ * late on the grid.  Subtracted from our slot instant. */
 static uint32_t s_twr_corr_dtu    = 0;
 static uint8_t  s_twr_corr_valid  = 0;
 /* Freshness of that correction (P1-3): the Root cycle id in effect when the
@@ -1211,15 +1207,16 @@ static void anchor_tx_timesync(uint64_t scheduled_tx, uint16_t cycle_id)
          * publish — and the receiver must not pair it into the TDOA. */
         pkt[DL_TS_FLAGS_IDX] |= DL_TS_FLAG_TX_OFFGRID;
     }
-    /* P0-1: cs_level and slot are two DIFFERENT bytes now.  They used to
-     * share byte 18, so writing the slot destroyed the level and every
-     * receiver saw a corrupted hierarchy.
+    /* P0-1: the role byte and the slot are two DIFFERENT bytes now.  They
+     * used to share byte 18, so writing the slot destroyed the role and
+     * every receiver saw a corrupted field.
      *
-     * M3: cs_level no longer describes a hierarchy level — there is no
+     * M3: the role byte no longer describes a hierarchy level — there is no
      * hierarchy any more.  It is the ZONE ROLE: 0 = the zone's reference
      * (the anchor whose clock defines the zone's axis), 1 = a member.
-     * The Tag still reads this byte to find the reference of the zone it
-     * is in (M4 replaces that by a per-zone bucket). */
+     * The Tag reads this byte to find the reference of the zone it is in
+     * (M4 buckets the anchors per zone and pairs each zone's members with
+     * that zone's reference). */
     pkt[DL_TS_LEVEL_IDX] = am_zone_ref() ? 0 : 1;
 
     /* The slot the TAG compensates this beacon with.
@@ -2054,7 +2051,6 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
          * It also does NOT answer the NETWORK_ACK: the gateway counts the
          * answers to report "who is still missing", and an anchor that was
          * never asked for must not appear there. */
-        g_anchor.cs_level = 1;
         anchor_clear_slot("NOT_IN_ROSTER");
         s_net_slot_idx = 255;
         s_net_state = NET_IDLE;      /* silent on the grid */
@@ -2072,7 +2068,6 @@ static void anchor_handle_network_start(const uint8_t *rx_buf, uint32_t frame_le
      *   • the members place their slot instants on the reference's axis.
      * There is no hierarchy, no parent, and no admission handshake: the
      * slot table came with this very command. */
-    g_anchor.cs_level = am_zone_ref() ? 0 : 1;
     g_anchor.zone_role = am_zone_ref() ? DL_ZONE_ROLE_REF : DL_ZONE_ROLE_MEMBER;
     s_net_state = NET_RUNNING;
     s_net_start_ms = HAL_GetTick();
@@ -2290,7 +2285,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
      * it buckets together really do share ONE axis.  Two anchors of
      * different zones carry different stamps — which is exactly the
      * cross-zone mixing the zone split exists to prevent. */
-    uint8_t sender_level = rx_buf[DL_TS_CS_LEVEL_IDX];
+    uint8_t sender_level = rx_buf[DL_TS_LEVEL_IDX];
     bool sender_is_ref = (src_rank == s_zone_ref_rank);
 
     /* The sender's own role byte has to agree with the designation: 0 means
@@ -2338,7 +2333,7 @@ static void anchor_rx_timesync(uint8_t *rx_buf, uint32_t frame_len)
         g_anchor.last_schedule_rx_ms = HAL_GetTick();
     }
 
-    /* TDMA reference update: if this is a Root (cs_level=0) beacon,
+    /* TDMA reference update: if this is the zone reference (role=0) beacon,
      * capture its TX timestamp so child anchors can schedule delayed TX.
      *
      * P0-3: the Root's timestamp lives in the ROOT's clock domain, ours lives
@@ -3150,7 +3145,7 @@ static void anchor_loop(void)
                     case FUNC_NETWORK_START:   /* GW → anchors: manual net formation */
                         handled = match_header(rx_buf, match_network_start, 10, 1, 0, 1);
                         break;
-                    case FUNC_TWR_CORR:        /* Root → child: path correction */
+                    case FUNC_TWR_CORR:        /* ref → child: path correction */
                         handled = match_header(rx_buf, match_twr_corr, 10, 1, 1, 1);
                         break;
                     case FUNC_FIND_REQ:
@@ -3221,7 +3216,7 @@ static void anchor_loop(void)
         if (++s_sync_ctr >= 20) {
             s_sync_ctr = 0;
 
-            /* Anchor state diagnostic: run_state, cs_level, my_slot, num_neighbors */
+            /* Anchor state diagnostic: run_state, role, my_slot, num_neighbors */
             { char dbg[64];
               int n_neigh = 0;
               int ni;
@@ -3333,8 +3328,6 @@ static int anchor_init(void)
 {
     uint32_t uid32 = compute_uid32();
     g_anchor.rank = compute_rank_from_uid();  /* CRC16 over the full 96-bit UID */
-    g_anchor.cs_level = 1;                  /* M3: a member until the gateway says
-                                             * otherwise (0 = the zone reference) */
     g_anchor.my_eui64 = (uint64_t)uid32;
     g_anchor.seq = 0;
     g_anchor.tx_count = 0;

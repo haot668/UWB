@@ -11,14 +11,10 @@ extern "C" {
 
 #define TEST_FUSION_ANCHOR
 
-/* Dynamic role: auto-discovery assigns rank at runtime.
- * Master = 0, slaves = 1..N.  All slaves share the same firmware binary.
- * Define FUSION_ANCHOR_RANK=0 to force Master (only Master project). */
-#define AUTO_ANCHOR_ENABLE
-
-#ifndef FUSION_ANCHOR_RANK
-#define FUSION_ANCHOR_RANK 255  /* 255 = unassigned, auto-discovery determines rank */
-#endif
+/* M6: the auto-discovery / election role macros (AUTO_ANCHOR_ENABLE,
+ * FUSION_ANCHOR_RANK) were removed -- the zone reference is designated by
+ * the gateway, not by an election at boot.  Nothing in the live firmware
+ * referenced them any more. */
 
 /*============================================================================
  * FUSION_DOWNLINK_MODE — anchors TX downlink beacon (master) / blink (slave)

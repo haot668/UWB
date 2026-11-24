@@ -25,8 +25,6 @@ NEW_INCLUDE = (
     "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Inc;"
     "..\\shared\\decadriver;"
     "..\\shared\\platform;"
-    "..\\shared\\MAC_802_15_4;"
-    "..\\shared\\MAC_802_15_8;"
     "..\\shared\\shared_data;"
     "..\\shared\\examples_info;"
     "..\\shared\\config;"
@@ -69,8 +67,6 @@ projects = {
             "deca_mutex.c":                  "..\\shared\\platform\\deca_mutex.c",
             "deca_sleep.c":                  "..\\shared\\platform\\deca_sleep.c",
             "deca_device.c":                 "..\\shared\\decadriver\\deca_device.c",
-            "mac_802_15_4.c":                "..\\shared\\MAC_802_15_4\\mac_802_15_4.c",
-            "mac_802_15_8.c":                "..\\shared\\MAC_802_15_8\\mac_802_15_8.c",
             "example_info.c":                "..\\shared\\examples_info\\example_info.c",
             "shared_functions.c":            "..\\shared\\shared_data\\shared_functions.c",
             "fusion_anchor.c":               "..\\shared\\fusion_anchor\\fusion_anchor.c",
@@ -92,7 +88,7 @@ projects = {
             "stm32l4xx_hal_tim_ex.c":        "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal_tim_ex.c",
             "stm32l4xx_hal_uart.c":          "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal_uart.c",
         },
-        "remove_files": ["gateway_cmd.c"],
+        "remove_files": ["gateway_cmd.c", "mac_802_15_4.c", "mac_802_15_8.c"],
     },
     "uwb_tag": {
         "target_name": "DWS3000_Tag",
@@ -110,8 +106,6 @@ projects = {
             "deca_mutex.c":                  "..\\shared\\platform\\deca_mutex.c",
             "deca_sleep.c":                  "..\\shared\\platform\\deca_sleep.c",
             "deca_device.c":                 "..\\shared\\decadriver\\deca_device.c",
-            "mac_802_15_4.c":                "..\\shared\\MAC_802_15_4\\mac_802_15_4.c",
-            "mac_802_15_8.c":                "..\\shared\\MAC_802_15_8\\mac_802_15_8.c",
             "example_info.c":                "..\\shared\\examples_info\\example_info.c",
             "shared_functions.c":            "..\\shared\\shared_data\\shared_functions.c",
             "clock_sync.c":                  "..\\shared\\shared_data\\clock_sync.c",
@@ -134,7 +128,7 @@ projects = {
             "stm32l4xx_hal_tim_ex.c":        "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal_tim_ex.c",
             "stm32l4xx_hal_uart.c":          "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal_uart.c",
         },
-        "remove_files": ["fusion_anchor.c", "gateway_cmd.c"],
+        "remove_files": ["fusion_anchor.c", "gateway_cmd.c", "mac_802_15_4.c", "mac_802_15_8.c"],
         # Tag needs fusion_tag.c added as a new file in the Examples group
         "add_files_to_group": {
             "Examples": [
@@ -163,8 +157,6 @@ projects = {
             "deca_mutex.c":                  "..\\shared\\platform\\deca_mutex.c",
             "deca_sleep.c":                  "..\\shared\\platform\\deca_sleep.c",
             "deca_device.c":                 "..\\shared\\decadriver\\deca_device.c",
-            "mac_802_15_4.c":                "..\\shared\\MAC_802_15_4\\mac_802_15_4.c",
-            "mac_802_15_8.c":                "..\\shared\\MAC_802_15_8\\mac_802_15_8.c",
             "example_info.c":                "..\\shared\\examples_info\\example_info.c",
             "shared_functions.c":            "..\\shared\\shared_data\\shared_functions.c",
             "fusion_anchor.c":               "..\\shared\\fusion_anchor\\fusion_anchor.c",
@@ -186,7 +178,7 @@ projects = {
             "stm32l4xx_hal_tim_ex.c":        "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal_tim_ex.c",
             "stm32l4xx_hal_uart.c":          "..\\shared\\Drivers\\STM32L4xx_HAL_Driver\\Src\\stm32l4xx_hal_uart.c",
         },
-        "remove_files": [],
+        "remove_files": ["mac_802_15_4.c", "mac_802_15_8.c"],
     },
 }
 

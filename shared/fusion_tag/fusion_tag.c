@@ -223,7 +223,7 @@ static uint32_t s_n_cycle_mismatch = 0;   /* beacons dropped: wrong cycle id  */
  * buckets the anchors by their zone and solves each bucket on its own.
  *
  * Each bucket carries the state of ONE zone's clock reference (the anchor
- * with cs_level = 0, which owns slot 0 of that zone's grid):
+ * with zone role = 0, which owns slot 0 of that zone's grid):
  *
  *   ref_rank    which anchor is the reference of this zone
  *   rate        (our clock)/(reference's clock) -- the slot compensation
@@ -1724,12 +1724,13 @@ static void tag_rx_timesync(uint8_t *rx_buf, uint32_t frame_len, uint64_t rx_hw_
         s_trackers[tracker_slot].quality *= 0.5f;
     }
 
-    /* The Root (cs_level = 0) owns the grid the other anchors are placed on,
-     * so its clock is the reference for the slot spacing.  Our clock_sync
-     * factor towards the Root is the rate ratio (our clock)/(Root's clock)
-     * that the slot compensation needs (see the TDOA block). */
+    /* The zone reference (zone role = 0) owns the grid the other anchors
+     * are placed on, so its clock is the reference for the slot spacing.
+     * Our clock_sync factor towards the reference is the rate ratio
+     * (our clock)/(reference's clock) that the slot compensation needs
+     * (see the TDOA block). */
     /* ── M4: the zone's clock reference and its clock ratio ───────────────
-     * cs_level = 0 marks the REFERENCE of the sender's zone (M3 renamed
+     * zone role = 0 marks the REFERENCE of the sender's zone (M3 renamed
      * the byte: it is the zone role, not a level in a tree).  The
      * reference owns slot 0 of the zone's grid, so its beacon defines the
      * round origin and the slot spacing of that zone.
@@ -2398,8 +2399,9 @@ int fusion_tag(void)
                      * out right AFTER a received beacon -- that interval
                      * is the gap between two anchor slots, so it is safe.
                      *
-                     * The old code required s_root_seen: a tag that never
-                     * heard the Root at all stayed COMPLETELY silent, and
+                     * The old code required a "seen the reference" flag: a
+                     * tag that never heard the reference at all stayed
+                     * COMPLETELY silent, and
                      * on the bench that is indistinguishable from a dead
                      * tag.  Now the degraded report goes out whenever the
                      * reference has been silent for too long -- including

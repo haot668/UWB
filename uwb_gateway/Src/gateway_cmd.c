@@ -1411,10 +1411,12 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
          * including the tag's position reports.  It is now part of the
          * ordinary receive path, so nothing is lost any more.
          *
-         * Parse: [10-11]=root_rank, [12]=cs_level, [13]=slot_idx,
-         *         [14]=n_neighbors, [15]=zone_id, [16-17]=ref_rank */
+         * Parse: [10-11]=root_rank, [13]=slot_idx, [14]=n_neighbors,
+         *         [15]=zone_id, [16-17]=ref_rank.
+         * Byte 12 (the old hierarchy level) is NOT read any more: the
+         * hierarchy is gone (M3), and the zone role the ACK now carries is
+         * at [15]. */
         uint16_t ack_root;
-        uint8_t  cs_level;
         uint8_t  slot_idx;
         uint8_t  n_neigh;
         uint8_t  ack_zone = DL_ZONE_ID_NONE;
@@ -1423,7 +1425,6 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
         if (len < (uint16_t)(DL_TS_NETACK_NNEIGH_IDX + 1)) return;
         ack_root = (uint16_t)(frame[DL_TS_NETACK_ROOT_IDX] |
                    ((uint16_t)frame[DL_TS_NETACK_ROOT_IDX + 1] << 8));
-        cs_level = frame[DL_TS_NETACK_LEVEL_IDX];
         slot_idx = frame[DL_TS_NETACK_SLOT_IDX];
         n_neigh  = frame[DL_TS_NETACK_NNEIGH_IDX];
         /* The zone the anchor joined and the clock reference it picked.
@@ -1437,7 +1438,7 @@ void gateway_handle_uwb_rx(uint8_t *frame, uint16_t len)
                         ((uint16_t)frame[DL_TS_NETACK_REF_RANK_IDX + 1] << 8));
         }
         src_rank = (uint16_t)(frame[7] | ((uint16_t)frame[8] << 8));
-        (void)ack_root; (void)cs_level; (void)slot_idx;
+        (void)ack_root; (void)slot_idx;
 
         /* Count each anchor only once, even though it ACKs on every
          * broadcast of the burst. */

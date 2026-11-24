@@ -2,16 +2,19 @@
  * @file    downlink_protocol.h
  * @brief   BD8NCF-style mesh sync protocol for UWB TDOA positioning.
  *
- *          Architecture: ONE TDMA grid shared by the whole network.  The
- *          Root (cs_level = 0) owns slot 0 and its beacon defines the
- *          origin of every round.  Every anchor broadcasts one compact
+ *          Architecture: ONE TDMA grid PER ZONE.  Each zone has its own
+ *          REFERENCE ANCHOR (role byte 27 = 0) that owns slot 0; its
+ *          beacon defines the origin of every round of that zone.  The
+ *          members of a zone place their slots on that zone's own time
+ *          axis — two zones are two independent axes and their TDOAs are
+ *          never mixed.  Every anchor broadcasts one compact
  *          TimeSync frame per round (50 ms → 20 frames/s) at
  *              round_origin + slot × 6.25 ms
  *          where round_origin is taken from the DW3000 SYS_TIME axis, so
- *          all anchors share ONE physical time grid.  A round carries the
- *          embedded TX timestamp, so the Tag derives the anchor clock
- *          model from it (clock_sync.h) and the slot compensation cancels
- *          the grid offsets from the TDOA.
+ *          all anchors of a zone share ONE physical time grid.  A round
+ *          carries the embedded TX timestamp, so the Tag derives the
+ *          anchor clock model from it (clock_sync.h) and the slot
+ *          compensation cancels the grid offsets from the TDOA.
  *
  *          Frame types:
  *            0xEE  TIMESYNC          Anchor → broadcast   periodic sync
@@ -53,9 +56,13 @@ extern "C" {
 /* Anchor discovery — anchor announces itself while not yet networked */
 #define FUNC_ANCHOR_DISCOVERY  0xECu   /* Anchor → GW broadcast: I exist       */
 
-/* Zone mesh (M2) — per-edge clock sync inside a zone.  These REPLACE the
- * Root's broadcast path (FUNC_TWR_CORR) in the M3 milestone; until then
- * they are defined but not sent. */
+/* Zone mesh (M2) — per-edge clock sync inside a zone.
+ *
+ * M6 note: these two codes are NOT sent by the current firmware.  The
+ * per-edge clock sync is carried by the beacon's own rate/offset fields
+ * (see DL_TS_* below), and the DS-TWR path correction (FUNC_TWR_CORR) is
+ * still broadcast by the zone reference -- the correction is what places
+ * the members' beacons on the zone grid, so it must stay. */
 #define FUNC_ZONE_SYNC_REQ     0xEAu   /* Anchor → zone broadcast: my clock     */
 #define FUNC_ZONE_SYNC_RSP     0xEBu   /* Anchor → unicast: my reference clock  */
 
@@ -236,7 +243,8 @@ extern "C" {
  *   [7-8]   source_addr      (Anchor rank)
  *   [9]     func             (0xE9)
  *   [10-11] root_rank        (confirmed root rank, uint16 LE)
- *   [12]    cs_level         (0=root, 1=child)      (legacy, M3 deletes it)
+ *   [12]    reserved         (the old hierarchy level — M3 deleted the
+ *                             hierarchy; the zone role is at [15])
  *   [13]    slot_idx         (TDMA slot, 255=unassigned)
  *   [14]    n_neighbors      (discovered neighbor count)
  *   [15]    zone_id          (uint8, the zone I joined)
@@ -286,11 +294,10 @@ extern "C" {
 #define DL_RX_WINDOW_MS            100u    /* 标签 RX 窗口 = 一个超周期           */
 #define DL_MAX_TRACKED_ANCHORS     8u      /* Tag tracks up to 8 anchors          */
 
-/* Anchor election (used during Phase 1.2 cascading sync) ----------------- */
-#define DL_CS_LEVEL_UNINIT         0xFFu  /* Anchor not yet assigned a level     */
-#define DL_CS_LEVEL_ROOT            0u     /* Level 0 = root clock source         */
-#define DL_PARENT_LOST_TIMEOUT_MS   30000u /* If parent silent 30 s, re-elect   */
-#define DL_SCAN_TIMEOUT_MS          5000u  /* 5-second scan period on boot          */
+/* M6: the anchor election is GONE (M3 replaced it with the zone reference
+ * designated by the gateway), so its constants went with it:
+ * DL_CS_LEVEL_UNINIT / DL_CS_LEVEL_ROOT / DL_PARENT_LOST_TIMEOUT_MS /
+ * DL_SCAN_TIMEOUT_MS. */
 
 /*============================================================================
  * TimeSync frame layout (75 bytes total, including the 10-byte header)
@@ -305,8 +312,8 @@ extern "C" {
  *                             bit2 = TX_OFFGRID, bit3 = COORD_VALID) <-- P0-2
  *   [16-17] reserved
  *   [18]    slot             (own TDMA slot, 255 = unassigned/ALOHA)
- *   [19-26] parent_eui64     (8 bytes, 0 if cs_level=0)
- *   [27]    cs_level         (0xFF uninit, 0=root, 1+=child)   <-- P0-1
+ *   [19-26] reserved         (the old parent EUI64 — no tree any more)
+ *   [27]    zone role        (0 = the zone's reference, 1 = a member) <-- P0-1
  *   [28-43] slot_table       (8 × uint16 rank, 0 = empty)      <-- P0-2
  *   [44-51] x/y/z coords (int16 each) + 2 pad bytes
  *   [52-53] cycle_id         (uint16, TDMA cycle counter)      <-- P0-4
@@ -343,19 +350,26 @@ extern "C" {
  *                             its own 2-byte CRC after the frame; that
  *                             CRC is not part of the frame.
  *
- * WHY THE ZONE FIELDS GO AT THE END AND NOT INTO THE cs_level BYTE
+ * WHY THE ZONE FIELDS GO AT THE END AND NOT INTO THE ROLE BYTE
  * -------------------------------------------------------------------
- * The port plan proposed to re-use the cs_level byte (27) for zone_id,
+ * The port plan proposed to re-use the role byte (27) for zone_id,
  * because the Root hierarchy it carried is deleted in M3.  That is right
- * for the END state, but it is wrong for the ORDER of the work: cs_level
+ * for the END state, but it is wrong for the ORDER of the work: the byte
  * is read and written by the anchor's election logic (fusion_anchor.c) and
- * by the tag's Root detection, and changing its meaning in M2 — before M3
+ * by the tag's reference detection, and changing its meaning in M2 — before M3
  * removes those readers — would silently corrupt the hierarchy.
  *
  * So M2 only ADDS bytes at the end of the frame.  The old fields stay
  * where they are until the milestone that actually deletes them; only then
  * are the freed bytes reclaimed, and by then the zone fields' offsets have
  * been frozen by the M2 release.
+ *
+ * M6: the hierarchy IS gone now, and byte 27 keeps its wire value
+ * (0 = the zone's reference, 1 = a member) — the tag and the gateway
+ * both key on "== 0", so the encoding stays.  What went away is the
+ * NAME: the field in the anchor is `zone_role`, and the constant is
+ * DL_TS_LEVEL_IDX.  The zone id itself lives in its own byte at the end
+ * of the frame ([65]).
  *
  * WHY THE FRAME USED TO BE 63 BYTES (a real bug, fixed):
  *   The frame was 63 bytes and [61-62] carried rx_ref_cycle — live data
@@ -401,8 +415,8 @@ extern "C" {
  *   (how far its own grid origin sits from the Root's grid).  That is a
  *   per-anchor constant and is handled by the Root's self-calibration.
  *
- * P0-1: cs_level and slot used to share byte 18 — writing the slot
- *       overwrote the level, so every frame looked like level == slot.
+ * P0-1: the role byte and the slot used to share byte 18 — writing the slot
+ *       overwrote the role, so every frame looked like role == slot.
  *       They are now separate bytes with separate indices.
  *
  * P0-4: cycle_id tells the Tag which TDMA round a beacon belongs to.  The
@@ -426,15 +440,16 @@ extern "C" {
  *       CLEARED — receivers must ignore imprecise timestamps for the
  *       clock model and for the grid origin.
  *
- * DS-TWR: rx_ref_ts40 / rx_ref_cycle let the Root close the round trip
- *       with the sender:
+ * DS-TWR: rx_ref_ts40 / rx_ref_cycle let the zone reference close the round
+ *       trip with the sender:
  *           (r2 - T1) = prop_R->X + f * (T2 - r1) + prop_X->R
- *       with r1 = the sender's RX instant of the Root frame (rx_ref_ts40),
- *       T1 = that frame's TX instant (known from rx_ref_cycle), T2 = the
- *       sender's TX instant (tx_timestamp40) and r2 = the Root's RX
- *       instant.  The Root solves the propagation delay and unicasts the
- *       correction back (FUNC_TWR_CORR), so the child can place its own
- *       beacon exactly on the Root's grid.
+ *       with r1 = the sender's RX instant of the reference frame
+ *       (rx_ref_ts40), T1 = that frame's TX instant (known from
+ *       rx_ref_cycle), T2 = the sender's TX instant (tx_timestamp40) and
+ *       r2 = the reference's RX instant.  The reference solves the
+ *       propagation delay and unicasts the correction back
+ *       (FUNC_TWR_CORR), so the member can place its own beacon exactly on
+ *       the zone grid.
  *============================================================================*/
 #define DL_TIMESYNC_LEN            75u
 /* The length of the PREVIOUS revision of the beacon (67 bytes: the one
@@ -463,8 +478,7 @@ extern "C" {
 #define DL_TS_TX_ERR_IDX          63u    /* int16 LE: this frame's TX departure
                                            * error in the sender's DTU             */
 #define DL_TS_SLOT_IDX            18u    /* own TDMA slot (255 = unassigned)        */
-#define DL_TS_PARENT_EUI_IDX      19u    /* 8-byte EUI64                             */
-#define DL_TS_LEVEL_IDX           27u    /* cs_level (P0-1: was DL_TS_CS_LEVEL_IDX) */
+#define DL_TS_LEVEL_IDX           27u    /* zone role: 0 = reference, 1 = member    */
 #define DL_TS_SLOT_TABLE_IDX      28u    /* 8 × uint16_t rank, 0 = empty            */
 #define DL_TS_COORD_IDX           44u    /* x/y/z coords appended after slot table  */
 #define DL_TS_CYCLE_IDX           52u    /* uint16 TDMA cycle counter                */
@@ -565,38 +579,44 @@ extern "C" {
 #define DL_ZS_PAD_IDX              23u
 
 /*============================================================================
- * TWR correction frame (Root → broadcast, variable length)
- *   The Root solved the Root↔Child propagation delay from the round trip
- *   and tells the child how far its own beacon was off the grid.  The child
- *   shifts its next slot instant accordingly, which removes the systematic
- *   (root->child propagation delay) bias from the Tag's slot-compensated
- *   TDOA.
+ * TWR correction frame (zone reference → broadcast, variable length)
+ *   The zone reference solved the reference↔member propagation delay from
+ *   the round trip and tells each member how far its own beacon was off the
+ *   grid.  The member shifts its next slot instant accordingly, which
+ *   removes the systematic (reference->member propagation delay) bias from
+ *   the Tag's slot-compensated TDOA.
+ *
+ *   M6 note: the port plan asked for this frame to be deleted together with
+ *   the Root.  That is WRONG for the zone architecture: the reference is the
+ *   only node that knows the round trip, and the correction is exactly what
+ *   places the members' beacons on the zone grid.  The frame stays; only the
+ *   sender's role changed (Root → zone reference).
  *
  *   The delay is carried in DEVICE TIME UNITS, not centimetres: the DS-TWR
  *   solver works entirely in DTU and a cm round-trip would throw away the
  *   sub-cm resolution (1 cm = 2.132 DTU) — and it keeps the clock-domain
- *   question out of the wire format.  The child's clock differs from the
- *   Root's by f_root, so the value sent is the delay expressed in the
- *   CHILD's clock (p_root / f_root), which is the unit the child needs to
+ *   question out of the wire format.  The member's clock differs from the
+ *   reference's by f_ref, so the value sent is the delay expressed in the
+ *   MEMBER's clock (p_ref / f_ref), which is the unit the member needs to
  *   shift its own grid origin.
  *
- *   P1-3: the corrections of ALL children travel in ONE frame, one batch
+ *   P1-3: the corrections of ALL members travel in ONE frame, one batch
  *   per TDMA cycle.  The previous scheme (one unicast per cycle, round
- *   robin over the children) delayed a child's correction by up to N
+ *   robin over the members) delayed a member's correction by up to N
  *   cycles — 0.64 s for 8 anchors — which made a "2 cycle" freshness
  *   limit impossible and let the path delay go badly stale.  With the
- *   batch every child learns its own delay every cycle.
+ *   batch every member learns its own delay every cycle.
  *
  *   [0-9]   header (10 B, dst = 0xFFFF broadcast)
  *   [10]    entry count N (1..DL_TWR_CORR_MAX_ENTRIES)
  *   [11]    quality: age of the OLDEST entry, in TDMA cycles
  *   [12..]  N entries of DL_TWR_CORR_ENTRY_LEN bytes:
- *             target_rank  (uint16 LE, the child this correction is for)
- *             corr_dtu     (uint16 LE, Root→Child path delay in DTU)
+ *             target_rank  (uint16 LE, the member this correction is for)
+ *             corr_dtu     (uint16 LE, reference→member path delay in DTU)
  *
  *   corr_dtu fits in 16 bit: the plausible range is 40..22,000 DTU.
  *============================================================================*/
-#define FUNC_TWR_CORR           0xE7u   /* Root → broadcast: path corrections     */
+#define FUNC_TWR_CORR           0xE7u   /* ref → broadcast: path corrections       */
 #define DL_TWR_CORR_HDR_LEN     12u    /* header + count + quality               */
 #define DL_TWR_CORR_COUNT_IDX   10u
 #define DL_TWR_CORR_QUAL_IDX    11u
@@ -606,18 +626,15 @@ extern "C" {
 #define DL_TWR_CORR_MAX_LEN     (DL_TWR_CORR_HDR_LEN \
                                  + DL_TWR_CORR_ENTRY_LEN * DL_TWR_CORR_MAX_ENTRIES)
 
-/* Plausible Root→Child path delay, in DTU (child clock):
+/* Plausible reference→member path delay, in DTU (member clock):
  *   0.2 m = 42.6 DTU .. 100 m = 21,320 DTU. */
 #define DL_TWR_CORR_MIN_DTU     40u
 #define DL_TWR_CORR_MAX_DTU     22000u
 
 /* Freshness limit (P1-3): if our own entry has not been refreshed for more
  * than this many TDMA cycles, the correction is stale — the path delay may
- * have changed (the anchor moved) — and the child leaves the grid. */
+ * have changed (the anchor moved) — and the member leaves the grid. */
 #define DL_TWR_CORR_MAX_AGE_CYCLES 2u
-
-/* Backwards-compatible alias — the cs_level byte moved to 27 (P0-1). */
-#define DL_TS_CS_LEVEL_IDX        DL_TS_LEVEL_IDX
 
 /*============================================================================
  * Clock Feedback frame layout (Observer → unicast, 27 bytes payload)
@@ -768,11 +785,9 @@ extern "C" {
 #define DL_ANCHOR_ENTRY_SIZE  7u
 
 /* TDOA conversion: 1 DW3000 device time unit ≈ 15.65 ps ≈ 0.46907 cm.
- * M1: the number now lives in ONE place only — shared_defines.h.  This is
- * an alias to it, not a second copy of the literal, so the two cannot
- * drift apart (the old copy here was a hard 0.46907f that nobody
- * remembered to update). */
-#define TDOA_CM_PER_DTU         CM_PER_DTU_F
+ * M1/M6: the number lives in ONE place only — shared_defines.h's
+ * CM_PER_DTU_F.  The old alias here was removed in M6: nothing used it,
+ * and a second name for the same constant is a second place to forget. */
 
 typedef struct {
     uint16_t id;    /* anchor rank (16-bit to support ranks > 255) */
